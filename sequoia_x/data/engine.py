@@ -34,6 +34,7 @@ CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_daily (symbol, date);
 def _bs_fetch_batch(tasks: list) -> list:
     """多进程 worker：独立 login，批量拉取 baostock 数据。"""
     import baostock as bs
+
     bs.login()
     results = []
     for symbol, bs_code, start, end in tasks:
@@ -85,6 +86,36 @@ class DataEngine:
                 params=(symbol,),
             )
         return df
+
+    def get_latest_snapshot(self, symbols: list[str]) -> dict[str, dict]:
+        """批量取每只股票「最新一个交易日」的快照行。
+
+        用于技术面过滤（如成交额），避免为了一行数据把整段历史都读出来。
+        用窗口函数一次查完，配合 (symbol, date) 索引，几十到几百只股票毫秒级返回。
+
+        Args:
+            symbols: 纯数字股票代码列表。
+
+        Returns:
+            {symbol: {"date": str, "close": float|None, "turnover": float|None}}；
+            无数据的股票不在字典中。
+        """
+        if not symbols:
+            return {}
+
+        placeholders = ",".join("?" * len(symbols))
+        sql = f"""
+            SELECT symbol, date, close, turnover FROM (
+                SELECT symbol, date, close, turnover,
+                       ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY date DESC) AS rn
+                FROM stock_daily
+                WHERE symbol IN ({placeholders})
+            ) WHERE rn = 1
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(sql, symbols).fetchall()
+
+        return {row[0]: {"date": row[1], "close": row[2], "turnover": row[3]} for row in rows}
 
     @staticmethod
     def _to_baostock_code(symbol: str) -> str:
@@ -139,7 +170,10 @@ class DataEngine:
             logger.info("无新数据（可能非交易日）")
             return 0
 
-        df = pd.DataFrame(all_rows, columns=["symbol", "date", "open", "high", "low", "close", "volume", "turnover"])
+        df = pd.DataFrame(
+            all_rows,
+            columns=["symbol", "date", "open", "high", "low", "close", "volume", "turnover"],
+        )
         for col in ["open", "high", "low", "close", "volume", "turnover"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         df = df.dropna(subset=["close"])
@@ -149,7 +183,9 @@ class DataEngine:
         with sqlite3.connect(self.db_path) as conn:
             for d in df["date"].unique().tolist():
                 conn.execute("DELETE FROM stock_daily WHERE date = ?", (d,))
-            df.to_sql("stock_daily", conn, if_exists="append", index=False, method="multi", chunksize=500)
+            df.to_sql(
+                "stock_daily", conn, if_exists="append", index=False, method="multi", chunksize=500
+            )
             conn.commit()
 
         logger.info(f"sync_today_bulk: 写入 {count} 条数据")
@@ -277,8 +313,12 @@ class DataEngine:
                 try:
                     with sqlite3.connect(self.db_path) as conn:
                         df.to_sql(
-                            "stock_daily", conn, if_exists="append",
-                            index=False, method="multi", chunksize=500,
+                            "stock_daily",
+                            conn,
+                            if_exists="append",
+                            index=False,
+                            method="multi",
+                            chunksize=500,
                         )
                 except sqlite3.IntegrityError:
                     pass
@@ -312,9 +352,9 @@ class DataEngine:
             symbols = []
             while rs.next():
                 row = rs.get_row_data()
-                code = row[0]           # "sh.600000" or "sz.000001"
-                status = row[4]         # "1" = 上市
-                stock_type = row[5]     # "1" = 股票
+                code = row[0]  # "sh.600000" or "sz.000001"
+                status = row[4]  # "1" = 上市
+                stock_type = row[5]  # "1" = 股票
                 if status == "1" and stock_type == "1":
                     symbols.append(code.split(".")[1])  # 提取纯数字代码
             logger.info(f"获取股票列表完成，共 {len(symbols)} 只")
@@ -327,7 +367,5 @@ class DataEngine:
 
     def get_local_symbols(self) -> list[str]:
         with sqlite3.connect(self.db_path) as conn:
-            rows = conn.execute(
-                "SELECT DISTINCT symbol FROM stock_daily"
-            ).fetchall()
+            rows = conn.execute("SELECT DISTINCT symbol FROM stock_daily").fetchall()
         return [row[0] for row in rows]

@@ -1,5 +1,6 @@
 """配置管理模块：通过 pydantic-settings 从环境变量或 .env 文件加载系统配置。"""
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -9,6 +10,33 @@ class Settings(BaseSettings):
     feishu_webhook_url: str  # 必填字段，缺失时抛出 ValidationError
     strategy_webhooks: dict[str, str] = {}
 
+    # ── 股票池精筛（全部可选，不配置即不过滤）──
+    # 1) 估值
+    # 流通市值区间，单位：亿元。例如 min=100 表示只看 100 亿以上流通盘
+    min_market_cap: float | None = None
+    max_market_cap: float | None = None
+    # 市盈率(TTM)区间。亏损股市盈率为负，设 min_pe=0 即可排除亏损股
+    min_pe: float | None = None
+    max_pe: float | None = None
+    # 市净率区间
+    min_pb: float | None = None
+    max_pb: float | None = None
+    # 2) 流动性：成交额下限，单位：亿元（取自本地库，无网络开销）
+    min_turnover: float | None = None
+    # 3) 技术面：换手率区间，单位：%
+    min_turn: float | None = None
+    max_turn: float | None = None
+    # 4) 行业：逗号分隔的关键词，子串匹配行业名。
+    #    include 非空时只保留命中任一关键词的；exclude 命中的一律排除。
+    #    例：include_industries=电子,软件,医药  /  exclude_industries=房地产,银行
+    include_industries: str = ""
+    exclude_industries: str = ""
+
+    # ── 本地 HTML 报告 ──
+    # 跑完策略后生成一份本地单文件 HTML 报告（按策略分块展示选股结果）
+    report_enabled: bool = True
+    report_dir: str = "reports"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -16,10 +44,28 @@ class Settings(BaseSettings):
         extra="ignore",  # <--- 加上这一行！让 Pydantic 放行未定义的变量
     )
 
+    @field_validator(
+        "min_market_cap",
+        "max_market_cap",
+        "min_pe",
+        "max_pe",
+        "min_pb",
+        "max_pb",
+        "min_turnover",
+        "min_turn",
+        "max_turn",
+        mode="before",
+    )
+    @classmethod
+    def _blank_to_none(cls, v: object) -> object:
+        """把空字符串/空白字符串视为「未配置」（.env 中留空是常见写法）。"""
+        if isinstance(v, str) and v.strip() == "":
+            return None
+        return v
+
     @classmethod
     def settings_customise_sources(cls, settings_cls, **kwargs):  # type: ignore[override]
         """扩展配置源，支持从环境变量中扫描 STRATEGY_WEBHOOK_ 前缀的键。"""
-        from pydantic_settings import EnvSettingsSource
         import os
 
         sources = super().settings_customise_sources(settings_cls, **kwargs)
@@ -29,7 +75,7 @@ class Settings(BaseSettings):
         webhooks: dict[str, str] = {}
         for key, value in os.environ.items():
             if key.upper().startswith(prefix):
-                strategy_key = key[len(prefix):].lower()
+                strategy_key = key[len(prefix) :].lower()
                 webhooks[strategy_key] = value
 
         # 注入到初始化数据中（通过 init_kwargs source）
@@ -50,7 +96,7 @@ class Settings(BaseSettings):
         webhooks: dict[str, str] = dict(self.strategy_webhooks)
         for key, value in os.environ.items():
             if key.upper().startswith(prefix):
-                strategy_key = key[len(prefix):].lower()
+                strategy_key = key[len(prefix) :].lower()
                 webhooks[strategy_key] = value
 
         # 使用 object.__setattr__ 绕过 pydantic 的不可变保护

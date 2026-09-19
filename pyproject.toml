@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "sequoia-x"
 version = "2.0.0"
@@ -18,6 +22,11 @@ dev = [
     "hypothesis>=6.100",
     "pytest-mock>=3.12",
 ]
+
+# 只在 sequoia_x 包内做自动发现，避免把 data/ logs/ reports/ 等
+# 数据目录误当作顶层包（新版 setuptools 的 flat-layout 检查会直接报错）。
+[tool.setuptools.packages.find]
+include = ["sequoia_x*"]
 
 [tool.ruff]
 line-length = 100

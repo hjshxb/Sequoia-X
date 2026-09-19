@@ -69,5 +69,6 @@ class PrivatePlacementStrategy(BaseStrategy):
                 seen.add(s)
                 unique_symbols.append(s)
 
+        unique_symbols = self.apply_universe_filter(unique_symbols)
         logger.info(f"PrivatePlacementStrategy 选出 {len(unique_symbols)} 只股票")
         return unique_symbols

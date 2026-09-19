@@ -24,45 +24,22 @@ class TurtleTradeStrategy(BaseStrategy):
     _MIN_BARS: int = 21  # 至少需要 21 根 K 线（20日窗口 + 当日）
 
     def _get_market_caps(self, symbols: list[str]) -> dict[str, float]:
-        """通过 baostock 查询候选股票的流通市值（不复权收盘价 × 流通股本）。
+        """查询候选股票的流通市值（单位：元），用于按市值排序。
 
-        流通股本 = 成交量 / (换手率% / 100)
-        流通市值 = 流通股本 × 不复权收盘价
+        复用 FundamentalFilter 的批量拉取与进程内缓存：
+        - 使用回看窗口取最近一个交易日的真实（不复权）价格，
+          避免在周末/节假日因当天无行情而拿到空数据、导致排序静默失效；
+        - 与基本面过滤共享缓存，避免重复请求同一只股票。
+
+        Returns:
+            {symbol: 流通市值(元)}；取不到市值的股票不在字典中。
         """
-        from datetime import date
-
-        import baostock as bs
-
-        today_str = date.today().strftime("%Y-%m-%d")
-        market_caps: dict[str, float] = {}
-
-        bs.login()
-        try:
-            for symbol in symbols:
-                bs_code = self.engine._to_baostock_code(symbol)
-                rs = bs.query_history_k_data_plus(
-                    bs_code,
-                    "close,volume,turn",
-                    start_date=today_str,
-                    end_date=today_str,
-                    frequency="d",
-                    adjustflag="3",  # 不复权，真实价格
-                )
-                while rs.next():
-                    row = rs.get_row_data()
-                    try:
-                        close = float(row[0])
-                        volume = float(row[1])
-                        turn = float(row[2])
-                        if turn > 0:
-                            circulating_shares = volume / (turn / 100)
-                            market_caps[symbol] = circulating_shares * close
-                    except (ValueError, ZeroDivisionError):
-                        continue
-        finally:
-            bs.logout()
-
-        return market_caps
+        metrics = self.universe_filter.fetch_metrics(symbols)
+        return {
+            symbol: metric.circ_market_cap
+            for symbol, metric in metrics.items()
+            if metric.circ_market_cap is not None
+        }
 
     def run(self) -> list[str]:
         """
@@ -92,8 +69,8 @@ class TurtleTradeStrategy(BaseStrategy):
                 liquid = last["turnover"] > 100_000_000
 
                 # 【新增防守条件】拒绝郑州煤电式的高开低走大阴线！
-                is_yang = last["close"] > last["open"]   # 实体必须是阳线（红柱）
-                is_up = last["close"] > prev["close"]    # 必须是真涨，不能是假阳线
+                is_yang = last["close"] > last["open"]  # 实体必须是阳线（红柱）
+                is_up = last["close"] > prev["close"]  # 必须是真涨，不能是假阳线
 
                 if breakout and liquid and is_yang and is_up:
                     candidates.append(symbol)
@@ -102,7 +79,9 @@ class TurtleTradeStrategy(BaseStrategy):
                 logger.warning(f"[{symbol}] TurtleTradeStrategy 计算失败：{exc}")
                 continue
 
-        # 按流通市值从大到小排序
+        # 先应用精筛（估值 / 流动性 / 技术面 / 行业），再按流通市值从大到小排序
+        candidates = self.apply_universe_filter(candidates)
+
         if candidates:
             market_caps = self._get_market_caps(candidates)
             candidates.sort(key=lambda s: market_caps.get(s, 0), reverse=True)

@@ -1,7 +1,5 @@
 """高旗形整理策略：强动量后极度收敛缩量。"""
 
-import pandas as pd
-
 from sequoia_x.core.logger import get_logger
 from sequoia_x.strategy.base import BaseStrategy
 
@@ -68,5 +66,6 @@ class HighTightFlagStrategy(BaseStrategy):
                 logger.warning(f"[{symbol}] HighTightFlagStrategy 计算失败：{exc}")
                 continue
 
+        selected = self.apply_universe_filter(selected)
         logger.info(f"HighTightFlagStrategy 选出 {len(selected)} 只股票")
         return selected

@@ -63,5 +63,6 @@ class UptrendLimitDownStrategy(BaseStrategy):
                 logger.warning(f"[{symbol}] UptrendLimitDownStrategy 计算失败：{exc}")
                 continue
 
+        selected = self.apply_universe_filter(selected)
         logger.info(f"UptrendLimitDownStrategy 选出 {len(selected)} 只股票")
         return selected

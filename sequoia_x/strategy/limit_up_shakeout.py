@@ -1,7 +1,5 @@
 """涨停洗盘策略：昨日涨停后今日放量收阴但不破昨收。"""
 
-import pandas as pd
-
 from sequoia_x.core.logger import get_logger
 from sequoia_x.strategy.base import BaseStrategy
 
@@ -61,5 +59,6 @@ class LimitUpShakeoutStrategy(BaseStrategy):
                 logger.warning(f"[{symbol}] LimitUpShakeoutStrategy 计算失败：{exc}")
                 continue
 
+        selected = self.apply_universe_filter(selected)
         logger.info(f"LimitUpShakeoutStrategy 选出 {len(selected)} 只股票")
         return selected

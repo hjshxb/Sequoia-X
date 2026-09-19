@@ -1,7 +1,9 @@
-import pandas as pd
 import sqlite3
-from sequoia_x.strategy.base import BaseStrategy
+
+import pandas as pd
+
 from sequoia_x.core.logger import get_logger
+from sequoia_x.strategy.base import BaseStrategy
 
 logger = get_logger(__name__)
 
@@ -24,33 +26,38 @@ class RpsBreakoutStrategy(BaseStrategy):
         if df.empty:
             return []
 
-        df['date'] = pd.to_datetime(df['date'])
-        df = df.sort_values(['symbol', 'date'])
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values(["symbol", "date"])
 
         # 纵向计算涨幅
-        df['close_shift'] = df.groupby('symbol')['close'].shift(self.rps_period)
-        df['pct_change'] = (df['close'] - df['close_shift']) / df['close_shift']
+        df["close_shift"] = df.groupby("symbol")["close"].shift(self.rps_period)
+        df["pct_change"] = (df["close"] - df["close_shift"]) / df["close_shift"]
 
-        latest_date = df['date'].max()
-        latest_df = df[df['date'] == latest_date].copy()
-        latest_df = latest_df.dropna(subset=['pct_change'])
+        latest_date = df["date"].max()
+        latest_df = df[df["date"] == latest_date].copy()
+        latest_df = latest_df.dropna(subset=["pct_change"])
 
         # 横向排位 (RPS)
-        latest_df['rps'] = latest_df['pct_change'].rank(pct=True) * 100
-        strong_stocks = latest_df[latest_df['rps'] >= self.rps_threshold].copy()
+        latest_df["rps"] = latest_df["pct_change"].rank(pct=True) * 100
+        strong_stocks = latest_df[latest_df["rps"] >= self.rps_threshold].copy()
 
         # 计算滚动最高价
-        roll_high = df.groupby('symbol')['high'].rolling(
-            window=self.rps_period, min_periods=self.rps_period // 2
-        ).max().reset_index(level=0, drop=True)
-        df['roll_high'] = roll_high
+        roll_high = (
+            df.groupby("symbol")["high"]
+            .rolling(window=self.rps_period, min_periods=self.rps_period // 2)
+            .max()
+            .reset_index(level=0, drop=True)
+        )
+        df["roll_high"] = roll_high
 
-        latest_roll_high = df[df['date'] == latest_date][['symbol', 'roll_high']]
-        strong_stocks = strong_stocks.merge(latest_roll_high, on='symbol')
+        latest_roll_high = df[df["date"] == latest_date][["symbol", "roll_high"]]
+        strong_stocks = strong_stocks.merge(latest_roll_high, on="symbol")
 
         # 突破判定
-        breakout_condition = strong_stocks['close'] >= strong_stocks['roll_high'] * 0.90
+        breakout_condition = strong_stocks["close"] >= strong_stocks["roll_high"] * 0.90
         selected = strong_stocks[breakout_condition]
 
-        logger.info(f"RpsBreakoutStrategy 选出 {len(selected)} 只股票")
-        return selected['symbol'].tolist()
+        selected_symbols = self.apply_universe_filter(selected["symbol"].tolist())
+
+        logger.info(f"RpsBreakoutStrategy 选出 {len(selected_symbols)} 只股票")
+        return selected_symbols
