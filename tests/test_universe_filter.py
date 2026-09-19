@@ -22,7 +22,6 @@ from sequoia_x.data.universe_filter import (
     split_keywords,
 )
 
-
 # 精筛相关的环境变量。`Settings(_env_file=None)` 只能屏蔽 .env 文件本身，
 # 挡不住 os.environ —— 同一 pytest 进程内只要有模块在导入期 load_dotenv()
 # （例如 import main），仓库真实 .env 的内容就会渗进这些用例。
@@ -38,6 +37,9 @@ _FILTER_ENV_VARS = (
     "MAX_TURN",
     "INCLUDE_INDUSTRIES",
     "EXCLUDE_INDUSTRIES",
+    "MIN_TOP10_FREE_HOLDING",
+    "MAX_TOP10_FREE_HOLDING",
+    "HOLDER_REPORT_DATE",
 )
 
 
@@ -94,6 +96,32 @@ def stub_meta(mapping: dict[str, str]):
     return _load
 
 
+def stub_holdings(mapping: dict[str, float]):
+    """stub `_fetch_holder_ratios`（市场级接口，不接收 symbols）。"""
+
+    def _fetch(self):
+        return dict(mapping)
+
+    return _fetch
+
+
+class FakeEngine:
+    """最小 DataEngine 替身：只需全市场代码 + 本地成交额快照。"""
+
+    def __init__(self, symbols, turnover: dict[str, float] | None = None):
+        self._symbols = list(symbols)
+        self._turnover = dict(turnover or {})
+
+    def get_local_symbols(self):
+        return list(self._symbols)
+
+    def get_latest_snapshot(self, symbols):
+        return {s: {"turnover": self._turnover[s]} for s in symbols if s in self._turnover}
+
+    def _to_baostock_code(self, symbol):
+        return f"sh.{symbol}" if symbol.startswith(("6", "9")) else f"sz.{symbol}"
+
+
 NA = StockMetric("", None, None, None, None)
 
 
@@ -117,12 +145,16 @@ def test_blank_env_values_become_none():
         min_turn="",
         min_turnover="",
         max_turn=None,
+        min_top10_free_holding="",
+        max_top10_free_holding="  ",
     )
     assert settings.min_market_cap is None
     assert settings.max_pb is None
     assert settings.min_turn is None
     assert settings.min_turnover is None
     assert settings.max_turn is None
+    assert settings.min_top10_free_holding is None
+    assert settings.max_top10_free_holding is None
 
 
 def test_numeric_env_values_parsed():
@@ -165,6 +197,8 @@ def test_disabled_when_nothing_configured():
         ("max_turn", 10.0),
         ("include_industries", "电子"),
         ("exclude_industries", "房地产"),
+        ("min_top10_free_holding", 30.0),
+        ("max_top10_free_holding", 70.0),
     ],
 )
 def test_enabled_when_any_configured(field, value):
@@ -182,10 +216,11 @@ def test_describe_mentions_all_dimensions():
             max_turn=15,
             include_industries="电子,软件",
             exclude_industries="房地产",
+            min_top10_free_holding=30,
         )
     )
     text = f.describe()
-    for token in ["流通市值", "市盈率", "市净率", "成交额", "换手率", "电子", "房地产"]:
+    for token in ["流通市值", "市盈率", "市净率", "成交额", "换手率", "电子", "房地产", "流通股东"]:
         assert token in text
 
 
@@ -198,6 +233,7 @@ def test_disabled_is_passthrough_without_any_io(monkeypatch):
 
     monkeypatch.setattr(UniverseFilter, "_fetch_from_baostock", boom)
     monkeypatch.setattr(UniverseFilter, "_fetch_turnover", boom)
+    monkeypatch.setattr(UniverseFilter, "_fetch_holder_ratios", boom)
     monkeypatch.setattr(stock_meta_module, "load_stock_meta", boom)
 
     f = UniverseFilter(settings=make_settings())
@@ -545,6 +581,209 @@ def test_metrics_are_fetched_only_once(monkeypatch):
     f.apply(["000001"])
     f.apply(["000001"])
     assert calls["n"] == 1
+
+
+# ── 前十大流通股东合计占比维度 ──
+
+
+def test_filter_by_top10_holding_min(monkeypatch):
+    """MIN 语义：保留「筹码集中」（前十大合计占比达标）的股票。"""
+    monkeypatch.setattr(
+        UniverseFilter,
+        "_fetch_holder_ratios",
+        stub_holdings(
+            {
+                "000001": 21.5,  # 分散，不达标
+                "000002": 30.0,  # 恰好达标（闭区间）
+                "000003": 68.4,  # 集中
+            }
+        ),
+    )
+    f = UniverseFilter(settings=make_settings(min_top10_free_holding=30))
+    assert f.apply(["000001", "000002", "000003"]) == ["000002", "000003"]
+
+
+def test_filter_by_top10_holding_max(monkeypatch):
+    """MAX 语义：剔除过度集中（流通盘被锁死、流动性差）的股票。"""
+    monkeypatch.setattr(
+        UniverseFilter,
+        "_fetch_holder_ratios",
+        stub_holdings({"000001": 20.0, "000002": 70.0, "000003": 95.0}),
+    )
+    f = UniverseFilter(settings=make_settings(max_top10_free_holding=70))
+    assert f.apply(["000001", "000002", "000003"]) == ["000001", "000002"]
+
+
+def test_filter_by_top10_holding_range(monkeypatch):
+    monkeypatch.setattr(
+        UniverseFilter,
+        "_fetch_holder_ratios",
+        stub_holdings({"000001": 25.0, "000002": 45.0, "000003": 80.0}),
+    )
+    f = UniverseFilter(settings=make_settings(min_top10_free_holding=30, max_top10_free_holding=70))
+    assert f.apply(["000001", "000002", "000003"]) == ["000002"]
+
+
+def test_top10_holding_missing_rejected_when_min(monkeypatch):
+    """设了 MIN 时，没有股东数据的股票无法证明达标 -> 剔除。"""
+    monkeypatch.setattr(UniverseFilter, "_fetch_holder_ratios", stub_holdings({"000001": 55.0}))
+    f = UniverseFilter(settings=make_settings(min_top10_free_holding=30))
+    assert f.apply(["000001", "000002"]) == ["000001"]
+
+
+def test_top10_holding_missing_passes_when_only_max(monkeypatch):
+    """只设 MAX 时，数据缺失应放行（无法证明它超过上限）。"""
+    monkeypatch.setattr(UniverseFilter, "_fetch_holder_ratios", stub_holdings({"000001": 95.0}))
+    f = UniverseFilter(settings=make_settings(max_top10_free_holding=70))
+    assert f.apply(["000001", "000002"]) == ["000002"]
+
+
+def test_top10_holding_failure_skips_only_that_dimension(monkeypatch):
+    """股东数据整体拉取失败时，只跳过该维度，其余维度照常生效。"""
+    monkeypatch.setattr(UniverseFilter, "_fetch_holder_ratios", stub_holdings({}))
+    monkeypatch.setattr(
+        UniverseFilter,
+        "_fetch_from_baostock",
+        stub_metrics(
+            {"000001": metric("000001", cap_yi=200), "000002": metric("000002", cap_yi=5)}
+        ),
+    )
+    f = UniverseFilter(settings=make_settings(min_top10_free_holding=30, min_market_cap=100))
+    # 股东维度被跳过；市值维度生效，只剩 000001
+    assert f.apply(["000001", "000002"]) == ["000001"]
+
+
+def test_top10_holding_does_not_require_baostock(monkeypatch):
+    """只配股东维度时，不应调用 baostock 指标接口。"""
+    calls = {"n": 0}
+
+    def counting(self, symbols):
+        calls["n"] += 1
+        return {}
+
+    monkeypatch.setattr(UniverseFilter, "_fetch_from_baostock", counting)
+    monkeypatch.setattr(UniverseFilter, "_fetch_holder_ratios", stub_holdings({"600000": 40.0}))
+
+    f = UniverseFilter(settings=make_settings(min_top10_free_holding=30))
+    assert f.apply(["600000"]) == ["600000"]
+    assert calls["n"] == 0
+
+
+def test_top10_holding_does_not_require_stock_meta(monkeypatch):
+    """只配股东维度时，不应加载行业表。"""
+    calls = {"n": 0}
+
+    def counting():
+        calls["n"] += 1
+        return {}
+
+    monkeypatch.setattr(stock_meta_module, "load_stock_meta", counting)
+    monkeypatch.setattr(UniverseFilter, "_fetch_holder_ratios", stub_holdings({"600000": 40.0}))
+
+    f = UniverseFilter(settings=make_settings(min_top10_free_holding=30))
+    assert f.apply(["600000"]) == ["600000"]
+    assert calls["n"] == 0
+
+
+def test_fetch_holder_ratios_delegates_to_holder_module(monkeypatch):
+    """过滤器只负责判定，取数细节（报告期 / 缓存目录）交给数据模块。"""
+    from sequoia_x.data import holder_concentration
+
+    seen: dict = {}
+
+    def fake_load(**kwargs):
+        seen.update(kwargs)
+        return {"600000": 40.0}
+
+    monkeypatch.setattr(holder_concentration, "load_top10_free_holding", fake_load)
+
+    f = UniverseFilter(
+        settings=make_settings(
+            min_top10_free_holding=30,
+            holder_report_date="2025-12-31",
+            holder_cache_dir="tmp/cache",
+        )
+    )
+    assert f.apply(["600000"]) == ["600000"]
+    assert seen["report_date"] == "2025-12-31"
+    assert seen["cache_dir"] == "tmp/cache"
+
+
+# ── 前置过滤（分级执行） ──
+
+
+def test_get_passing_universe_is_passthrough_when_disabled():
+    engine = FakeEngine(["600000", "000001"])
+    f = UniverseFilter(settings=make_settings(), engine=engine)
+    assert f.get_passing_universe() == ["600000", "000001"]
+
+
+def test_get_passing_universe_staged_matches_single_pass(monkeypatch):
+    """分级执行的结果必须与「一次完整过滤」完全一致。"""
+    symbols = ["600001", "600002", "000003", "000004"]
+    engine = FakeEngine(
+        symbols,
+        turnover={"600001": 10e8, "600002": 10e8, "000003": 0.1e8, "000004": 10e8},
+    )
+    monkeypatch.setattr(
+        stock_meta_module,
+        "load_stock_meta",
+        stub_meta(
+            {
+                "600001": "软件和信息技术服务业",
+                "600002": "房地产业",
+                "000003": "软件和信息技术服务业",
+                "000004": "软件和信息技术服务业",
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        UniverseFilter,
+        "_fetch_from_baostock",
+        stub_metrics(
+            {
+                "600001": metric("600001", cap_yi=200, pe=15.0, turn=3.0),
+                "000004": metric("000004", cap_yi=5, pe=15.0, turn=3.0),
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        UniverseFilter,
+        "_fetch_holder_ratios",
+        stub_holdings({"600001": 55.0, "000004": 55.0}),
+    )
+
+    settings = make_settings(
+        min_turnover=1,
+        include_industries="软件",
+        min_market_cap=100,
+        min_pe=0,
+        min_turn=1,
+        min_top10_free_holding=30,
+    )
+    staged = UniverseFilter(settings=settings, engine=engine).get_passing_universe()
+    # 单次完整过滤（不借助分级）
+    single = UniverseFilter(settings=settings, engine=engine).apply(symbols)
+    assert staged == single == ["600001"]
+
+
+def test_get_passing_universe_applies_holder_in_stage_one(monkeypatch):
+    """股东维度不逐股联网，应放在第 1 级（零边际成本）。"""
+    engine = FakeEngine(["600001", "600002"], turnover={"600001": 10e8, "600002": 10e8})
+    monkeypatch.setattr(UniverseFilter, "_fetch_holder_ratios", stub_holdings({"600001": 55.0}))
+    baostock_calls = {"n": 0}
+
+    def counting(self, symbols):
+        baostock_calls["n"] += 1
+        return {}
+
+    monkeypatch.setattr(UniverseFilter, "_fetch_from_baostock", counting)
+
+    f = UniverseFilter(
+        settings=make_settings(min_turnover=1, min_top10_free_holding=30), engine=engine
+    )
+    assert f.get_passing_universe() == ["600001"]
+    assert baostock_calls["n"] == 0
 
 
 # ── 市值公式 ──

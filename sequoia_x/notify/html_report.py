@@ -25,9 +25,10 @@ from sequoia_x.data.universe_filter import StockMetric
 
 logger = get_logger(__name__)
 
-# 基础列；传入 metrics 时再追加指标列
+# 基础列；传入 metrics / holdings 时再追加指标列
 _BASE_COLUMNS: tuple[str, ...] = ("代码", "名称", "板块", "行业")
 _METRIC_COLUMNS: tuple[str, ...] = ("市值(亿)", "换手率", "PE(TTM)")
+_HOLDING_COLUMNS: tuple[str, ...] = ("十大流通(%)",)
 
 YI = 1e8
 
@@ -101,6 +102,13 @@ def _fmt_pe(metric: StockMetric | None) -> str:
     return f"{metric.pe_ttm:.1f}"
 
 
+def _fmt_holding(ratio: float | None) -> str:
+    """前十大流通股东合计占流通股比例（%，一位小数）。"""
+    if ratio is None:
+        return "—"
+    return f"{ratio:.1f}"
+
+
 class HtmlReportGenerator:
     """把各策略选股结果渲染成本地单文件 HTML 报告。"""
 
@@ -126,6 +134,7 @@ class HtmlReportGenerator:
         filter_desc: str = "",
         output_path: str | Path | None = None,
         metrics: dict[str, StockMetric] | None = None,
+        holdings: dict[str, float] | None = None,
     ) -> Path:
         """生成 HTML 报告并写入磁盘。
 
@@ -135,6 +144,8 @@ class HtmlReportGenerator:
             output_path: 输出路径；为 None 时使用 default_path()。
             metrics: 可选的 {代码: StockMetric}。传入后额外展示
                 市值 / 换手率 / PE(TTM) 三列；缺数据的股票显示为「—」。
+            holdings: 可选的 {代码: 前十大流通股东合计占流通股比例(%)}。
+                传入后额外展示「十大流通(%)」一列，便于回看与调阈值。
 
         Returns:
             实际写入的报告文件路径。
@@ -142,6 +153,8 @@ class HtmlReportGenerator:
         meta = stock_meta_module.load_stock_meta()
         if metrics is None:
             metrics = {}
+        if holdings is None:
+            holdings = {}
         missing = 0
         for symbols in results.values():
             for symbol in symbols:
@@ -150,7 +163,7 @@ class HtmlReportGenerator:
         if missing:
             logger.warning(f"HTML 报告：{missing} 条记录缺少名称/行业，将显示为「—」")
 
-        content = self._render(results, meta, filter_desc, metrics)
+        content = self._render(results, meta, filter_desc, metrics, holdings)
 
         path = Path(output_path) if output_path else self.default_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -165,13 +178,21 @@ class HtmlReportGenerator:
         meta: dict[str, StockMeta],
         filter_desc: str,
         metrics: dict[str, StockMetric],
+        holdings: dict[str, float] | None = None,
     ) -> str:
         today = date.today().strftime("%Y-%m-%d")
         total = sum(len(v) for v in results.values())
         hit_strategies = sum(1 for v in results.values() if v)
 
         show_metrics = bool(metrics)
-        headers = _BASE_COLUMNS + (_METRIC_COLUMNS if show_metrics else ())
+        # 只有部分股票有股东数据时也展示该列，缺失的显示为「—」
+        holdings = holdings or {}
+        show_holdings = bool(holdings)
+        headers = (
+            _BASE_COLUMNS
+            + (_METRIC_COLUMNS if show_metrics else ())
+            + (_HOLDING_COLUMNS if show_holdings else ())
+        )
         n_cols = len(headers)
         thead = "".join(f"<th>{html.escape(h)}</th>" for h in headers)
 
@@ -189,7 +210,9 @@ class HtmlReportGenerator:
                                 symbol,
                                 meta.get(symbol),
                                 metrics.get(symbol),
+                                holdings.get(symbol),
                                 show_metrics,
+                                show_holdings,
                             )
                         )
                 rows = "\n".join(parts)
@@ -447,7 +470,9 @@ class HtmlReportGenerator:
         symbol: str,
         meta: StockMeta | None,
         metric: StockMetric | None,
+        holding: float | None,
         show_metrics: bool,
+        show_holdings: bool = False,
     ) -> str:
         name = html.escape(meta.name) if meta and meta.name else "—"
         industry = html.escape(meta.industry) if meta and meta.industry else "—"
@@ -467,5 +492,7 @@ class HtmlReportGenerator:
                 f'<td class="num">{_fmt_turn(metric)}</td>'
                 f'<td class="num">{_fmt_pe(metric)}</td>'
             )
+        if show_holdings:
+            cells += f'<td class="num">{_fmt_holding(holding)}</td>'
 
         return f'            <tr data-board="{html.escape(board)}">{cells}</tr>'

@@ -143,10 +143,13 @@ def main() -> None:
                 # 只有精筛完全未配置时才会新拉一次。
                 displayed = sorted({s for symbols in results.values() for s in symbols})
                 metrics = universe.fetch_metrics(displayed) if displayed else {}
+                # 前十大流通股东占比：仅当配置了筹码维度时才展示，
+                # 且直接复用精筛已加载的市场级快照，零额外请求。
                 report_path = HtmlReportGenerator(settings).generate(
                     results,
                     filter_desc=universe.describe(),
                     metrics=metrics,
+                    holdings=universe.cached_holder_ratios(),
                 )
                 logger.info(f"HTML 报告已生成：{report_path.resolve()}")
             except Exception as exc:

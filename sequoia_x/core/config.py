@@ -31,6 +31,15 @@ class Settings(BaseSettings):
     #    例：include_industries=电子,软件,医药  /  exclude_industries=房地产,银行
     include_industries: str = ""
     exclude_industries: str = ""
+    # 5) 筹码集中度：前十大流通股东合计持股占流通股比例区间，单位：%
+    #    取自东财全市场接口，按报告期缓存（一年仅更新 4 次），命中缓存后零网络开销。
+    #    min=30 表示只保留「前十大流通股东合计持股 >= 30%」的股票。
+    min_top10_free_holding: float | None = None
+    max_top10_free_holding: float | None = None
+    # 指定股东数据报告期（YYYY-MM-DD 或 YYYYMMDD）；留空 = 自动取最新已披露季末
+    holder_report_date: str = ""
+    # 股东数据缓存目录
+    holder_cache_dir: str = "data/cache"
 
     # ── 本地 HTML 报告 ──
     # 跑完策略后生成一份本地单文件 HTML 报告（按策略分块展示选股结果）
@@ -54,6 +63,8 @@ class Settings(BaseSettings):
         "min_turnover",
         "min_turn",
         "max_turn",
+        "min_top10_free_holding",
+        "max_top10_free_holding",
         mode="before",
     )
     @classmethod

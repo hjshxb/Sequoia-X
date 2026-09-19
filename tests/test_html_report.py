@@ -400,3 +400,47 @@ def test_group_header_colspan_follows_column_count(gen):
         metrics={"600000": _metric(100.0, 1.0, 10.0)},
     ).read_text(encoding="utf-8")
     assert 'colspan="7"' in with_metrics
+
+    with_both = gen.generate(
+        {"TurtleTradeStrategy": ["600000"]},
+        metrics={"600000": _metric(100.0, 1.0, 10.0)},
+        holdings={"600000": 50.0},
+    ).read_text(encoding="utf-8")
+    assert 'colspan="8"' in with_both
+
+
+# ── 筹码集中度列（前十大流通股东合计占比） ──
+
+
+def test_holding_column_absent_without_holdings(gen):
+    text = gen.generate({"TurtleTradeStrategy": ["600000"]}).read_text(encoding="utf-8")
+    assert "十大流通" not in text
+
+
+def test_holding_column_rendered_when_provided(gen):
+    text = gen.generate({"TurtleTradeStrategy": ["600000"]}, holdings={"600000": 74.87}).read_text(
+        encoding="utf-8"
+    )
+
+    assert "十大流通" in text
+    assert "74.9" in text  # 一位小数
+
+
+def test_holding_column_coexists_with_metrics(gen):
+    text = gen.generate(
+        {"TurtleTradeStrategy": ["600000"]},
+        metrics={"600000": _metric(1234.0, 3.456, 42.35)},
+        holdings={"600000": 74.87},
+    ).read_text(encoding="utf-8")
+
+    assert "市值(亿)" in text and "PE(TTM)" in text and "十大流通" in text
+
+
+def test_missing_holding_renders_placeholder(gen):
+    """只有当部分股票有股东数据时，缺失的那些应展示占位符。"""
+    text = gen.generate(
+        {"TurtleTradeStrategy": ["600000", "000001"]}, holdings={"600000": 74.87}
+    ).read_text(encoding="utf-8")
+
+    assert "十大流通" in text
+    assert "—" in text
