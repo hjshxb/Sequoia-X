@@ -108,10 +108,8 @@ def main() -> None:
             strategy.set_universe(universe_pool)
 
         notifier = FeishuNotifier(settings)
-        if args.no_push:
-            logger.info("已指定 --no-push，跳过全部飞书推送")
 
-        # 6. 遍历策略，有结果则推送至对应机器人
+        # 6. 遍历策略，收集结果（推送统一放到最后，汇总成一张卡片）
         results: dict[str, list[str]] = {}
         for strategy in strategies:
             strategy_name = type(strategy).__name__
@@ -121,22 +119,23 @@ def main() -> None:
             results[strategy_name] = selected
             logger.info(f"{strategy_name} 选出 {len(selected)} 只股票")
 
-            if not selected:
-                logger.info(f"{strategy_name} 无选股结果，跳过推送")
-            elif args.no_push:
-                continue
-            else:
-                # 推送失败不应中断后续策略，否则本地报告会一并丢失
-                try:
-                    notifier.send(
-                        symbols=selected,
-                        strategy_name=strategy_name,
-                        webhook_key=strategy.webhook_key,
-                    )
-                except Exception as exc:
-                    logger.error(f"{strategy_name} 飞书推送异常，已忽略：{exc}")
+        # 7. 推送：各策略汇总成单张卡片（中文策略名 + 按板块分组，只给代码+名称）
+        if args.no_push:
+            logger.info("已指定 --no-push，跳过飞书推送")
+        elif not any(results.values()):
+            logger.info("所有策略均无选股结果，跳过飞书推送")
+        else:
+            # 推送失败不应中断后续流程，否则本地报告会一并丢失
+            try:
+                notifier.send_report(
+                    results,
+                    # describe() 自带「精筛：」前缀，卡片里那行已有标签，去掉避免重复
+                    filter_desc=universe.describe().removeprefix("精筛："),
+                )
+            except Exception as exc:
+                logger.error(f"飞书推送异常，已忽略：{exc}")
 
-        # 7. 生成本地 HTML 报告（按策略分块 + 板块分组，不依赖飞书）
+        # 8. 生成本地 HTML 报告（按策略分块 + 板块分组，不依赖飞书）
         if settings.report_enabled:
             try:
                 # 展示 市值/换手率/PE 三列。精筛若已启用，这些指标在精筛阶段

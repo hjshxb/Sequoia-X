@@ -32,7 +32,9 @@ _METRIC_COLUMNS: tuple[str, ...] = ("市值(亿)", "换手率", "PE(TTM)")
 YI = 1e8
 
 # 策略类名 -> 中文展示名。未收录的策略回退为类名本身。
-_STRATEGY_LABELS: dict[str, str] = {
+# 这份映射是「展示层公共词汇」：本地 HTML 报告与飞书推送都从这里取，
+# 保证两处对同一策略的叫法一致（见 feishu.py）。
+STRATEGY_LABELS: dict[str, str] = {
     "MaVolumeStrategy": "均线放量",
     "TurtleTradeStrategy": "海龟突破",
     "HighTightFlagStrategy": "高窄旗形",
@@ -41,6 +43,14 @@ _STRATEGY_LABELS: dict[str, str] = {
     "RpsBreakoutStrategy": "RPS 突破",
     "PrivatePlacementStrategy": "定增公告",
 }
+
+# 兼容旧引用（原名带下划线，仅供历史代码/测试使用）
+_STRATEGY_LABELS = STRATEGY_LABELS
+
+
+def strategy_label(strategy_name: str) -> str:
+    """取策略的中文展示名；未收录时回退为类名本身。"""
+    return STRATEGY_LABELS.get(strategy_name, strategy_name)
 
 
 def to_xueqiu_code(symbol: str) -> str:

@@ -1,4 +1,15 @@
-"""飞书通知模块：将选股结果通过 Webhook 推送至飞书群。"""
+"""飞书通知模块：把各策略选股结果汇总成一张卡片推送到飞书群。
+
+推送形态：**每个交易日一张汇总卡片** —— 各策略是卡片里的小节，
+小节内部再按上市板块（主板 → 创业板 → 科创板 → 北交所 → 其他）分组。
+内容刻意保持精简：只给「代码 + 名称」，不放外链。
+
+与本地 HTML 报告保持一致：
+    - 策略中文名与板块分组复用 `html_report` 的展示词汇（`strategy_label`
+      / `group_by_board`），两处对同一策略、同一板块的叫法不会漂移；
+    - 股票名称来自 `sequoia_x.data.stock_meta`（全市场一次请求 + 进程内缓存），
+      不做逐股请求，也不会因为取不到名称而丢股票。
+"""
 
 import json
 from datetime import date
@@ -7,16 +18,28 @@ import requests
 
 from sequoia_x.core.config import Settings
 from sequoia_x.core.logger import get_logger
+from sequoia_x.data import stock_meta as stock_meta_module
+from sequoia_x.data.stock_meta import StockMeta
+from sequoia_x.notify.html_report import group_by_board, strategy_label
 
 logger = get_logger(__name__)
 
+# 精筛条件在卡片里的最大展示长度。`describe()` 会把行业黑名单全量列出，
+# 实际配置动辄几十个关键词，不截断会把整张卡片撑爆。
+# 阈值项（市值/PE/成交额/换手）排在描述前面，所以截断牺牲的是尾部行业名单。
+_MAX_FILTER_CHARS = 120
+
+
+def _elide(text: str, limit: int = _MAX_FILTER_CHARS) -> str:
+    """超长文本截断并加省略号；未超长时原样返回。"""
+    return text if len(text) <= limit else text[:limit] + "…"
+
 
 class FeishuNotifier:
-    """飞书 Webhook 推送器。
+    """飞书 Webhook 推送器：把多策略结果汇总成单张卡片。
 
-    根据策略的 webhook_key 路由到对应的飞书机器人。
-    若 webhook_key 未在 Settings.strategy_webhooks 中配置，
-    则 fallback 到 Settings.feishu_webhook_url。
+    Attributes:
+        settings: 提供 webhook 配置。
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -28,41 +51,67 @@ class FeishuNotifier:
         """
         self.settings = settings
 
-    @staticmethod
-    def _to_xueqiu_code(code: str) -> str:
-        """将纯数字代码转为雪球格式：6开头→SH，4/8开头→BJ，其余→SZ。"""
-        if code.startswith("6"):
-            return f"SH{code}"
-        elif code.startswith(("4", "8")):
-            return f"BJ{code}"
-        return f"SZ{code}"
+    # ── 卡片内容 ──
 
     @staticmethod
-    def _get_stock_names(symbols: list[str]) -> dict[str, str]:
-        """通过 baostock 批量查询股票名称，返回 {code: name} 映射。"""
-        import baostock as bs
-        bs.login()
-        mapping = {}
-        for code in symbols:
-            prefix = "sh" if code.startswith(("6", "9")) else "sz"
-            rs = bs.query_stock_basic(code=f"{prefix}.{code}")
-            while rs.next():
-                row = rs.get_row_data()
-                mapping[code] = row[1]  # 第2个字段是股票名称
-        bs.logout()
-        return mapping
+    def _stock_text(symbol: str, meta: dict[str, StockMeta]) -> str:
+        """单只股票的展示文本：`代码 名称`；名称缺失时退化为只有代码。"""
+        item = meta.get(symbol)
+        name = (item.name if item else None) or ""
+        return f"{symbol} {name}".strip()
 
-    def _build_card(self, symbols: list[str], strategy_name: str) -> dict:
+    @classmethod
+    def _strategy_section(cls, label: str, symbols: list[str], meta: dict[str, StockMeta]) -> str:
+        """渲染一个策略小节：标题行 + 每个板块一行（板块内代码升序）。
+
+        板块标题带只数，例如 `主板 3：600000 浦发银行、600601 方正科技`。
+        """
+        lines = [f"**{label}**（{len(symbols)} 只）"]
+        for board, group in group_by_board(symbols):
+            stocks = "、".join(cls._stock_text(s, meta) for s in group)
+            lines.append(f"{board} {len(group)}：{stocks}")
+        return "\n".join(lines)
+
+    def _build_report_card(self, results: dict[str, list[str]], filter_desc: str = "") -> dict:
+        """把 {策略类名: 代码列表} 渲染成一张飞书交互卡片。
+
+        Args:
+            results: 各策略的选股结果，顺序即卡片中小节的顺序。
+            filter_desc: 精筛条件描述，展示在卡片顶部便于解释结果为何偏少。
+
+        Returns:
+            飞书 `msg_type=interactive` 的请求体。
+        """
+        meta = stock_meta_module.load_stock_meta()
         today = date.today().strftime("%Y-%m-%d")
-        names = self._get_stock_names(symbols)
+        total = sum(len(v) for v in results.values())
+        hit = sum(1 for v in results.values() if v)
 
-        links: list[str] = []
-        for code in symbols:
-            xq_code = self._to_xueqiu_code(code)
-            name = names.get(code, xq_code)
-            links.append(f"[{name}](https://xueqiu.com/S/{xq_code})")
+        summary = [f"**日期：** {today}", f"**命中策略：** {hit} / {len(results)}"]
+        summary.append(f"**选股数量：** {total}")
+        if filter_desc:
+            summary.append(f"**筛股条件：** {_elide(filter_desc)}")
 
-        symbol_text = " ".join(links) if links else "（无选股结果）"
+        elements: list[dict] = [
+            {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(summary)}}
+        ]
+
+        def add_markdown(content: str) -> None:
+            elements.append({"tag": "hr"})
+            elements.append({"tag": "div", "text": {"tag": "lark_md", "content": content}})
+
+        for strategy_name, symbols in results.items():
+            if symbols:
+                add_markdown(self._strategy_section(strategy_label(strategy_name), symbols, meta))
+
+        if total == 0:
+            # 全空时不留白卡片：明确说明「跑了但没选出来」
+            add_markdown("本次运行所有策略均无选股结果。")
+        else:
+            # 无结果的策略不单独成段，收成一行，避免卡片被空小节淹没
+            silent = [strategy_label(n) for n, s in results.items() if not s]
+            if silent:
+                add_markdown(f"**本次无结果：** {'、'.join(silent)}")
 
         return {
             "msg_type": "interactive",
@@ -70,53 +119,18 @@ class FeishuNotifier:
                 "header": {
                     "title": {
                         "tag": "plain_text",
-                        "content": f"📈 Sequoia-X 选股播报 | {strategy_name}",
+                        "content": f"📈 Sequoia-X 选股播报 | {today}",
                     },
                     "template": "blue",
                 },
-                "elements": [
-                    {
-                        "tag": "div",
-                        "text": {
-                            "tag": "lark_md",
-                            "content": f"**日期：** {today}\n**策略：** {strategy_name}\n**选股数量：** {len(symbols)}",
-                        },
-                    },
-                    {"tag": "hr"},
-                    {
-                        "tag": "div",
-                        "text": {
-                            "tag": "lark_md",
-                            "content": f"**选股列表：**\n{symbol_text}",
-                        },
-                    },
-                ],
+                "elements": elements,
             },
         }
 
-    def send(
-        self,
-        symbols: list[str],
-        strategy_name: str,
-        webhook_key: str = "default",
-    ) -> None:
-        """
-        将选股结果格式化为飞书卡片消息并 POST 至对应 Webhook。
+    # ── 发送 ──
 
-        根据 webhook_key 从 Settings 中查找专属 URL；
-        若未配置，则 fallback 到 feishu_webhook_url。
-
-        Args:
-            symbols: 选股结果代码列表。
-            strategy_name: 策略名称，用于卡片标题。
-            webhook_key: 策略标识，用于路由到对应飞书机器人。
-
-        Raises:
-            不抛出异常，HTTP 失败时记录 ERROR 日志。
-        """
-        url = self.settings.get_webhook_url(webhook_key)
-        payload = self._build_card(symbols, strategy_name)
-
+    def _post(self, url: str, payload: dict, webhook_key: str, count: int) -> None:
+        """POST 卡片并判读飞书返回；失败只记日志，不抛异常。"""
         try:
             resp = requests.post(
                 url,
@@ -124,17 +138,35 @@ class FeishuNotifier:
                 headers={"Content-Type": "application/json"},
                 timeout=10,
             )
-            # 解析飞书真正的返回体
+            # 飞书真正的成功标志是响应体内部的 code == 0
             resp_json = resp.json()
 
-            # 飞书真正的成功标志是内部的 code == 0
             if resp.status_code != 200 or resp_json.get("code") != 0:
                 logger.error(
-                    f"飞书推送失败 [{webhook_key}] "
-                    f"HTTP状态={resp.status_code} 飞书响应={resp.text}"
+                    f"飞书推送失败 [{webhook_key}] HTTP状态={resp.status_code} 飞书响应={resp.text}"
                 )
             else:
-                logger.info(f"飞书推送成功 [{webhook_key}]，共 {len(symbols)} 只股票")
+                logger.info(f"飞书推送成功 [{webhook_key}]，共 {count} 只股票")
 
         except requests.RequestException as exc:
             logger.error(f"飞书推送请求异常 [{webhook_key}]：{exc}")
+
+    def send_report(
+        self,
+        results: dict[str, list[str]],
+        filter_desc: str = "",
+        webhook_key: str = "default",
+    ) -> None:
+        """把所有策略的选股结果汇总成一张卡片推送出去。
+
+        Args:
+            results: {策略类名: 选股代码列表}，顺序决定卡片中小节的顺序。
+            filter_desc: 精筛条件描述。
+            webhook_key: 用于路由 Webhook；未配置专属地址时回退到默认地址。
+
+        Raises:
+            不抛出异常，HTTP 失败时记录 ERROR 日志。
+        """
+        url = self.settings.get_webhook_url(webhook_key)
+        payload = self._build_report_card(results, filter_desc)
+        self._post(url, payload, webhook_key, sum(len(v) for v in results.values()))
