@@ -23,11 +23,31 @@ from sequoia_x.data.universe_filter import (
 )
 
 
+# 精筛相关的环境变量。`Settings(_env_file=None)` 只能屏蔽 .env 文件本身，
+# 挡不住 os.environ —— 同一 pytest 进程内只要有模块在导入期 load_dotenv()
+# （例如 import main），仓库真实 .env 的内容就会渗进这些用例。
+_FILTER_ENV_VARS = (
+    "MIN_MARKET_CAP",
+    "MAX_MARKET_CAP",
+    "MIN_PE",
+    "MAX_PE",
+    "MIN_PB",
+    "MAX_PB",
+    "MIN_TURNOVER",
+    "MIN_TURN",
+    "MAX_TURN",
+    "INCLUDE_INDUSTRIES",
+    "EXCLUDE_INDUSTRIES",
+)
+
+
 @pytest.fixture(autouse=True)
-def _clear_caches():
-    """每个用例前清空进程内缓存，避免相互污染。"""
+def _clear_caches(monkeypatch):
+    """每个用例前清空进程内缓存与环境变量，避免相互污染。"""
     _METRIC_CACHE.clear()
     stock_meta_module.reset_cache()
+    for var in _FILTER_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
     yield
     _METRIC_CACHE.clear()
     stock_meta_module.reset_cache()

@@ -87,11 +87,16 @@ class DataEngine:
             )
         return df
 
+    # SQLite 的绑定变量上限默认约 999（老版本）/ 32766（新版本），
+    # 全市场 5000+ 只股票一次性 IN 查询会超限，因此分批执行。
+    _SQL_PARAM_CHUNK = 900
+
     def get_latest_snapshot(self, symbols: list[str]) -> dict[str, dict]:
         """批量取每只股票「最新一个交易日」的快照行。
 
-        用于技术面过滤（如成交额），避免为了一行数据把整段历史都读出来。
-        用窗口函数一次查完，配合 (symbol, date) 索引，几十到几百只股票毫秒级返回。
+        用于技术面过滤（如成交额）与股票池预筛，避免为了一行数据把整段历史都读出来。
+        用窗口函数一次查完，配合 (symbol, date) 索引，几十到几百只股票毫秒级返回；
+        传入全市场 5000+ 只时代码会自动分批（见 `_SQL_PARAM_CHUNK`）。
 
         Args:
             symbols: 纯数字股票代码列表。
@@ -103,8 +108,7 @@ class DataEngine:
         if not symbols:
             return {}
 
-        placeholders = ",".join("?" * len(symbols))
-        sql = f"""
+        sql = """
             SELECT symbol, date, close, turnover FROM (
                 SELECT symbol, date, close, turnover,
                        ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY date DESC) AS rn
@@ -112,10 +116,17 @@ class DataEngine:
                 WHERE symbol IN ({placeholders})
             ) WHERE rn = 1
         """
-        with sqlite3.connect(self.db_path) as conn:
-            rows = conn.execute(sql, symbols).fetchall()
 
-        return {row[0]: {"date": row[1], "close": row[2], "turnover": row[3]} for row in rows}
+        result: dict[str, dict] = {}
+        chunk = self._SQL_PARAM_CHUNK
+        with sqlite3.connect(self.db_path) as conn:
+            for i in range(0, len(symbols), chunk):
+                batch = symbols[i : i + chunk]
+                placeholders = ",".join("?" * len(batch))
+                rows = conn.execute(sql.format(placeholders=placeholders), batch).fetchall()
+                for row in rows:
+                    result[row[0]] = {"date": row[1], "close": row[2], "turnover": row[3]}
+        return result
 
     @staticmethod
     def _to_baostock_code(symbol: str) -> str:

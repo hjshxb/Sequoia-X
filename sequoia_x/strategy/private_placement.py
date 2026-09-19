@@ -24,7 +24,12 @@ class PrivatePlacementStrategy(BaseStrategy):
     _LOOKBACK_DAYS: int = 7  # 回看天数，覆盖一周内的新公告
 
     def run(self) -> list[str]:
-        """拉取定增公告，返回近期有定向增发的股票代码列表。"""
+        """拉取定增公告，返回近期有定向增发的股票代码列表。
+
+        候选来自外部公告源（并非取自本地库），因此不适用「预筛池即遍历范围」的模式；
+        末尾的 apply_universe_filter 在已注入池子时会把结果收敛到池内，
+        效果等同于「近 7 天定增公告 ∩ 精筛池」。
+        """
         try:
             import akshare as ak
 

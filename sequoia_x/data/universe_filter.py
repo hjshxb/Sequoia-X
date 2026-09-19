@@ -6,6 +6,13 @@
     3. 技术面 —— 换手率区间
     4. 行业   —— 行业关键词白名单 / 黑名单（子串匹配）
 
+两种调用方式：
+    - `apply(symbols)`            —— 后置过滤：对策略初选结果做精筛。
+    - `get_passing_universe()`    —— 前置过滤：先算出全市场合格股票池，
+                                     再交给策略去执行（见 BaseStrategy.set_universe）。
+      前置过滤采用**分级执行**：先用零成本维度（成交额/行业）把全市场收窄，
+      再对残余股票拉取昂贵指标（市值/PE/PB/换手率），避免对 5000+ 只逐个联网。
+
 数据来源与成本：
     - 流通市值 / 市盈率 / 市净率 / 换手率：baostock 不复权日线，**只对候选股**查询，
       进程内缓存，多策略共享。
@@ -310,7 +317,7 @@ class UniverseFilter:
     # ── 过滤 ──
 
     def apply(self, symbols: list[str]) -> list[str]:
-        """对候选股票列表应用全部已配置的过滤维度。
+        """对候选股票列表应用全部已配置的过滤维度（后置过滤，保留兼容）。
 
         Args:
             symbols: 策略选出的候选股票代码列表。
@@ -318,15 +325,108 @@ class UniverseFilter:
         Returns:
             过滤后的代码列表。未启用过滤、或输入为空时原样返回。
         """
-        if not self.enabled or not symbols:
-            return symbols
+        return self._apply(
+            symbols,
+            valuation=self._valuation_enabled,
+            liquidity=self._liquidity_enabled,
+            technical=self._technical_enabled,
+            industry=self._industry_enabled,
+        )
+
+    def get_passing_universe(self) -> list[str]:
+        """返回通过精筛的**全市场**股票池，供策略在执行前限定候选范围（前置过滤）。
+
+        分级执行以控制网络成本：
+          第 1 级 —— 零成本维度：成交额取自本地库（无请求）、行业为全市场单次请求，
+                     先把 5000+ 只收窄到几百只；
+          第 2 级 —— 昂贵维度：市值 / PE / PB / 换手率需逐股请求 baostock，
+                     只对第 1 级的残余执行。
+        两个阶段是「与」关系，最终结果与直接对全市场做一次完整 apply 完全一致。
+
+        未启用任何维度时直接返回全市场，且不产生任何网络请求。
+
+        Returns:
+            通过全部已配置维度的股票代码列表（保持全市场原有顺序）。
+        """
+        if self.engine is None:
+            logger.error("精筛预筛：未提供 engine，无法获取全市场股票池")
+            return []
+
+        all_symbols: list[str] = self.engine.get_local_symbols()  # type: ignore[attr-defined]
+        if not self.enabled or not all_symbols:
+            return all_symbols
+
+        liquidity_on = self._liquidity_enabled
+        industry_on = self._industry_enabled
+
+        if not (liquidity_on or industry_on):
+            logger.warning(
+                "精筛预筛：未配置「成交额 / 行业」等零成本维度，"
+                f"将直接对全市场 {len(all_symbols)} 只拉取估值/换手率指标，"
+                "单线程耗时约 10 分钟以上"
+            )
+
+        # 第 1 级：零成本维度（本地库成交额 + 全市场单次行业请求）
+        stage1 = self._apply(
+            all_symbols,
+            valuation=False,
+            liquidity=liquidity_on,
+            technical=False,
+            industry=industry_on,
+        )
+        logger.info(
+            f"精筛预筛：全市场 {len(all_symbols)} -> {len(stage1)}（成交额/行业，零网络成本）"
+        )
+
+        if not stage1:
+            return []
+
+        # 第 2 级：昂贵维度（逐股 baostock 指标），只对残余执行
+        stage2 = self._apply(
+            stage1,
+            valuation=self._valuation_enabled,
+            liquidity=False,
+            technical=self._technical_enabled,
+            industry=False,
+        )
+        logger.info(f"精筛预筛：{len(stage1)} -> {len(stage2)}（市值/PE/PB/换手率）")
+        return stage2
+
+    def _apply(
+        self,
+        symbols: list[str],
+        *,
+        valuation: bool,
+        liquidity: bool,
+        technical: bool,
+        industry: bool,
+    ) -> list[str]:
+        """按显式指定的维度集合过滤候选股票。
+
+        维度以参数传入（而非直接读配置），是为了支持「分级预筛」：
+        第 1 级只跑零成本维度、第 2 级只跑昂贵维度，两级的交集等价于一次完整过滤。
+
+        Args:
+            symbols: 待过滤的股票代码列表。
+            valuation: 是否启用估值维度（市值/PE/PB）。
+            liquidity: 是否启用流动性维度（成交额）。
+            technical: 是否启用手技术面维度（换手率）。
+            industry: 是否启用行业维度（白名单/黑名单）。
+
+        Returns:
+            过滤后的代码列表。指定维度全为 False、或输入为空时原样返回。
+        """
+        if not symbols:
+            return list(symbols)
+        if not (valuation or liquidity or technical or industry):
+            return list(symbols)
 
         # 维度是否生效。注意：某一数据源「完全拉取失败」时必须把对应维度真正关掉，
         # 否则会退化成「全部因数据缺失被剔除」，把结果误杀成空。
-        valuation_on = self._valuation_enabled
-        technical_on = self._technical_enabled
-        liquidity_on = self._liquidity_enabled
-        industry_on = self._industry_enabled
+        valuation_on = valuation
+        technical_on = technical
+        liquidity_on = liquidity
+        industry_on = industry
 
         # 1) 估值 / 换手率（baostock，一次登录批量拉取）
         metrics: dict[str, StockMetric] = {}

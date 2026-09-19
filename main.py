@@ -13,9 +13,6 @@ import sys
 
 from dotenv import load_dotenv
 
-load_dotenv()
-
-
 import socket
 
 socket.setdefaulttimeout(10.0)
@@ -37,6 +34,11 @@ from sequoia_x.strategy.uptrend_limit_down import UptrendLimitDownStrategy
 
 
 def main() -> None:
+    # 说明：`load_dotenv()` 刻意放在函数内而不是模块顶层 —— 顶层调用会在
+    # 「import main」时就把 .env 写进 os.environ，污染同进程内的其它测试
+    # （pydantic 的 `_env_file=None` 只屏蔽 .env 文件，挡不住 os.environ）。
+    load_dotenv()
+
     parser = argparse.ArgumentParser(description="Sequoia-X V2 选股系统")
     parser.add_argument(
         "--backfill",
@@ -62,7 +64,8 @@ def main() -> None:
         engine = DataEngine(settings)
 
         # 3.1 打印精筛配置（未配置时为「未启用」）
-        logger.info(UniverseFilter(settings=settings, engine=engine).describe())
+        universe = UniverseFilter(settings=settings, engine=engine)
+        logger.info(universe.describe())
 
         if args.backfill:
             # ── 回填模式：单线程保守拉历史 K 线，自动多轮重跑 ──
@@ -77,7 +80,21 @@ def main() -> None:
         count = engine.sync_today_bulk()
         logger.info(f"快照同步完成，写入 {count} 只股票")
 
-        # 4. 策略列表（新增策略在此追加即可）
+        # 4. 前置过滤：先算出全市场合格股票池，再交给各策略执行。
+        #    精筛未启用时该池即全市场（零网络开销）；启用时分级执行
+        #    （成交额/行业零成本维度先收窄，再对残余拉取昂贵指标）。
+        universe_pool: list[str] | None = None
+        if universe.enabled:
+            universe_pool = universe.get_passing_universe()
+            if not universe_pool:
+                # 容错：池子为空极可能是数据源故障（而非真的全被条件剔除），
+                # 此时不注入池子，回退到「全市场选股 + 后置过滤」，避免结果被误杀成空。
+                logger.error("精筛预筛结果为空，判定为数据源异常，回退为全市场 + 后置过滤")
+                universe_pool = None
+            else:
+                logger.info(f"精筛预筛完成，合格股票池 {len(universe_pool)} 只")
+
+        # 5. 策略列表（新增策略在此追加即可）
         strategies: list[BaseStrategy] = [
             MaVolumeStrategy(engine=engine, settings=settings),
             TurtleTradeStrategy(engine=engine, settings=settings),
@@ -87,12 +104,14 @@ def main() -> None:
             RpsBreakoutStrategy(engine=engine, settings=settings),
             PrivatePlacementStrategy(engine=engine, settings=settings),
         ]
+        for strategy in strategies:
+            strategy.set_universe(universe_pool)
 
         notifier = FeishuNotifier(settings)
         if args.no_push:
             logger.info("已指定 --no-push，跳过全部飞书推送")
 
-        # 5. 遍历策略，有结果则推送至对应机器人
+        # 6. 遍历策略，有结果则推送至对应机器人
         results: dict[str, list[str]] = {}
         for strategy in strategies:
             strategy_name = type(strategy).__name__
@@ -117,10 +136,9 @@ def main() -> None:
                 except Exception as exc:
                     logger.error(f"{strategy_name} 飞书推送异常，已忽略：{exc}")
 
-        # 6. 生成本地 HTML 报告（按策略分块 + 板块分组，不依赖飞书）
+        # 7. 生成本地 HTML 报告（按策略分块 + 板块分组，不依赖飞书）
         if settings.report_enabled:
             try:
-                universe = UniverseFilter(settings=settings, engine=engine)
                 # 展示 市值/换手率/PE 三列。精筛若已启用，这些指标在精筛阶段
                 # 就已拉取并进了进程内缓存，此处不会再产生网络请求；
                 # 只有精筛完全未配置时才会新拉一次。

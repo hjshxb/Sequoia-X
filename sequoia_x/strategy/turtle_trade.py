@@ -43,9 +43,9 @@ class TurtleTradeStrategy(BaseStrategy):
 
     def run(self) -> list[str]:
         """
-        遍历全市场，返回满足海龟突破条件的股票代码列表。
+        遍历候选股票池，返回满足海龟突破条件的股票代码列表。
         """
-        symbols = self.engine.get_local_symbols()
+        symbols = self.candidate_symbols()
         candidates: list[str] = []
 
         for symbol in symbols:

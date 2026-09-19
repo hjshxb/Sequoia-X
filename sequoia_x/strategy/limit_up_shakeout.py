@@ -24,12 +24,12 @@ class LimitUpShakeoutStrategy(BaseStrategy):
 
     def run(self) -> list[str]:
         """
-        遍历全市场，返回满足涨停洗盘条件的股票代码列表。
+        遍历候选股票池，返回满足涨停洗盘条件的股票代码列表。
 
         Returns:
             满足条件的股票代码列表。
         """
-        symbols = self.engine.get_local_symbols()
+        symbols = self.candidate_symbols()
         selected: list[str] = []
 
         for symbol in symbols:

@@ -16,6 +16,10 @@ class RpsBreakoutStrategy(BaseStrategy):
     rps_threshold: int = 90
 
     def run(self) -> list[str]:
+        # 注意：RPS 是**横截面**指标（全市场涨幅百分位排名），因此这里刻意直接读全表，
+        # 不限定在预筛池内 —— 只有在全市场里排进前 10%，才叫真正的相对强度。
+        # 预筛池的作用体现在最后一步 apply_universe_filter()：
+        # 已注入池子时它退化为「是否在池内」，即"全市场强势股 ∩ 精筛池"。
         try:
             with sqlite3.connect(self.engine.db_path) as conn:
                 df = pd.read_sql("SELECT symbol, date, close, high FROM stock_daily", conn)
