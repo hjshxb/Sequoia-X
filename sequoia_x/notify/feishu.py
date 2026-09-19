@@ -2,11 +2,12 @@
 
 推送形态：**每个交易日一张汇总卡片** —— 各策略是卡片里的小节，
 小节内部再按上市板块（主板 → 创业板 → 科创板 → 北交所 → 其他）分组。
-内容刻意保持精简：只给「代码 + 名称」，不放外链。
+每只股票只展示「代码 + 名称」，但整块可点击跳转雪球行情页（不放行业/市值等列）。
 
 与本地 HTML 报告保持一致：
-    - 策略中文名与板块分组复用 `html_report` 的展示词汇（`strategy_label`
-      / `group_by_board`），两处对同一策略、同一板块的叫法不会漂移；
+    - 策略中文名、板块分组、雪球代码前缀都复用 `html_report` 的实现
+      （`strategy_label` / `group_by_board` / `to_xueqiu_code`），
+      两处对同一策略、同一板块、同一交易所前缀的判定不会漂移；
     - 股票名称来自 `sequoia_x.data.stock_meta`（全市场一次请求 + 进程内缓存），
       不做逐股请求，也不会因为取不到名称而丢股票。
 """
@@ -20,7 +21,11 @@ from sequoia_x.core.config import Settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data import stock_meta as stock_meta_module
 from sequoia_x.data.stock_meta import StockMeta
-from sequoia_x.notify.html_report import group_by_board, strategy_label
+from sequoia_x.notify.html_report import (
+    group_by_board,
+    strategy_label,
+    to_xueqiu_code,
+)
 
 logger = get_logger(__name__)
 
@@ -55,10 +60,15 @@ class FeishuNotifier:
 
     @staticmethod
     def _stock_text(symbol: str, meta: dict[str, StockMeta]) -> str:
-        """单只股票的展示文本：`代码 名称`；名称缺失时退化为只有代码。"""
+        """单只股票的展示文本：`[代码 名称](雪球链接)`。
+
+        可见文本只有「代码 + 名称」，但整块可点，点开就是雪球行情页
+        （与本地 HTML 报告一致）。名称缺失时退化为只有代码，股票不会丢。
+        """
         item = meta.get(symbol)
         name = (item.name if item else None) or ""
-        return f"{symbol} {name}".strip()
+        label = f"{symbol} {name}".strip()
+        return f"[{label}](https://xueqiu.com/S/{to_xueqiu_code(symbol)})"
 
     @classmethod
     def _strategy_section(cls, label: str, symbols: list[str], meta: dict[str, StockMeta]) -> str:

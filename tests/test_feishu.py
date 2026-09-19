@@ -175,14 +175,29 @@ def test_card_groups_stocks_by_board_order() -> None:
     assert i_main < i_chinext < i_star < i_bse
 
 
-def test_card_shows_code_and_name_without_links() -> None:
-    """只展示 代码 + 名称，不带雪球等外链。"""
+def test_card_shows_code_and_name_only() -> None:
+    """展示内容只有 代码 + 名称（不带行业/市值等列）。"""
     notifier = FeishuNotifier(make_settings())
     text = card_text(posted_card(notifier, {"MaVolumeStrategy": ["600000", "600601"]}))
 
     assert "600000" in text and "浦发银行" in text
     assert "600601" in text and "方正科技" in text
-    assert "xueqiu.com" not in text
+
+
+def test_card_links_every_stock_to_xueqiu() -> None:
+    """每只股票都要挂雪球链接，保持「点代码跳行情」的老习惯。
+
+    链接的可见文本仍是 `代码 名称`，所以卡片不会变长。
+    交易所前缀规则与 HTML 报告共用（6→SH，4/8→BJ，其余→SZ）。
+    """
+    notifier = FeishuNotifier(make_settings())
+    text = card_text(posted_card(notifier, {"MaVolumeStrategy": ["600000", "300750", "830799"]}))
+
+    assert "https://xueqiu.com/S/SH600000" in text
+    assert "https://xueqiu.com/S/SZ300750" in text
+    assert "https://xueqiu.com/S/BJ830799" in text
+    # 可见文本仍是 代码 + 名称
+    assert "浦发银行" in text and "宁德时代" in text and "艾融软件" in text
 
 
 def test_card_falls_back_to_code_when_name_missing() -> None:
@@ -232,9 +247,7 @@ def test_card_elides_overlong_filter_description() -> None:
     """
     notifier = FeishuNotifier(make_settings())
     long_desc = "成交额 >=5亿，排除行业 " + "、".join(f"行业{i}" for i in range(200))
-    text = card_text(
-        posted_card(notifier, {"MaVolumeStrategy": ["600000"]}, filter_desc=long_desc)
-    )
+    text = card_text(posted_card(notifier, {"MaVolumeStrategy": ["600000"]}, filter_desc=long_desc))
 
     assert "成交额 >=5亿" in text
     assert "行业199" not in text
