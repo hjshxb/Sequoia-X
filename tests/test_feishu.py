@@ -254,6 +254,37 @@ def test_card_elides_overlong_filter_description() -> None:
     assert "…" in text
 
 
+def test_card_shows_trailing_condition_despite_long_blacklist() -> None:
+    """回归：行业黑名单很长时，排在它后面的筹码条件也必须出现在卡片上。
+
+    实测踩过：`describe()` 完整版里 44 个行业关键词就把 120 字预算吃光了，
+    卡片上的「筛股条件」以「…」结尾 —— 刚加的条件反而看不见。
+    所以卡片改用 `describe(brief=True)`（长关键词表折叠成「等 N 项」）。
+    """
+    from sequoia_x.data.universe_filter import UniverseFilter
+
+    settings = Settings(
+        db_path="data/test.db",
+        start_date="2024-01-01",
+        feishu_webhook_url="https://example.com/default",
+        min_market_cap=100,
+        min_pe=0,
+        min_turnover=5,
+        min_turn=2,
+        max_turn=20,
+        exclude_industries=",".join(f"行业{i}" for i in range(44)),
+        min_top10_free_holding=30,
+        _env_file=None,
+    )
+    desc = UniverseFilter(settings=settings).describe(brief=True).removeprefix("精筛：")
+
+    notifier = FeishuNotifier(settings)
+    text = card_text(posted_card(notifier, {"MaVolumeStrategy": ["600000"]}, filter_desc=desc))
+
+    assert "前十大流通股东 >=30%" in text
+    assert "…" not in text, "brief 描述不应再触发截断"
+
+
 def test_card_shows_summary_counts() -> None:
     """卡片要有命中策略数与选股总数，方便一眼看清。"""
     notifier = FeishuNotifier(make_settings())

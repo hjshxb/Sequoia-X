@@ -129,8 +129,10 @@ def main() -> None:
             try:
                 notifier.send_report(
                     results,
-                    # describe() 自带「精筛：」前缀，卡片里那行已有标签，去掉避免重复
-                    filter_desc=universe.describe().removeprefix("精筛："),
+                    # describe() 自带「精筛：」前缀，卡片里那行已有标签，去掉避免重复。
+                    # 必须用 brief=True：完整版里 40+ 个行业关键词会把后面的条款挤出
+                    # 卡片可视长度（实测「前十大流通股东」曾被截掉）。
+                    filter_desc=universe.describe(brief=True).removeprefix("精筛："),
                 )
             except Exception as exc:
                 logger.error(f"飞书推送异常，已忽略：{exc}")

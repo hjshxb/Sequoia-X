@@ -48,6 +48,9 @@ YI = 1e8  # 1 亿元
 # 回看窗口天数：覆盖周末与连续假期，取窗口内最后一个有数据的交易日
 _LOOKBACK_DAYS = 15
 
+# `describe(brief=True)` 时关键词表最多列出的项数，超出则折叠成「等 N 项」
+_BRIEF_KEYWORD_HEAD = 3
+
 # 进程内缓存：{symbol: StockMetric}，同一次运行内多策略共享
 _METRIC_CACHE: dict[str, StockMetric] = {}
 
@@ -190,8 +193,18 @@ class UniverseFilter:
             or self._holder_enabled
         )
 
-    def describe(self) -> str:
-        """返回人类可读的过滤条件描述，用于日志与报告页首。"""
+    def describe(self, *, brief: bool = False) -> str:
+        """返回人类可读的过滤条件描述，用于日志与报告页首。
+
+        Args:
+            brief: 为 True 时把长关键词表折叠成「前 3 个 等 N 项」。
+                **长度受限的展示端（飞书卡片）必须用 brief=True** ——
+                完整版里行业黑名单动辄 40+ 个关键词，会把后面的条款挤出可视长度。
+                报告页首（无长度限制）保留完整版。
+
+        Returns:
+            形如 `精筛：流通市值 >=100亿，成交额 >=5亿` 的描述文本。
+        """
         if not self.enabled:
             return "精筛：未启用"
 
@@ -205,6 +218,13 @@ class UniverseFilter:
                 return f">={lo:g}{unit}"
             return f"<={hi:g}{unit}"
 
+        def keywords(prefix: str, items: list[str]) -> str:
+            """关键词表。brief 模式下超长时只列前几个 + 总数。"""
+            if not brief or len(items) <= _BRIEF_KEYWORD_HEAD:
+                return prefix + "/".join(items)
+            head = "/".join(items[:_BRIEF_KEYWORD_HEAD])
+            return f"{prefix}{head} 等 {len(items)} 项"
+
         if s.min_market_cap is not None or s.max_market_cap is not None:
             parts.append(f"流通市值 {rng(s.min_market_cap, s.max_market_cap, '亿')}")
         if s.min_pe is not None or s.max_pe is not None:
@@ -217,9 +237,9 @@ class UniverseFilter:
             parts.append(f"换手率 {rng(s.min_turn, s.max_turn, '%')}")
         inc, exc = self._include_industries, self._exclude_industries
         if inc:
-            parts.append("行业含 " + "/".join(inc))
+            parts.append(keywords("行业含 ", inc))
         if exc:
-            parts.append("排除行业 " + "/".join(exc))
+            parts.append(keywords("排除行业 ", exc))
         if self._holder_enabled:
             holder_range = rng(s.min_top10_free_holding, s.max_top10_free_holding, "%")
             parts.append(f"前十大流通股东 {holder_range}")

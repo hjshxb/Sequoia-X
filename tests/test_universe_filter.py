@@ -224,6 +224,55 @@ def test_describe_mentions_all_dimensions():
         assert token in text
 
 
+# ── describe(brief=True)：给「长度受限」的展示端（飞书卡片）用 ──
+
+
+def test_describe_brief_collapses_long_keyword_list():
+    """长关键词表折叠成「前 3 个 等 N 项」，避免吃掉整行预算。"""
+    f = UniverseFilter(settings=make_settings(exclude_industries="房地产,银行,煤炭,钢铁,电力"))
+    brief = f.describe(brief=True)
+    assert "房地产/银行/煤炭" in brief
+    assert "等 5 项" in brief
+    assert "钢铁" not in brief
+
+
+def test_describe_default_keeps_every_keyword():
+    """默认（报告端）必须仍然列全，不因 brief 而丢失信息。"""
+    f = UniverseFilter(settings=make_settings(exclude_industries="房地产,银行,煤炭,钢铁,电力"))
+    assert "钢铁" in f.describe()
+
+
+def test_describe_brief_keeps_short_keyword_list():
+    f = UniverseFilter(settings=make_settings(include_industries="电子,软件"))
+    assert "行业含 电子/软件" in f.describe(brief=True)
+
+
+def test_describe_brief_omits_nothing_but_keyword_lists():
+    """brief 的核心诉求：短条款一个都不能少，尾部条款不能被长列表挤掉。"""
+    f = UniverseFilter(
+        settings=make_settings(
+            min_market_cap=100,
+            min_pe=0,
+            min_turnover=5,
+            min_turn=2,
+            max_turn=20,
+            exclude_industries=",".join(f"行业{i}" for i in range(44)),
+            min_top10_free_holding=30,
+        )
+    )
+    brief = f.describe(brief=True)
+    expected = [
+        "流通市值 >=100亿",
+        "市盈率TTM >=0",
+        "成交额 >=5亿",
+        "换手率 2~20%",
+        "前十大流通股东 >=30%",
+    ]
+    for token in expected:
+        assert token in brief
+    assert brief.startswith("精筛：")
+
+
 # ── 纯透传（未启用时不得发网络请求）──
 
 
