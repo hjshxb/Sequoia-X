@@ -54,6 +54,13 @@ class Settings(BaseSettings):
     # 且建议先用小批量（如 --workers 2）观察是否稳定。
     sync_workers: int = 1
 
+    # ── 股票静态信息缓存（代码 → 名称 / 行业）──
+    # 名称与行业几乎不变，但旧实现每次运行都要多一次 baostock login + 一次
+    # 全市场请求。现在落盘到行情库的 stock_meta 表（复用 db_path），
+    # 命中缓存即**完全不联网**，且数据源不可用时能用旧数据降级。
+    # 缓存有效期（天）：超过则联网刷新；0 = 每次都刷新。
+    stock_meta_ttl_days: int = 7
+
     # ── 本地 HTML 报告 ──
     # 跑完策略后生成一份本地单文件 HTML 报告（按策略分块展示选股结果）
     report_enabled: bool = True
@@ -101,6 +108,22 @@ class Settings(BaseSettings):
         """并发进程数必须落在 1~MAX_SYNC_WORKERS：0/负数无意义，过大易触发风控。"""
         if not 1 <= v <= MAX_SYNC_WORKERS:
             raise ValueError(f"sync_workers 必须在 1~{MAX_SYNC_WORKERS} 之间，当前为 {v}")
+        return v
+
+    @field_validator("stock_meta_ttl_days", mode="before")
+    @classmethod
+    def _blank_ttl_to_default(cls, v: object) -> object:
+        """`STOCK_META_TTL_DAYS=` 留空视为未配置，回落默认 7 天。"""
+        if isinstance(v, str) and v.strip() == "":
+            return 7
+        return v
+
+    @field_validator("stock_meta_ttl_days", mode="after")
+    @classmethod
+    def _check_ttl(cls, v: int) -> int:
+        """TTL 允许为 0（每次都刷新），但不接受负数。"""
+        if v < 0:
+            raise ValueError(f"stock_meta_ttl_days 不能为负，当前为 {v}")
         return v
 
     @classmethod

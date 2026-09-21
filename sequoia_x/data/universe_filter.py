@@ -18,7 +18,9 @@
     - 流通市值 / 市盈率 / 市净率 / 换手率：baostock 不复权日线，**只对候选股**查询，
       进程内缓存，多策略共享。
     - 成交额：本地 SQLite 一次批量查询（窗口函数），零网络开销。
-    - 行业：baostock `query_stock_industry()`，整市场一次请求 + 进程内缓存。
+    - 行业：baostock `query_stock_industry()`，整市场一次请求；结果落盘到
+      本地库的 `stock_meta` 表（见 stock_meta.load_stock_meta），
+      命中缓存时**零网络请求**，数据源不可用时降级用本地旧数据。
     - 筹码集中度：东财全市场接口（**非逐股**），按报告期落盘缓存，
       一年仅更新 4 次，命中缓存后零网络开销（见 data/holder_concentration.py）。
     - **五个维度都未配置时完全不产生网络请求。**
