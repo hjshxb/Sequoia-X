@@ -31,16 +31,37 @@ CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_daily (symbol, date);
 """
 
 
+class BaostockUnavailable(RuntimeError):
+    """baostock 整体不可用：登录被拒（如被风控拉黑）或整批查询全部失败。
+
+    刻意用独立异常类型而不是返回空列表 —— 空列表会被上层当成「非交易日、无新数据」，
+    于是拿旧数据照跑策略并推送，把数据源故障伪装成正常结果。
+    """
+
+
 def _bs_fetch_batch(tasks: list) -> list:
     """同步 worker：独立 login，批量拉取 baostock 数据。
 
     单进程模式下由 `sync_today_bulk` 直接调用（整份任务一次传入）；
     多进程模式下作为 `Pool.map` 的任务函数，每个分片各起一个进程。
+
+    Raises:
+        BaostockUnavailable: 登录失败，或本批查询**全部**失败。
+            登录失败必须立即抛出、一只都不许查 —— 旧实现丢弃了 `bs.login()`
+            的返回值，照样给整批股票各发一次注定失败的请求，把一次故障放大成
+            「全市场重试风暴」，最终换来 10001011 黑名单（历史事故的放大器）。
     """
     import baostock as bs
 
-    bs.login()
+    lg = bs.login()
+    if lg.error_code != "0":
+        raise BaostockUnavailable(
+            f"baostock 登录失败: {lg.error_code} {lg.error_msg}"
+            f"（{len(tasks)} 只待拉取，已放弃，未发出任何行情请求）"
+        )
+
     results = []
+    failed = 0
     for symbol, bs_code, start, end in tasks:
         rs = bs.query_history_k_data_plus(
             bs_code,
@@ -51,10 +72,21 @@ def _bs_fetch_batch(tasks: list) -> list:
             adjustflag="1",  # 后复权
         )
         if rs.error_code != "0":
+            failed += 1
             continue
         while rs.next():
             results.append([symbol] + rs.get_row_data())
     bs.logout()
+
+    # 个别股票查不到（退市 / 长期停牌 / 新代码）是正常的，跳过即可；
+    # 但「整批全部失败」只可能是数据源出了问题，不能伪装成「无新数据」。
+    if failed and failed == len(tasks):
+        raise BaostockUnavailable(
+            f"baostock 本批 {len(tasks)} 只股票查询全部失败，判定为数据源故障"
+        )
+    if failed:
+        logger.warning(f"本批 {len(tasks)} 只中有 {failed} 只查询失败，已跳过")
+
     return results
 
 
@@ -180,20 +212,27 @@ class DataEngine:
         # 且 baostock 的连接与报错都留在主进程，排障时日志是一条完整时间线。
         n_workers = max(1, min(self.sync_workers, len(tasks)))
 
-        if n_workers == 1:
-            logger.info(f"需要更新 {len(tasks)} 只股票，单进程串行拉取...")
-            all_rows = _bs_fetch_batch(tasks)
-        else:
-            from multiprocessing import Pool
+        try:
+            if n_workers == 1:
+                logger.info(f"需要更新 {len(tasks)} 只股票，单进程串行拉取...")
+                all_rows = _bs_fetch_batch(tasks)
+            else:
+                from multiprocessing import Pool
 
-            logger.info(f"需要更新 {len(tasks)} 只股票，启动 {n_workers} 进程并行拉取...")
-            chunks = [tasks[i::n_workers] for i in range(n_workers)]
-            with Pool(n_workers) as pool:
-                batch_results = pool.map(_bs_fetch_batch, chunks)
-            all_rows = [row for batch in batch_results for row in batch]
+                logger.info(f"需要更新 {len(tasks)} 只股票，启动 {n_workers} 进程并行拉取...")
+                chunks = [tasks[i::n_workers] for i in range(n_workers)]
+                with Pool(n_workers) as pool:
+                    batch_results = pool.map(_bs_fetch_batch, chunks)
+                all_rows = [row for batch in batch_results for row in batch]
+        except BaostockUnavailable as exc:
+            # 数据源不可用必须显式失败并终止主流程，绝不能返回 0 ——
+            # 返回 0 会让上层拿上一交易日的旧数据照跑策略并推送，
+            # 把「拿不到数据」伪装成「今天没有信号」。
+            logger.error(f"baostock 不可用，本次增量同步中止（未改动数据库）：{exc}")
+            raise
 
         if not all_rows:
-            logger.info("无新数据（可能非交易日）")
+            logger.info("所有查询均成功但无新行（非交易日 / 数据源尚未更新）")
             return 0
 
         df = pd.DataFrame(

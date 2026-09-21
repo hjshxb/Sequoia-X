@@ -21,7 +21,7 @@ socket.setdefaulttimeout(10.0)
 
 from sequoia_x.core.config import MAX_SYNC_WORKERS, get_settings
 from sequoia_x.core.logger import get_logger
-from sequoia_x.data.engine import DataEngine
+from sequoia_x.data.engine import BaostockUnavailable, DataEngine
 from sequoia_x.data.universe_filter import UniverseFilter
 from sequoia_x.notify.feishu import FeishuNotifier
 from sequoia_x.notify.html_report import HtmlReportGenerator
@@ -97,7 +97,13 @@ def main() -> None:
 
         # ── 日常模式：单次 API 补今天 + 策略 + 推送 ──
         logger.info("开始拉取最新快照...")
-        count = engine.sync_today_bulk()
+        try:
+            count = engine.sync_today_bulk()
+        except BaostockUnavailable as exc:
+            # 数据源不可用 ⇒ 直接终止。绝不拿上一交易日的旧数据照跑策略并推送，
+            # 那等于用陈旧数据冒充当日选股结果，比不出结果更糟。
+            logger.error(f"数据源不可用，本次不生成报告、不推送飞书：{exc}")
+            sys.exit(1)
         logger.info(f"快照同步完成，写入 {count} 只股票")
 
         # 4. 前置过滤：先算出全市场合格股票池，再交给各策略执行。
