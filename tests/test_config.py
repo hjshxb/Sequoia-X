@@ -21,7 +21,47 @@ def test_env_overrides_default(db_path: str, monkeypatch) -> None:
     assert s.db_path == db_path
 
 
-# Feature: sequoia-x-v2, Property 2: 缺失必填字段触发 ValidationError
+# Feature: sequoia-x-v2, Property 2: 同步并发进程数可配置、默认单进程
+def test_sync_workers_defaults_to_single_process() -> None:
+    """默认必须为单进程 —— 并发登录会触发 baostock 风控拉黑。"""
+    from sequoia_x.core.config import Settings
+
+    s = Settings(_env_file=None, feishu_webhook_url="https://example.com/hook")
+    assert s.sync_workers == 1
+
+
+def test_sync_workers_can_be_overridden(monkeypatch) -> None:
+    """可通过环境变量手动指定并发进程数。"""
+    import sequoia_x.core.config as cfg_module
+    from sequoia_x.core.config import Settings
+
+    monkeypatch.setenv("SYNC_WORKERS", "4")
+    monkeypatch.setenv("FEISHU_WEBHOOK_URL", "https://example.com/hook")
+    monkeypatch.setattr(cfg_module, "_settings", None)
+    assert Settings().sync_workers == 4
+
+
+def test_sync_workers_blank_falls_back_to_default() -> None:
+    """`.env` 里 `SYNC_WORKERS=` 留空是常见写法，应回落到默认 1 而不是报错。"""
+    from sequoia_x.core.config import Settings
+
+    s = Settings(_env_file=None, feishu_webhook_url="https://example.com/hook", sync_workers="")
+    assert s.sync_workers == 1
+
+
+@pytest.mark.parametrize("bad", [0, -1, 33, 999])
+def test_sync_workers_rejects_out_of_range(bad: int) -> None:
+    """0/负数无意义；过大极易触发风控 —— 非法值应在启动时直接报错。"""
+    from sequoia_x.core.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            feishu_webhook_url="https://example.com/hook",
+            sync_workers=bad,
+        )
+
+
 def test_missing_required_field_raises() -> None:
     """属性 2：缺少 feishu_webhook_url 时，实例化 Settings 应抛出 ValidationError。"""
     import os

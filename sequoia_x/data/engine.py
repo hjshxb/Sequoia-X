@@ -32,7 +32,11 @@ CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_daily (symbol, date);
 
 
 def _bs_fetch_batch(tasks: list) -> list:
-    """多进程 worker：独立 login，批量拉取 baostock 数据。"""
+    """同步 worker：独立 login，批量拉取 baostock 数据。
+
+    单进程模式下由 `sync_today_bulk` 直接调用（整份任务一次传入）；
+    多进程模式下作为 `Pool.map` 的任务函数，每个分片各起一个进程。
+    """
     import baostock as bs
 
     bs.login()
@@ -60,6 +64,8 @@ class DataEngine:
     def __init__(self, settings: Settings) -> None:
         self.db_path: str = settings.db_path
         self.start_date: str = settings.start_date
+        # 增量同步的并发进程数，默认 1（单进程串行）。见 config.MAX_SYNC_WORKERS 说明。
+        self.sync_workers: int = settings.sync_workers
         self._init_db()
 
     def _init_db(self) -> None:
@@ -137,9 +143,13 @@ class DataEngine:
     # ── 数据同步 ──
 
     def sync_today_bulk(self) -> int:
-        """多进程并行通过 baostock 拉取增量数据（后复权），写入 SQLite。"""
+        """通过 baostock 拉取增量数据（后复权），写入 SQLite。
+
+        并发度由 `SYNC_WORKERS` 控制，**默认 1（单进程串行）**。
+        历史上 8 进程并发拉全市场曾触发 baostock 风控黑名单（10001011），
+        故默认保守；需要提速时再手动调大 `SYNC_WORKERS`。
+        """
         from datetime import date, timedelta
-        from multiprocessing import Pool
 
         today_str = date.today().strftime("%Y-%m-%d")
 
@@ -165,17 +175,22 @@ class DataEngine:
             logger.info("所有股票已是最新，无需更新")
             return 0
 
-        logger.info(f"需要更新 {len(tasks)} 只股票，启动多进程并行拉取...")
+        # 并发度：配置值 与 待更新股票数 取小，避免创建空分片。
+        # 单进程时刻意不进 multiprocessing.Pool —— 省掉 fork 与任务序列化，
+        # 且 baostock 的连接与报错都留在主进程，排障时日志是一条完整时间线。
+        n_workers = max(1, min(self.sync_workers, len(tasks)))
 
-        n_workers = min(8, len(tasks))
-        chunks = [tasks[i::n_workers] for i in range(n_workers)]
+        if n_workers == 1:
+            logger.info(f"需要更新 {len(tasks)} 只股票，单进程串行拉取...")
+            all_rows = _bs_fetch_batch(tasks)
+        else:
+            from multiprocessing import Pool
 
-        with Pool(n_workers) as pool:
-            batch_results = pool.map(_bs_fetch_batch, chunks)
-
-        all_rows = []
-        for batch in batch_results:
-            all_rows.extend(batch)
+            logger.info(f"需要更新 {len(tasks)} 只股票，启动 {n_workers} 进程并行拉取...")
+            chunks = [tasks[i::n_workers] for i in range(n_workers)]
+            with Pool(n_workers) as pool:
+                batch_results = pool.map(_bs_fetch_batch, chunks)
+            all_rows = [row for batch in batch_results for row in batch]
 
         if not all_rows:
             logger.info("无新数据（可能非交易日）")

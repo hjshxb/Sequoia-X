@@ -1,11 +1,13 @@
 """Sequoia-X V2 主程序入口。
 
 两种运行模式：
-  python main.py               # 日常模式：8进程增量补数据 + 跑策略 + 飞书推送（2~3分钟）
+  python main.py               # 日常模式：增量补数据 + 跑策略 + 飞书推送
   python main.py --backfill    # 回填模式：baostock 拉全市场历史K线（首次/补数据用，约12分钟）
 
 可选开关：
   --no-push                    # 只跑策略并生成本地 HTML 报告，跳过飞书推送
+  --workers N                  # 覆盖 SYNC_WORKERS，指定增量同步的并发进程数（1~32）
+                               # 默认取配置，未配置即单进程串行
 """
 
 import argparse
@@ -17,7 +19,7 @@ import socket
 
 socket.setdefaulttimeout(10.0)
 
-from sequoia_x.core.config import get_settings
+from sequoia_x.core.config import MAX_SYNC_WORKERS, get_settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data.engine import DataEngine
 from sequoia_x.data.universe_filter import UniverseFilter
@@ -50,15 +52,33 @@ def main() -> None:
         action="store_true",
         help="跳过飞书推送，仅跑策略并生成本地 HTML 报告",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            f"增量同步的并发进程数（1~{MAX_SYNC_WORKERS}），覆盖 SYNC_WORKERS；"
+            "默认取配置（未配置即单进程串行）"
+        ),
+    )
     args = parser.parse_args()
 
     try:
         # 1. 初始化配置
         settings = get_settings()
 
+        # 1.1 命令行 --workers 覆盖配置。范围在这里就先挡掉，
+        #     避免把一个明显错误的并发度带进同步流程。
+        if args.workers is not None:
+            if not 1 <= args.workers <= MAX_SYNC_WORKERS:
+                parser.error(f"--workers 必须在 1~{MAX_SYNC_WORKERS} 之间")
+            settings.sync_workers = args.workers
+
         # 2. 初始化日志
         logger = get_logger(__name__)
         logger.info("Sequoia-X V2 启动")
+        logger.info(f"增量同步并发进程数：{settings.sync_workers}")
 
         # 3. 初始化数据引擎
         engine = DataEngine(settings)

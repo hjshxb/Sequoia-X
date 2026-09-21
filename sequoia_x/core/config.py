@@ -3,6 +3,11 @@
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# baostock 增量同步允许的最大并发进程数。
+# 上限刻意收得很紧：baostock 对同一客户端的并发登录有风控，实测 8 进程并发
+# 拉全市场 5000+ 只股票会触发「黑名单用户(10001011)」，恢复期极长。
+MAX_SYNC_WORKERS = 32
+
 
 class Settings(BaseSettings):
     db_path: str = "data/sequoia_v2.db"
@@ -41,6 +46,14 @@ class Settings(BaseSettings):
     # 股东数据缓存目录
     holder_cache_dir: str = "data/cache"
 
+    # ── 数据同步 ──
+    # baostock 增量同步的并发进程数。**默认 1（单进程串行）**。
+    # 注意：并行登录会触发 baostock 风控。历史上「5221 只 × 8 进程」的重试风暴
+    # 直接换来「黑名单用户(10001011)」，且每次登录要 1.5~2 分钟才超时，排障极痛。
+    # 因此默认保守串行；确有需要再手动调大（上限见 MAX_SYNC_WORKERS），
+    # 且建议先用小批量（如 --workers 2）观察是否稳定。
+    sync_workers: int = 1
+
     # ── 本地 HTML 报告 ──
     # 跑完策略后生成一份本地单文件 HTML 报告（按策略分块展示选股结果）
     report_enabled: bool = True
@@ -72,6 +85,22 @@ class Settings(BaseSettings):
         """把空字符串/空白字符串视为「未配置」（.env 中留空是常见写法）。"""
         if isinstance(v, str) and v.strip() == "":
             return None
+        return v
+
+    @field_validator("sync_workers", mode="before")
+    @classmethod
+    def _blank_sync_workers_to_default(cls, v: object) -> object:
+        """`.env` 里写 `SYNC_WORKERS=`（留空）是常见写法，视为未配置，回落默认 1。"""
+        if isinstance(v, str) and v.strip() == "":
+            return 1
+        return v
+
+    @field_validator("sync_workers", mode="after")
+    @classmethod
+    def _check_sync_workers(cls, v: int) -> int:
+        """并发进程数必须落在 1~MAX_SYNC_WORKERS：0/负数无意义，过大易触发风控。"""
+        if not 1 <= v <= MAX_SYNC_WORKERS:
+            raise ValueError(f"sync_workers 必须在 1~{MAX_SYNC_WORKERS} 之间，当前为 {v}")
         return v
 
     @classmethod
