@@ -53,10 +53,15 @@ def login(user_id="anonymous", password="123456"):
         return _LoginResult("10001011", "黑名单用户，请与管理员联系")
     if MODE == "login_network":
         return _LoginResult("10002007", "网络接收错误。")
+    # 真实 baostock 登录成功会**直接往 stdout 打印**这行（库内部的 print，
+    # 不是日志）。必须模拟，否则测试抓不到「噪音污染 $(...) 捕获」这一类问题
+    # —— 真机上踩过：IS_TRADE 变成 "login success!\nlogout success!\n1"。
+    print("login success!")
     return _LoginResult("0", "success")
 
 
 def logout():
+    print("logout success!")
     return _LoginResult("0", "success")
 
 

@@ -20,25 +20,52 @@ echo "项目: $PROJ"
 # 刻意**不**丢弃 stderr：baostock 的失败原因（login failed / 错误码）是排障的关键，
 # 之前用 2>/dev/null 把它们全吞了，只留下一个无从下手的 "ERR"。
 # 同时把错误码/错误信息随 stdout 一起带出来，方便直接读出「黑名单」还是「网络故障」。
+#
+# ⚠️ 但必须把 baostock **自己**的 stdout 吞掉：库内部会直接 print
+#    "login success!" / "logout success!"，这些行会被 $(...) 一并捕获，
+#    IS_TRADE 就变成 "login success!\nlogout success!\n1"，
+#    匹配不到任何 case 分支 → 每个交易日都落到兜底被判 exit 3、静默跳过选股。
+#    （9/22 18:30 那次之所以正常，是因为当时还是旧的 if 版本，非法值恰好
+#      「漏」下去执行了 main.py —— 正是上面刚堵掉的那个洞。）
+#    所以这里用 redirect_stdout 把 baostock 的输出整体吞进内存，
+#    只让自己算出来的 _result 走 stdout，保证 stdout 上有且仅有一行结果。
 IS_TRADE=$("$PY" - <<'PYEOF'
+import contextlib
 import datetime
+import io
+
 try:
     import baostock as bs
 except Exception as exc:
-    print(f"ERR:import:{exc}"); raise SystemExit
-lg = bs.login()
-if lg.error_code != "0":
-    print(f"ERR:login:{lg.error_code}:{lg.error_msg}"); raise SystemExit
-d = datetime.date.today().strftime("%Y-%m-%d")
-rs = bs.query_trade_dates(start_date=d, end_date=d)
-flag = ""
-while rs.error_code == "0" and rs.next():
-    flag = rs.get_row_data()[1]
-bs.logout()
-if flag in ("0", "1"):
-    print(flag)
-else:
-    print(f"ERR:calendar:{rs.error_code}:{rs.error_msg}")
+    print(f"ERR:import:{exc}")
+    raise SystemExit
+
+# 初值兜底：无论中途发生什么，stdout 上都必定有一行非空结果，
+# 绝不留下空串让 case 落进 *) 兜底。
+_result = "ERR:unknown:未执行到任何分支"
+_swallowed = io.StringIO()
+with contextlib.redirect_stdout(_swallowed):
+    try:
+        lg = bs.login()
+        if lg.error_code != "0":
+            _result = f"ERR:login:{lg.error_code}:{lg.error_msg}"
+        else:
+            d = datetime.date.today().strftime("%Y-%m-%d")
+            rs = bs.query_trade_dates(start_date=d, end_date=d)
+            flag = ""
+            while rs.error_code == "0" and rs.next():
+                flag = rs.get_row_data()[1]
+            if flag in ("0", "1"):
+                _result = flag
+            else:
+                _result = f"ERR:calendar:{rs.error_code}:{rs.error_msg}"
+    except Exception as exc:  # 未预期异常也不能冒充「交易日」
+        _result = f"ERR:exception:{type(exc).__name__}:{exc}"
+    finally:
+        with contextlib.suppress(Exception):
+            bs.logout()
+
+print(_result)
 PYEOF
 )
 echo "今日交易日标志: $IS_TRADE  (1=交易日, 0=休市, ERR:*=查询失败)"
