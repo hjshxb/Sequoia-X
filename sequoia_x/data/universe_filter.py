@@ -1,35 +1,37 @@
 """股票池过滤器：对策略初选结果做统一的多维度精筛。
 
-支持五个维度，全部可选（未配置即该维度不参与过滤）：
+支持六个维度，全部可选（未配置即该维度不参与过滤）：
     1. 估值   —— 流通市值区间、市盈率(TTM)区间、市净率区间
     2. 流动性 —— 成交额下限（取自本地库，无需联网）
     3. 技术面 —— 换手率区间
-    4. 行业   —— 行业关键词白名单 / 黑名单（子串匹配）
-    5. 筹码   —— 前十大流通股东合计持股占流通股比例区间
+    4. 技术面 —— 今日跌幅区间（取自本地库，无需联网）
+    5. 行业   —— 行业关键词白名单 / 黑名单（子串匹配）
+    6. 筹码   —— 前十大流通股东合计持股占流通股比例区间
 
 两种调用方式：
     - `apply(symbols)`            —— 后置过滤：对策略初选结果做精筛。
     - `get_passing_universe()`    —— 前置过滤：先算出全市场合格股票池，
                                      再交给策略去执行（见 BaseStrategy.set_universe）。
-      前置过滤采用**分级执行**：先用零成本维度（成交额/行业/筹码）把全市场收窄，
-      再对残余股票拉取昂贵指标（市值/PE/PB/换手率），避免对 5000+ 只逐个联网。
+      前置过滤采用**分级执行**：先用零成本维度（成交额/今日跌幅/行业/筹码）
+      把全市场收窄，再对残余股票拉取昂贵指标（市值/PE/PB/换手率），
+      避免对 5000+ 只逐个联网。
 
 数据来源与成本：
     - 流通市值 / 市盈率 / 市净率 / 换手率：baostock 不复权日线，**只对候选股**查询，
       进程内缓存，多策略共享。
-    - 成交额：本地 SQLite 一次批量查询（窗口函数），零网络开销。
+    - 成交额 / 今日跌幅：本地 SQLite 一次批量查询（窗口函数），零网络开销。
     - 行业：baostock `query_stock_industry()`，整市场一次请求；结果落盘到
       本地库的 `stock_meta` 表（见 stock_meta.load_stock_meta），
       命中缓存时**零网络请求**，数据源不可用时降级用本地旧数据。
     - 筹码集中度：东财全市场接口（**非逐股**），按报告期落盘缓存，
       一年仅更新 4 次，命中缓存后零网络开销（见 data/holder_concentration.py）。
-    - **五个维度都未配置时完全不产生网络请求。**
+    - **六个维度都未配置时完全不产生网络请求。**
 
 容错策略（重要）：
     - 某一数据源「完全拉取失败」时，只跳过该维度的判据并记 ERROR，
       其余维度照常生效 —— 避免单个数据源故障把全部股票误杀成空结果。
     - 单只股票某个指标缺失，视为不通过该维度（例如亏损股 peTTM 为空）。
-      例外：行业与筹码数据存在**结构性缺失**（次新股/未披露），
+      例外：行业 / 筹码 / 今日跌幅存在**结构性缺失**（次新股、未披露、停牌），
       只有在配置了下限（白名单 / MIN）时才剔除缺失股，配上限时放行。
 """
 
@@ -115,12 +117,14 @@ class _Context:
     valuation: bool
     liquidity: bool
     technical: bool
+    today_drop: bool
     industry: bool
     holder: bool
     metrics: dict[str, StockMetric]
     turnovers: dict[str, float]
     metas: dict
     holdings: dict[str, float]
+    drops: dict[str, float]
     reasons: dict[str, int] = field(default_factory=dict)
 
     def drop(self, reason: str) -> None:
@@ -185,12 +189,17 @@ class UniverseFilter:
         )
 
     @property
+    def _today_drop_enabled(self) -> bool:
+        return self.settings.min_today_drop is not None or self.settings.max_today_drop is not None
+
+    @property
     def enabled(self) -> bool:
         """是否启用了任一维度的过滤。"""
         return (
             self._valuation_enabled
             or self._liquidity_enabled
             or self._technical_enabled
+            or self._today_drop_enabled
             or self._industry_enabled
             or self._holder_enabled
         )
@@ -237,6 +246,8 @@ class UniverseFilter:
             parts.append(f"成交额 >={s.min_turnover:g}亿")
         if self._technical_enabled:
             parts.append(f"换手率 {rng(s.min_turn, s.max_turn, '%')}")
+        if self._today_drop_enabled:
+            parts.append(f"今日跌幅 {rng(s.min_today_drop, s.max_today_drop, '%')}")
         inc, exc = self._include_industries, self._exclude_industries
         if inc:
             parts.append(keywords("行业含 ", inc))
@@ -355,6 +366,39 @@ class UniverseFilter:
             if row.get("turnover") is not None
         }
 
+    def _fetch_today_drops(self, symbols: list[str]) -> dict[str, float]:
+        """取每只股票的**今日跌幅**（%），正数表示下跌、负数表示上涨。
+
+        口径：`(今收 - 昨收) / 昨收`，数据全部来自本地行情库，无网络开销。
+        「今日」以**全市场最新交易日**为基准：停牌股的最后一行早于该日，
+        不能拿停牌前的旧涨跌幅充数，所以这类股票不进结果（按数据缺失处理）。
+
+        Returns:
+            {股票代码: 今日跌幅(%)}；取不到数据时返回 {}。
+        """
+        if self.engine is None:
+            return {}
+
+        try:
+            latest = self.engine.get_market_latest_date()  # type: ignore[attr-defined]
+            rows = self.engine.get_recent_rows(symbols, rows=2)  # type: ignore[attr-defined]
+        except Exception as exc:
+            logger.error(f"精筛：本地行情读取失败 {exc}")
+            return {}
+
+        drops: dict[str, float] = {}
+        for symbol, series in rows.items():
+            if len(series) < 2:
+                continue  # 次新股 / 长期停牌：没有昨收，算不出涨跌幅
+            last, prev = series[-1], series[-2]
+            if latest is not None and last["date"] != latest:
+                continue  # 当日停牌：最后一行不是全市场最新交易日
+            close, prev_close = last["close"], prev["close"]
+            if not close or not prev_close:
+                continue
+            drops[symbol] = -(close - prev_close) / prev_close * 100
+        return drops
+
     def _fetch_holder_ratios(self) -> dict[str, float]:
         """取全市场「前十大流通股东合计持股占流通股比例」（%）。
 
@@ -402,6 +446,7 @@ class UniverseFilter:
             valuation=self._valuation_enabled,
             liquidity=self._liquidity_enabled,
             technical=self._technical_enabled,
+            today_drop=self._today_drop_enabled,
             industry=self._industry_enabled,
             holder=self._holder_enabled,
         )
@@ -410,8 +455,8 @@ class UniverseFilter:
         """返回通过精筛的**全市场**股票池，供策略在执行前限定候选范围（前置过滤）。
 
         分级执行以控制网络成本：
-          第 1 级 —— 零边际成本维度：成交额取自本地库（无请求）、行业为全市场单次请求、
-                     筹码集中度为全市场单次请求（按报告期缓存），
+          第 1 级 —— 零边际成本维度：成交额与今日跌幅取自本地库（无请求）、
+                     行业与筹码集中度为全市场单次请求（筹码还按报告期缓存），
                      先把 5000+ 只收窄到几百只；
           第 2 级 —— 昂贵维度：市值 / PE / PB / 换手率需逐股请求 baostock，
                      只对第 1 级的残余执行。
@@ -431,27 +476,30 @@ class UniverseFilter:
             return all_symbols
 
         liquidity_on = self._liquidity_enabled
+        today_drop_on = self._today_drop_enabled
         industry_on = self._industry_enabled
         holder_on = self._holder_enabled
 
-        if not (liquidity_on or industry_on or holder_on):
+        if not (liquidity_on or today_drop_on or industry_on or holder_on):
             logger.warning(
-                "精筛预筛：未配置「成交额 / 行业 / 筹码」等零成本维度，"
+                "精筛预筛：未配置「成交额 / 今日跌幅 / 行业 / 筹码」等零成本维度，"
                 f"将直接对全市场 {len(all_symbols)} 只拉取估值/换手率指标，"
                 "单线程耗时约 10 分钟以上"
             )
 
-        # 第 1 级：零边际成本维度（本地库成交额 + 全市场单次行业/股东请求）
+        # 第 1 级：零边际成本维度（本地库成交额/跌幅 + 全市场单次行业/股东请求）
         stage1 = self._apply(
             all_symbols,
             valuation=False,
             liquidity=liquidity_on,
             technical=False,
+            today_drop=today_drop_on,
             industry=industry_on,
             holder=holder_on,
         )
         logger.info(
-            f"精筛预筛：全市场 {len(all_symbols)} -> {len(stage1)}（成交额/行业/筹码，零边际成本）"
+            f"精筛预筛：全市场 {len(all_symbols)} -> {len(stage1)}"
+            "（成交额/今日跌幅/行业/筹码，零边际成本）"
         )
 
         if not stage1:
@@ -463,6 +511,7 @@ class UniverseFilter:
             valuation=self._valuation_enabled,
             liquidity=False,
             technical=self._technical_enabled,
+            today_drop=False,
             industry=False,
             holder=False,
         )
@@ -476,6 +525,7 @@ class UniverseFilter:
         valuation: bool,
         liquidity: bool,
         technical: bool,
+        today_drop: bool = False,
         industry: bool,
         holder: bool = False,
     ) -> list[str]:
@@ -488,7 +538,8 @@ class UniverseFilter:
             symbols: 待过滤的股票代码列表。
             valuation: 是否启用估值维度（市值/PE/PB）。
             liquidity: 是否启用流动性维度（成交额）。
-            technical: 是否启用手技术面维度（换手率）。
+            technical: 是否启用技术面维度（换手率）。
+            today_drop: 是否启用今日跌幅维度（本地库今收 vs 昨收）。
             industry: 是否启用行业维度（白名单/黑名单）。
             holder: 是否启用筹码维度（前十大流通股东合计占比）。
 
@@ -497,7 +548,7 @@ class UniverseFilter:
         """
         if not symbols:
             return list(symbols)
-        if not (valuation or liquidity or technical or industry or holder):
+        if not (valuation or liquidity or technical or today_drop or industry or holder):
             return list(symbols)
 
         # 维度是否生效。注意：某一数据源「完全拉取失败」时必须把对应维度真正关掉，
@@ -505,6 +556,7 @@ class UniverseFilter:
         valuation_on = valuation
         technical_on = technical
         liquidity_on = liquidity
+        today_drop_on = today_drop
         industry_on = industry
         holder_on = holder
 
@@ -524,7 +576,15 @@ class UniverseFilter:
                 logger.error("精筛：成交额数据完全获取失败，跳过该维度")
                 liquidity_on = False
 
-        # 3) 行业（baostock 全市场一次请求）
+        # 3) 今日跌幅（本地库，无网络开销）
+        drops: dict[str, float] = {}
+        if today_drop_on:
+            drops = self._fetch_today_drops(symbols)
+            if not drops:
+                logger.error("精筛：本地行情（今日跌幅）完全获取失败，跳过该维度")
+                today_drop_on = False
+
+        # 4) 行业（baostock 全市场一次请求）
         metas: dict = {}
         if industry_on:
             metas = stock_meta_module.load_stock_meta()
@@ -532,7 +592,7 @@ class UniverseFilter:
                 logger.error("精筛：行业数据完全获取失败，跳过该维度")
                 industry_on = False
 
-        # 4) 筹码集中度（东财全市场一次请求 + 报告期磁盘缓存）
+        # 5) 筹码集中度（东财全市场一次请求 + 报告期磁盘缓存）
         holdings: dict[str, float] = {}
         if holder_on:
             holdings = self._fetch_holder_ratios()
@@ -544,12 +604,14 @@ class UniverseFilter:
             valuation=valuation_on,
             liquidity=liquidity_on,
             technical=technical_on,
+            today_drop=today_drop_on,
             industry=industry_on,
             holder=holder_on,
             metrics=metrics,
             turnovers=turnovers,
             metas=metas,
             holdings=holdings,
+            drops=drops,
         )
 
         kept: list[str] = []
@@ -627,6 +689,27 @@ class UniverseFilter:
             if s.max_turn is not None and metric.turn > s.max_turn:
                 ctx.drop("换手率偏高")
                 return False
+
+        # ── 今日跌幅：本地库（今收 vs 昨收）──
+        if ctx.today_drop:
+            drop = ctx.drops.get(symbol)
+            lo = s.min_today_drop
+            hi = s.max_today_drop
+
+            if drop is None:
+                # 停牌 / 次新股当日没有行情。
+                #   设了下限 -> 无法证明它「跌够深」，判不通过；
+                #   只设上限 -> 无法证明它「跌超上限」，放行。
+                if lo is not None:
+                    ctx.drop("今日行情缺失")
+                    return False
+            else:
+                if lo is not None and drop < lo:
+                    ctx.drop("今日跌幅不足")
+                    return False
+                if hi is not None and drop > hi:
+                    ctx.drop("今日跌幅过大")
+                    return False
 
         # ── 行业：白名单 / 黑名单（子串匹配）──
         if ctx.industry:

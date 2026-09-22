@@ -345,3 +345,77 @@ def test_sync_today_bulk_returns_zero_only_on_genuine_no_new_data(monkeypatch) -
 
         monkeypatch.setattr(engine_module, "_bs_fetch_batch", lambda _tasks: [])
         assert engine.sync_today_bulk() == 0
+
+
+# ── 最近两个交易日的行情（供「今日跌幅」维度使用）──
+
+
+def _seed_daily(engine: DataEngine, rows: list[tuple[str, str, float]]) -> None:
+    """rows: [(symbol, date, close), ...]，其余字段用 close 填充占位。"""
+    with sqlite3.connect(engine.db_path) as conn:
+        conn.executemany(
+            "INSERT INTO stock_daily "
+            "(symbol, date, open, high, low, close, volume, turnover) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            [(s, d, c, c, c, c, 1.0, 1.0) for s, d, c in rows],
+        )
+        conn.commit()
+
+
+def test_get_market_latest_date_takes_max_across_all_symbols() -> None:
+    """基准日必须取全市场 MAX(date)，而不是某只股票自己的 MAX(date)。
+
+    停牌股的最后一行会明显早于全市场，若按逐股取值，就会把停牌前的
+    旧涨跌幅当成「今日跌幅」。
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        _seed_daily(
+            engine,
+            [
+                ("600000", "2026-09-21", 10.0),
+                ("600000", "2026-09-22", 10.5),
+                ("000001", "2026-09-18", 8.0),  # 09-18 之后一直停牌
+            ],
+        )
+        assert engine.get_market_latest_date() == "2026-09-22"
+
+
+def test_get_market_latest_date_on_empty_db_returns_none() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        assert engine.get_market_latest_date() is None
+
+
+def test_get_recent_rows_returns_rows_in_chronological_order() -> None:
+    """升序返回：[-1] 是最新一行，[-2] 即昨收。"""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        _seed_daily(
+            engine,
+            [
+                ("600000", "2026-09-18", 10.0),
+                ("600000", "2026-09-21", 10.2),
+                ("600000", "2026-09-22", 9.9),
+            ],
+        )
+        rows = engine.get_recent_rows(["600000"], rows=2)
+        assert [r["date"] for r in rows["600000"]] == ["2026-09-21", "2026-09-22"]
+        assert rows["600000"][-1]["close"] == 9.9
+        assert rows["600000"][-2]["close"] == 10.2
+
+
+def test_get_recent_rows_handles_single_row_and_unknown_symbol() -> None:
+    """次新股只有一行；完全不存在的代码不进入结果。"""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        _seed_daily(engine, [("600000", "2026-09-22", 10.0)])
+        rows = engine.get_recent_rows(["600000", "000002"], rows=2)
+        assert len(rows["600000"]) == 1
+        assert "000002" not in rows
+
+
+def test_get_recent_rows_empty_input_returns_empty() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        assert engine.get_recent_rows([], rows=2) == {}

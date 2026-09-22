@@ -31,14 +31,22 @@ class Settings(BaseSettings):
     # 3) 技术面：换手率区间，单位：%
     min_turn: float | None = None
     max_turn: float | None = None
-    # 4) 行业：逗号分隔的关键词，子串匹配行业名。
+    # 4) 技术面（本地库）：今日跌幅区间，单位：%
+    #    跌幅是**有符号**量：正数 = 下跌（5 表示今日跌 5%），负数 = 上涨
+    #    （-9.9 表示今日涨 9.9%）。所以 max=5 即「剔除今日跌超 5% 的」，
+    #    等价于要求今日涨跌幅 >= -5%；min=5 则反向只留跌够深的（超跌）。
+    #    口径为**收盘涨跌幅** (今收-昨收)/昨收，数据取自本地行情库，
+    #    零网络开销，因此与成交额/行业/筹码同属第 1 级预筛。
+    min_today_drop: float | None = None
+    max_today_drop: float | None = None
+    # 5) 行业：逗号分隔的关键词，子串匹配行业名。
     #    include 非空时只保留命中任一关键词的；exclude 命中的一律排除。
     #    例：include_industries=电子,软件,医药  /  exclude_industries=房地产,银行
     include_industries: str = ""
     exclude_industries: str = ""
-    # 5) 筹码集中度：前十大流通股东合计持股占流通股比例区间，单位：%
+    # 6) 筹码集中度：前十大流通股东合计持股占流通股比例区间，单位：%
     #    取自东财全市场接口，按报告期缓存（一年仅更新 4 次），命中缓存后零网络开销。
-    #    min=30 表示只保留「前十大流通股东合计持股 >= 30%」的股票。
+    #    min=40 表示只保留「前十大流通股东合计持股 >= 40%」的股票。
     min_top10_free_holding: float | None = None
     max_top10_free_holding: float | None = None
     # 指定股东数据报告期（YYYY-MM-DD 或 YYYYMMDD）；留空 = 自动取最新已披露季末
@@ -83,6 +91,8 @@ class Settings(BaseSettings):
         "min_turnover",
         "min_turn",
         "max_turn",
+        "min_today_drop",
+        "max_today_drop",
         "min_top10_free_holding",
         "max_top10_free_holding",
         mode="before",

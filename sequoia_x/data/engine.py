@@ -166,6 +166,55 @@ class DataEngine:
                     result[row[0]] = {"date": row[1], "close": row[2], "turnover": row[3]}
         return result
 
+    def get_market_latest_date(self) -> str | None:
+        """全市场最新交易日（`MAX(date)`），作为「今日」的判定基准。
+
+        刻意取**全市场**最大值、而不是某只股票自己的最大值：停牌股的最后一行
+        可能比全市场早好几天，若按逐股取值，就会把停牌前的旧涨跌幅当成今日涨跌幅。
+
+        Returns:
+            最新交易日（YYYY-MM-DD）；库为空时返回 None。
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute("SELECT MAX(date) FROM stock_daily").fetchone()
+        return row[0] if row and row[0] else None
+
+    def get_recent_rows(self, symbols: list[str], rows: int = 2) -> dict[str, list[dict]]:
+        """批量取每只股票**最近 N 个交易日**的收盘行情。
+
+        供「今日跌幅」这类需要「今收 vs 昨收」的判据使用：比逐股 `get_ohlcv()`
+        少读几十倍数据，全市场由一次窗口函数查完（超过 900 只自动分批）。
+
+        Args:
+            symbols: 纯数字股票代码列表。
+            rows: 每只股票取几行，默认 2（今日 + 昨日）。
+
+        Returns:
+            {symbol: [按日期**升序**排列的行]}，行内含 `date` / `close`；
+            即 `[-1]` 是最新一行、`[-2]` 是前一行。无数据的股票不在字典中。
+        """
+        if not symbols or rows < 1:
+            return {}
+
+        sql = """
+            SELECT symbol, date, close FROM (
+                SELECT symbol, date, close,
+                       ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY date DESC) AS rn
+                FROM stock_daily
+                WHERE symbol IN ({placeholders})
+            ) WHERE rn <= ? ORDER BY symbol, date
+        """
+
+        result: dict[str, list[dict]] = {}
+        chunk = self._SQL_PARAM_CHUNK
+        with sqlite3.connect(self.db_path) as conn:
+            for i in range(0, len(symbols), chunk):
+                batch = symbols[i : i + chunk]
+                placeholders = ",".join("?" * len(batch))
+                for row in conn.execute(sql.format(placeholders=placeholders), [*batch, rows]):
+                    result.setdefault(row[0], []).append({"date": row[1], "close": row[2]})
+        return result
+
     @staticmethod
     def _to_baostock_code(symbol: str) -> str:
         """将纯数字代码转为 baostock 格式：6/9开头 -> sh，其余 -> sz。"""

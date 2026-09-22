@@ -3,7 +3,7 @@
 覆盖点：
     - 未配置任何条件时为纯透传，且不产生任何网络请求
     - .env 中留空字符串应被视为「未配置」
-    - 四个维度各自的过滤逻辑、边界值、关键字匹配
+    - 各维度自己的过滤逻辑、边界值、关键字匹配
     - 指标缺失的股票判定为不通过
     - 单个数据源完全失败时只跳过该维度，其余维度照常生效
     - 流通市值公式与关键词拆分
@@ -40,6 +40,8 @@ _FILTER_ENV_VARS = (
     "MIN_TOP10_FREE_HOLDING",
     "MAX_TOP10_FREE_HOLDING",
     "HOLDER_REPORT_DATE",
+    "MIN_TODAY_DROP",
+    "MAX_TODAY_DROP",
 )
 
 
@@ -105,18 +107,60 @@ def stub_holdings(mapping: dict[str, float]):
     return _fetch
 
 
-class FakeEngine:
-    """最小 DataEngine 替身：只需全市场代码 + 本地成交额快照。"""
+# 「今日跌幅」维度需要两个交易日的收盘价；这两个日期是 FakeEngine 的默认基准。
+MARKET_LATEST_DATE = "2026-09-22"
+PREV_DATE = "2026-09-21"
 
-    def __init__(self, symbols, turnover: dict[str, float] | None = None):
+
+def fake_rows(
+    drops: dict[str, float | None], latest_date: str = MARKET_LATEST_DATE
+) -> dict[str, list[dict]]:
+    """把 {symbol: 今日跌幅%} 反推成引擎返回的原始行情行。
+
+    刻意**不**直接 stub「跌幅计算结果」，而是造原始行让过滤器自己算，
+    这样能一并覆盖「昨收 → 涨跌幅」这条真实计算路径。
+
+    值为 None 表示该股当日停牌（最后一行早于全市场最新交易日），
+    过滤器应判为「今日行情缺失」。
+    """
+    rows: dict[str, list[dict]] = {}
+    for symbol, drop in drops.items():
+        if drop is None:
+            rows[symbol] = [{"date": PREV_DATE, "close": 10.0}]
+            continue
+        rows[symbol] = [
+            {"date": PREV_DATE, "close": 10.0},
+            {"date": latest_date, "close": 10.0 * (1 - drop / 100)},
+        ]
+    return rows
+
+
+class FakeEngine:
+    """最小 DataEngine 替身：全市场代码 + 本地成交额快照 + 最近两日行情。"""
+
+    def __init__(
+        self,
+        symbols,
+        turnover: dict[str, float] | None = None,
+        drops: dict[str, float | None] | None = None,
+        latest_date: str | None = MARKET_LATEST_DATE,
+    ):
         self._symbols = list(symbols)
         self._turnover = dict(turnover or {})
+        self._latest_date = latest_date
+        self._rows = fake_rows(drops or {}, latest_date or MARKET_LATEST_DATE)
 
     def get_local_symbols(self):
         return list(self._symbols)
 
     def get_latest_snapshot(self, symbols):
         return {s: {"turnover": self._turnover[s]} for s in symbols if s in self._turnover}
+
+    def get_market_latest_date(self):
+        return self._latest_date
+
+    def get_recent_rows(self, symbols, rows=2):
+        return {s: self._rows[s][-rows:] for s in symbols if s in self._rows}
 
     def _to_baostock_code(self, symbol):
         return f"sh.{symbol}" if symbol.startswith(("6", "9")) else f"sz.{symbol}"
@@ -147,6 +191,8 @@ def test_blank_env_values_become_none():
         max_turn=None,
         min_top10_free_holding="",
         max_top10_free_holding="  ",
+        min_today_drop="",
+        max_today_drop="   ",
     )
     assert settings.min_market_cap is None
     assert settings.max_pb is None
@@ -155,6 +201,8 @@ def test_blank_env_values_become_none():
     assert settings.max_turn is None
     assert settings.min_top10_free_holding is None
     assert settings.max_top10_free_holding is None
+    assert settings.min_today_drop is None
+    assert settings.max_today_drop is None
 
 
 def test_numeric_env_values_parsed():
@@ -199,6 +247,8 @@ def test_disabled_when_nothing_configured():
         ("exclude_industries", "房地产"),
         ("min_top10_free_holding", 30.0),
         ("max_top10_free_holding", 70.0),
+        ("min_today_drop", 5.0),
+        ("max_today_drop", 5.0),
     ],
 )
 def test_enabled_when_any_configured(field, value):
@@ -214,13 +264,24 @@ def test_describe_mentions_all_dimensions():
             min_turnover=2,
             min_turn=0.5,
             max_turn=15,
+            max_today_drop=5,
             include_industries="电子,软件",
             exclude_industries="房地产",
             min_top10_free_holding=30,
         )
     )
     text = f.describe()
-    for token in ["流通市值", "市盈率", "市净率", "成交额", "换手率", "电子", "房地产", "流通股东"]:
+    for token in [
+        "流通市值",
+        "市盈率",
+        "市净率",
+        "成交额",
+        "换手率",
+        "今日跌幅",
+        "电子",
+        "房地产",
+        "流通股东",
+    ]:
         assert token in text
 
 
@@ -283,6 +344,7 @@ def test_disabled_is_passthrough_without_any_io(monkeypatch):
     monkeypatch.setattr(UniverseFilter, "_fetch_from_baostock", boom)
     monkeypatch.setattr(UniverseFilter, "_fetch_turnover", boom)
     monkeypatch.setattr(UniverseFilter, "_fetch_holder_ratios", boom)
+    monkeypatch.setattr(UniverseFilter, "_fetch_today_drops", boom)
     monkeypatch.setattr(stock_meta_module, "load_stock_meta", boom)
 
     f = UniverseFilter(settings=make_settings())
@@ -879,3 +941,138 @@ def test_strategy_applies_universe_filter(monkeypatch):
         ),
     )
     assert strategy.apply_universe_filter(["000001", "000002"]) == ["000001"]
+
+
+# ── 今日跌幅维度（取自本地库，零网络开销）──
+
+
+def test_today_drop_disabled_when_not_configured():
+    assert UniverseFilter(settings=make_settings())._today_drop_enabled is False
+
+
+def test_filter_by_max_today_drop_excludes_big_losers():
+    """MAX 语义：剔除今日跌超阈值的，保留抗跌与上涨的。
+
+    「跌幅」为有符号量：上涨时为负（-9.9 = 涨 9.9%），天然落在上限之内。
+    """
+    engine = FakeEngine(
+        ["000001", "000002", "000003", "000004"],
+        drops={
+            "000001": 2.0,  # 小跌 -> 保留
+            "000002": 5.0,  # 恰好到线（闭区间）-> 保留
+            "000003": 5.01,  # 跌超 5% -> 剔除
+            "000004": -9.9,  # 逆势大涨 -> 保留
+        },
+    )
+    f = UniverseFilter(settings=make_settings(max_today_drop=5), engine=engine)
+    assert f.apply(["000001", "000002", "000003", "000004"]) == ["000001", "000002", "000004"]
+
+
+def test_filter_by_min_today_drop_keeps_only_big_losers():
+    """MIN 语义：只保留今日跌够深的（超跌 / 错杀）。"""
+    engine = FakeEngine(["000001", "000002"], drops={"000001": 2.0, "000002": 6.0})
+    f = UniverseFilter(settings=make_settings(min_today_drop=5), engine=engine)
+    assert f.apply(["000001", "000002"]) == ["000002"]
+
+
+def test_filter_by_today_drop_range():
+    engine = FakeEngine(
+        ["000001", "000002", "000003"],
+        drops={"000001": 1.0, "000002": 4.0, "000003": 9.0},
+    )
+    f = UniverseFilter(settings=make_settings(min_today_drop=2, max_today_drop=5), engine=engine)
+    assert f.apply(["000001", "000002", "000003"]) == ["000002"]
+
+
+def test_today_drop_missing_passes_when_only_max():
+    """停牌股当日没有行情：只设上限时放行（无法证明它跌超上限）。"""
+    engine = FakeEngine(["000001", "000002"], drops={"000001": 1.0, "000002": None})
+    f = UniverseFilter(settings=make_settings(max_today_drop=5), engine=engine)
+    assert f.apply(["000001", "000002"]) == ["000001", "000002"]
+
+
+def test_today_drop_missing_rejected_when_min():
+    """设了下限时，无今日行情的股票无法证明「跌够深」-> 剔除。"""
+    engine = FakeEngine(["000001", "000002"], drops={"000001": 9.0, "000002": None})
+    f = UniverseFilter(settings=make_settings(min_today_drop=5), engine=engine)
+    assert f.apply(["000001", "000002"]) == ["000001"]
+
+
+def test_today_drop_does_not_require_baostock(monkeypatch):
+    """跌幅只在本地库计算，不应触发任何 baostock 指标请求。"""
+    calls = {"n": 0}
+
+    def counting(self, symbols):
+        calls["n"] += 1
+        return {}
+
+    monkeypatch.setattr(UniverseFilter, "_fetch_from_baostock", counting)
+    engine = FakeEngine(["600000"], drops={"600000": 1.0})
+
+    f = UniverseFilter(settings=make_settings(max_today_drop=5), engine=engine)
+    assert f.apply(["600000"]) == ["600000"]
+    assert calls["n"] == 0
+
+
+def test_today_drop_failure_skips_only_that_dimension():
+    """本地行情整体取不到时只跳过该维度，其余维度照常生效。"""
+    engine = FakeEngine(
+        ["000001", "000002"],
+        turnover={"000001": 10e8, "000002": 0.1e8},
+        drops={},
+    )
+    f = UniverseFilter(
+        settings=make_settings(max_today_drop=5, min_turnover=1), engine=engine
+    )
+    # 跌幅维度被跳过；成交额维度生效，000002 成交额不足被剔除
+    assert f.apply(["000001", "000002"]) == ["000001"]
+
+
+def test_today_drop_without_engine_is_passthrough():
+    """没有 engine 就取不到本地行情 —— 必须跳过该维度，而不是把股票全剔除。"""
+    f = UniverseFilter(settings=make_settings(max_today_drop=5))
+    assert f.apply(["000001", "000002"]) == ["000001", "000002"]
+
+
+def test_get_passing_universe_applies_today_drop_in_stage_one(monkeypatch):
+    """今日跌幅取自本地库，属零边际成本，应放在第 1 级预筛。"""
+    engine = FakeEngine(
+        ["600001", "600002"],
+        turnover={"600001": 10e8, "600002": 10e8},
+        drops={"600001": 1.0, "600002": 8.0},
+    )
+    baostock_calls = {"n": 0}
+
+    def counting(self, symbols):
+        baostock_calls["n"] += 1
+        return {}
+
+    monkeypatch.setattr(UniverseFilter, "_fetch_from_baostock", counting)
+
+    f = UniverseFilter(settings=make_settings(min_turnover=1, max_today_drop=5), engine=engine)
+    assert f.get_passing_universe() == ["600001"]
+    assert baostock_calls["n"] == 0
+
+
+def test_get_passing_universe_staged_matches_single_pass_with_today_drop(monkeypatch):
+    """加入今日跌幅维度后，分级执行仍须与「一次完整过滤」结果一致。"""
+    symbols = ["600001", "600002", "600003"]
+    engine = FakeEngine(
+        symbols,
+        turnover={s: 10e8 for s in symbols},
+        drops={"600001": 1.0, "600002": 8.0, "600003": 3.0},
+    )
+    monkeypatch.setattr(
+        UniverseFilter,
+        "_fetch_from_baostock",
+        stub_metrics({s: metric(s, cap_yi=200) for s in symbols}),
+    )
+    settings = make_settings(min_turnover=1, max_today_drop=5, min_market_cap=100)
+    staged = UniverseFilter(settings=settings, engine=engine).get_passing_universe()
+    single = UniverseFilter(settings=settings, engine=engine).apply(symbols)
+    assert staged == single == ["600001", "600003"]
+
+
+def test_describe_mentions_today_drop():
+    f = UniverseFilter(settings=make_settings(max_today_drop=5))
+    assert "今日跌幅 <=5%" in f.describe()
