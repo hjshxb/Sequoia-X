@@ -374,7 +374,7 @@ Sequoia-X/
 > 实测「5221 只 × 8 进程」的重试风暴会直接换来 `10001011 黑名单用户`，
 > 之后**连 login 都要 1.5~2 分钟才超时**（`10002007 网络接收错误`），恢复期很长。
 > 遇到黑名单时**切勿反复重试**，越试越难恢复；先停手，隔一段时间再单进程跑。
-> 排障可先执行 `python -m logs.probe_baostock`。
+> 排障可先执行 `python scripts/probe_baostock.py`。
 >
 > **同步是 fail-fast 的**：`bs.login()` 失败（或整批查询全错）会立刻抛
 > `BaostockUnavailable`，**一只股票的行情都不发**，主程序记 ERROR 后以退出码 1 终止 ——

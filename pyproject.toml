@@ -33,5 +33,11 @@ line-length = 100
 target-version = "py311"
 select = ["E", "F", "I", "UP"]
 
+[tool.ruff.lint.per-file-ignores]
+# scripts/ 是运维脚本（探针 / 验证 / 报告重算 / 定时任务入口），不是产品代码：
+#   它们需要「先动 sys.path、再 import」（E402），并刻意保留长命令行与长注释（E501）。
+# 其余规则（F/I/UP）照常适用 —— 脚本入库了，就该受基本约束。
+"scripts/*" = ["E402", "E501"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
