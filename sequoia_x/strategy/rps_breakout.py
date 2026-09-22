@@ -19,7 +19,14 @@ class RpsBreakoutStrategy(BaseStrategy):
         # 注意：RPS 是**横截面**指标（全市场涨幅百分位排名），因此这里刻意直接读全表，
         # 不限定在预筛池内 —— 只有在全市场里排进前 10%，才叫真正的相对强度。
         # 预筛池的作用体现在最后一步 apply_universe_filter()：
-        # 已注入池子时它退化为「是否在池内」，即"全市场强势股 ∩ 精筛池"。
+        # 已注入池子时它退化为「是否在池内」，即「全市场强势股 ∩ 精筛池」。
+        #
+        # ⚠️ 不要为了「省算力」把下面的 SQL 改成只查池内（`WHERE symbol IN (...)`）。
+        # 那样排名基数就从全市场变成池子，每只票的百分位会重排。实测（2026-09-22，
+        # 全市场 5221 只 / 精筛池 917 只）：全市场口径选出 71 只，池内口径只剩 25 只，
+        # 且是前者的**真子集** —— 会静默漏掉 46 只真正的全市场强势股。
+        # （精筛池本身偏向强势股，池内前 10% 的门槛反而比全市场更高，所以只漏不多选。）
+        # 回归测试：tests/test_strategy.py::TestRpsUniverseInteraction。
         try:
             with sqlite3.connect(self.engine.db_path) as conn:
                 df = pd.read_sql("SELECT symbol, date, close, high FROM stock_daily", conn)
