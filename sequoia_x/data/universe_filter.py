@@ -1,31 +1,32 @@
 """股票池过滤器：对策略初选结果做统一的多维度精筛。
 
-支持六个维度，全部可选（未配置即该维度不参与过滤）：
+支持七个维度，全部可选（未配置即该维度不参与过滤）：
     1. 估值   —— 流通市值区间、市盈率(TTM)区间、市净率区间
     2. 流动性 —— 成交额下限（取自本地库，无需联网）
     3. 技术面 —— 换手率区间
     4. 技术面 —— 今日跌幅区间（取自本地库，无需联网）
-    5. 行业   —— 行业关键词白名单 / 黑名单（子串匹配）
-    6. 筹码   —— 前十大流通股东合计持股占流通股比例区间
+    5. 技术面 —— 收盘价是否在 N 日均线上方（取自本地库，无需联网）
+    6. 行业   —— 行业关键词白名单 / 黑名单（子串匹配）
+    7. 筹码   —— 前十大流通股东合计持股占流通股比例区间
 
 两种调用方式：
     - `apply(symbols)`            —— 后置过滤：对策略初选结果做精筛。
     - `get_passing_universe()`    —— 前置过滤：先算出全市场合格股票池，
                                      再交给策略去执行（见 BaseStrategy.set_universe）。
-      前置过滤采用**分级执行**：先用零成本维度（成交额/今日跌幅/行业/筹码）
+      前置过滤采用**分级执行**：先用零成本维度（成交额/今日跌幅/均线/行业/筹码）
       把全市场收窄，再对残余股票拉取昂贵指标（市值/PE/PB/换手率），
       避免对 5000+ 只逐个联网。
 
 数据来源与成本：
     - 流通市值 / 市盈率 / 市净率 / 换手率：baostock 不复权日线，**只对候选股**查询，
       进程内缓存，多策略共享。
-    - 成交额 / 今日跌幅：本地 SQLite 一次批量查询（窗口函数），零网络开销。
+    - 成交额 / 今日跌幅 / 均线：本地 SQLite 一次批量查询（窗口函数），零网络开销。
     - 行业：baostock `query_stock_industry()`，整市场一次请求；结果落盘到
       本地库的 `stock_meta` 表（见 stock_meta.load_stock_meta），
       命中缓存时**零网络请求**，数据源不可用时降级用本地旧数据。
     - 筹码集中度：东财全市场接口（**非逐股**），按报告期落盘缓存，
       一年仅更新 4 次，命中缓存后零网络开销（见 data/holder_concentration.py）。
-    - **六个维度都未配置时完全不产生网络请求。**
+    - **七个维度都未配置时完全不产生网络请求。**
 
 容错策略（重要）：
     - 某一数据源「完全拉取失败」时，只跳过该维度的判据并记 ERROR，
@@ -33,6 +34,7 @@
     - 单只股票某个指标缺失，视为不通过该维度（例如亏损股 peTTM 为空）。
       例外：行业 / 筹码 / 今日跌幅存在**结构性缺失**（次新股、未披露、停牌），
       只有在配置了下限（白名单 / MIN）时才剔除缺失股，配上限时放行。
+      均线维度只有下限语义，历史不足 N 行的次新股一律剔除。
 """
 
 from __future__ import annotations
@@ -118,6 +120,7 @@ class _Context:
     liquidity: bool
     technical: bool
     today_drop: bool
+    ma: bool
     industry: bool
     holder: bool
     metrics: dict[str, StockMetric]
@@ -125,6 +128,7 @@ class _Context:
     metas: dict
     holdings: dict[str, float]
     drops: dict[str, float]
+    ma_deviations: dict[str, float]
     reasons: dict[str, int] = field(default_factory=dict)
 
     def drop(self, reason: str) -> None:
@@ -193,6 +197,10 @@ class UniverseFilter:
         return self.settings.min_today_drop is not None or self.settings.max_today_drop is not None
 
     @property
+    def _ma_enabled(self) -> bool:
+        return self.settings.min_ma_deviation is not None
+
+    @property
     def enabled(self) -> bool:
         """是否启用了任一维度的过滤。"""
         return (
@@ -200,6 +208,7 @@ class UniverseFilter:
             or self._liquidity_enabled
             or self._technical_enabled
             or self._today_drop_enabled
+            or self._ma_enabled
             or self._industry_enabled
             or self._holder_enabled
         )
@@ -248,6 +257,10 @@ class UniverseFilter:
             parts.append(f"换手率 {rng(s.min_turn, s.max_turn, '%')}")
         if self._today_drop_enabled:
             parts.append(f"今日跌幅 {rng(s.min_today_drop, s.max_today_drop, '%')}")
+        if self._ma_enabled:
+            dev = s.min_ma_deviation or 0.0
+            suffix = f"+{dev:g}%" if dev > 0 else ""
+            parts.append(f"收盘价>=MA{s.ma_window}{suffix}")
         inc, exc = self._include_industries, self._exclude_industries
         if inc:
             parts.append(keywords("行业含 ", inc))
@@ -399,6 +412,46 @@ class UniverseFilter:
             drops[symbol] = -(close - prev_close) / prev_close * 100
         return drops
 
+    def _fetch_ma_deviations(self, symbols: list[str]) -> dict[str, float]:
+        """取每只股票**收盘价相对 N 日均线的偏离度**（%）。
+
+        口径：`(最新收盘价 - MA(N)) / MA(N) * 100`，
+        `MA(N)` 为最近 N 个交易日收盘价的简单算术平均（窗口见 `MA_WINDOW`）。
+
+        用**后复权**序列计算：本地库存的就是后复权价（`adjustflag="1"`），
+        这样除权除息不会在均线上留下跳空缺口，均线才是连续的。
+
+        刻意**不**像「今日跌幅」那样要求最后一行等于全市场最新交易日：
+        均线是趋势指标，个股停牌一两天不改变「是否站在均线上方」的结论，
+        而且它的序列本身就是自己连续的交易日。
+
+        Returns:
+            {股票代码: 偏离度(%)}；历史不足一个窗口的股票不在结果中
+            （由调用方按「数据缺失」处理）。取不到数据时返回 {}。
+        """
+        if self.engine is None:
+            return {}
+
+        window = self.settings.ma_window
+        try:
+            rows = self.engine.get_recent_rows(symbols, rows=window)  # type: ignore[attr-defined]
+        except Exception as exc:
+            logger.error(f"精筛：本地行情读取失败 {exc}")
+            return {}
+
+        deviations: dict[str, float] = {}
+        for symbol, series in rows.items():
+            if len(series) < window:
+                continue  # 次新股 / 长期停牌：历史不足一个窗口，算不出均线
+            closes = [row["close"] for row in series]
+            if any(c is None for c in closes):
+                continue
+            average = sum(closes) / window
+            if average <= 0:
+                continue
+            deviations[symbol] = (closes[-1] - average) / average * 100
+        return deviations
+
     def _fetch_holder_ratios(self) -> dict[str, float]:
         """取全市场「前十大流通股东合计持股占流通股比例」（%）。
 
@@ -447,6 +500,7 @@ class UniverseFilter:
             liquidity=self._liquidity_enabled,
             technical=self._technical_enabled,
             today_drop=self._today_drop_enabled,
+            ma=self._ma_enabled,
             industry=self._industry_enabled,
             holder=self._holder_enabled,
         )
@@ -455,7 +509,7 @@ class UniverseFilter:
         """返回通过精筛的**全市场**股票池，供策略在执行前限定候选范围（前置过滤）。
 
         分级执行以控制网络成本：
-          第 1 级 —— 零边际成本维度：成交额与今日跌幅取自本地库（无请求）、
+          第 1 级 —— 零边际成本维度：成交额 / 今日跌幅 / 均线取自本地库（无请求）、
                      行业与筹码集中度为全市场单次请求（筹码还按报告期缓存），
                      先把 5000+ 只收窄到几百只；
           第 2 级 —— 昂贵维度：市值 / PE / PB / 换手率需逐股请求 baostock，
@@ -477,29 +531,31 @@ class UniverseFilter:
 
         liquidity_on = self._liquidity_enabled
         today_drop_on = self._today_drop_enabled
+        ma_on = self._ma_enabled
         industry_on = self._industry_enabled
         holder_on = self._holder_enabled
 
-        if not (liquidity_on or today_drop_on or industry_on or holder_on):
+        if not (liquidity_on or today_drop_on or ma_on or industry_on or holder_on):
             logger.warning(
-                "精筛预筛：未配置「成交额 / 今日跌幅 / 行业 / 筹码」等零成本维度，"
+                "精筛预筛：未配置「成交额 / 今日跌幅 / 均线 / 行业 / 筹码」等零成本维度，"
                 f"将直接对全市场 {len(all_symbols)} 只拉取估值/换手率指标，"
                 "单线程耗时约 10 分钟以上"
             )
 
-        # 第 1 级：零边际成本维度（本地库成交额/跌幅 + 全市场单次行业/股东请求）
+        # 第 1 级：零边际成本维度（本地库成交额/跌幅/均线 + 全市场单次行业/股东请求）
         stage1 = self._apply(
             all_symbols,
             valuation=False,
             liquidity=liquidity_on,
             technical=False,
             today_drop=today_drop_on,
+            ma=ma_on,
             industry=industry_on,
             holder=holder_on,
         )
         logger.info(
             f"精筛预筛：全市场 {len(all_symbols)} -> {len(stage1)}"
-            "（成交额/今日跌幅/行业/筹码，零边际成本）"
+            "（成交额/今日跌幅/均线/行业/筹码，零边际成本）"
         )
 
         if not stage1:
@@ -512,6 +568,7 @@ class UniverseFilter:
             liquidity=False,
             technical=self._technical_enabled,
             today_drop=False,
+            ma=False,
             industry=False,
             holder=False,
         )
@@ -526,6 +583,7 @@ class UniverseFilter:
         liquidity: bool,
         technical: bool,
         today_drop: bool = False,
+        ma: bool = False,
         industry: bool,
         holder: bool = False,
     ) -> list[str]:
@@ -540,6 +598,7 @@ class UniverseFilter:
             liquidity: 是否启用流动性维度（成交额）。
             technical: 是否启用技术面维度（换手率）。
             today_drop: 是否启用今日跌幅维度（本地库今收 vs 昨收）。
+            ma: 是否启用均线维度（本地库收盘价 vs N 日均线）。
             industry: 是否启用行业维度（白名单/黑名单）。
             holder: 是否启用筹码维度（前十大流通股东合计占比）。
 
@@ -548,7 +607,7 @@ class UniverseFilter:
         """
         if not symbols:
             return list(symbols)
-        if not (valuation or liquidity or technical or today_drop or industry or holder):
+        if not (valuation or liquidity or technical or today_drop or ma or industry or holder):
             return list(symbols)
 
         # 维度是否生效。注意：某一数据源「完全拉取失败」时必须把对应维度真正关掉，
@@ -557,6 +616,7 @@ class UniverseFilter:
         technical_on = technical
         liquidity_on = liquidity
         today_drop_on = today_drop
+        ma_on = ma
         industry_on = industry
         holder_on = holder
 
@@ -584,7 +644,15 @@ class UniverseFilter:
                 logger.error("精筛：本地行情（今日跌幅）完全获取失败，跳过该维度")
                 today_drop_on = False
 
-        # 4) 行业（baostock 全市场一次请求）
+        # 4) 均线偏离度（本地库，无网络开销）
+        ma_deviations: dict[str, float] = {}
+        if ma_on:
+            ma_deviations = self._fetch_ma_deviations(symbols)
+            if not ma_deviations:
+                logger.error("精筛：本地行情（均线）完全获取失败，跳过该维度")
+                ma_on = False
+
+        # 5) 行业（baostock 全市场一次请求）
         metas: dict = {}
         if industry_on:
             metas = stock_meta_module.load_stock_meta()
@@ -592,7 +660,7 @@ class UniverseFilter:
                 logger.error("精筛：行业数据完全获取失败，跳过该维度")
                 industry_on = False
 
-        # 5) 筹码集中度（东财全市场一次请求 + 报告期磁盘缓存）
+        # 6) 筹码集中度（东财全市场一次请求 + 报告期磁盘缓存）
         holdings: dict[str, float] = {}
         if holder_on:
             holdings = self._fetch_holder_ratios()
@@ -605,6 +673,7 @@ class UniverseFilter:
             liquidity=liquidity_on,
             technical=technical_on,
             today_drop=today_drop_on,
+            ma=ma_on,
             industry=industry_on,
             holder=holder_on,
             metrics=metrics,
@@ -612,6 +681,7 @@ class UniverseFilter:
             metas=metas,
             holdings=holdings,
             drops=drops,
+            ma_deviations=ma_deviations,
         )
 
         kept: list[str] = []
@@ -710,6 +780,22 @@ class UniverseFilter:
                 if hi is not None and drop > hi:
                     ctx.drop("今日跌幅过大")
                     return False
+
+        # ── 均线：收盘价是否在 N 日均线上方 ──
+        if ctx.ma:
+            deviation = ctx.ma_deviations.get(symbol)
+            floor = s.min_ma_deviation
+
+            if deviation is None:
+                # 次新股 / 长期停牌：历史不足一个窗口，算不出均线。
+                # 该维度只有下限语义（没有「上限」这种反向用法），
+                # 无法证明它站在均线上方 —— 剔除。
+                ctx.drop("均线数据缺失")
+                return False
+
+            if floor is not None and deviation < floor:
+                ctx.drop("跌破均线")
+                return False
 
         # ── 行业：白名单 / 黑名单（子串匹配）──
         if ctx.industry:

@@ -8,6 +8,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # 拉全市场 5000+ 只股票会触发「黑名单用户(10001011)」，恢复期极长。
 MAX_SYNC_WORKERS = 32
 
+# 均线窗口的合法范围。过小（1 天）没有意义，过大则超出常规行情历史长度。
+MIN_MA_WINDOW = 2
+MAX_MA_WINDOW = 500
+
 
 class Settings(BaseSettings):
     db_path: str = "data/sequoia_v2.db"
@@ -39,12 +43,22 @@ class Settings(BaseSettings):
     #    零网络开销，因此与成交额/行业/筹码同属第 1 级预筛。
     min_today_drop: float | None = None
     max_today_drop: float | None = None
-    # 5) 行业：逗号分隔的关键词，子串匹配行业名。
+    # 5) 技术面（本地库）：收盘价是否在 N 日均线上方
+    #    判据为「相对均线的偏离度 >= min_ma_deviation」，单位：%。
+    #      min_ma_deviation=0  -> 收盘价 >= MA（即站上均线）
+    #      min_ma_deviation=3  -> 收盘价高于均线 3% 以上（趋势更强）
+    #      留空                -> 该维度不参与过滤
+    #    窗口由 ma_window 指定，默认 120 个交易日（半年线）。
+    #    历史不足 N 行的次新股算不出均线，按数据缺失处理（剔除）。
+    #    与今日跌幅一样取自本地行情库（后复权收盘价），零网络开销。
+    min_ma_deviation: float | None = None
+    ma_window: int = 120
+    # 6) 行业：逗号分隔的关键词，子串匹配行业名。
     #    include 非空时只保留命中任一关键词的；exclude 命中的一律排除。
     #    例：include_industries=电子,软件,医药  /  exclude_industries=房地产,银行
     include_industries: str = ""
     exclude_industries: str = ""
-    # 6) 筹码集中度：前十大流通股东合计持股占流通股比例区间，单位：%
+    # 7) 筹码集中度：前十大流通股东合计持股占流通股比例区间，单位：%
     #    取自东财全市场接口，按报告期缓存（一年仅更新 4 次），命中缓存后零网络开销。
     #    min=40 表示只保留「前十大流通股东合计持股 >= 40%」的股票。
     min_top10_free_holding: float | None = None
@@ -93,6 +107,7 @@ class Settings(BaseSettings):
         "max_turn",
         "min_today_drop",
         "max_today_drop",
+        "min_ma_deviation",
         "min_top10_free_holding",
         "max_top10_free_holding",
         mode="before",
@@ -118,6 +133,24 @@ class Settings(BaseSettings):
         """并发进程数必须落在 1~MAX_SYNC_WORKERS：0/负数无意义，过大易触发风控。"""
         if not 1 <= v <= MAX_SYNC_WORKERS:
             raise ValueError(f"sync_workers 必须在 1~{MAX_SYNC_WORKERS} 之间，当前为 {v}")
+        return v
+
+    @field_validator("ma_window", mode="before")
+    @classmethod
+    def _blank_ma_window_to_default(cls, v: object) -> object:
+        """`.env` 里 `MA_WINDOW=` 留空视为未配置，回落默认 120。"""
+        if isinstance(v, str) and v.strip() == "":
+            return 120
+        return v
+
+    @field_validator("ma_window", mode="after")
+    @classmethod
+    def _check_ma_window(cls, v: int) -> int:
+        """窗口必须落在 MIN_MA_WINDOW~MAX_MA_WINDOW：过小无意义，过大超出合理行情历史。"""
+        if not MIN_MA_WINDOW <= v <= MAX_MA_WINDOW:
+            raise ValueError(
+                f"ma_window 必须在 {MIN_MA_WINDOW}~{MAX_MA_WINDOW} 之间，当前为 {v}"
+            )
         return v
 
     @field_validator("stock_meta_ttl_days", mode="before")

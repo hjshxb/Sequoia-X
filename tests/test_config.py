@@ -62,6 +62,48 @@ def test_sync_workers_rejects_out_of_range(bad: int) -> None:
         )
 
 
+def test_ma_window_defaults_to_120() -> None:
+    """均线窗口默认 120 个交易日。"""
+    from sequoia_x.core.config import Settings
+
+    s = Settings(_env_file=None, feishu_webhook_url="https://example.com/hook")
+    assert s.ma_window == 120
+    assert s.min_ma_deviation is None
+
+
+def test_ma_window_blank_falls_back_to_default() -> None:
+    """`.env` 里 `MA_WINDOW=` 留空视为未配置，回落 120。"""
+    from sequoia_x.core.config import Settings
+
+    s = Settings(_env_file=None, feishu_webhook_url="https://example.com/hook", ma_window="")
+    assert s.ma_window == 120
+
+
+def test_min_ma_deviation_blank_becomes_none() -> None:
+    """`MIN_MA_DEVIATION=` 留空 = 该维度不参与过滤。"""
+    from sequoia_x.core.config import Settings
+
+    s = Settings(
+        _env_file=None,
+        feishu_webhook_url="https://example.com/hook",
+        min_ma_deviation="  ",
+    )
+    assert s.min_ma_deviation is None
+
+
+@pytest.mark.parametrize("bad", [0, 1, -5, 501, 9999])
+def test_ma_window_rejects_out_of_range(bad: int) -> None:
+    """窗口过小没有意义，过大则超出合理的行情历史长度 —— 启动即报错。"""
+    from sequoia_x.core.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            feishu_webhook_url="https://example.com/hook",
+            ma_window=bad,
+        )
+
+
 def test_missing_required_field_raises() -> None:
     """属性 2：缺少 feishu_webhook_url 时，实例化 Settings 应抛出 ValidationError。"""
     import os

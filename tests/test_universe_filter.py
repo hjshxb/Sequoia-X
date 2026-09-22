@@ -9,6 +9,8 @@
     - 流通市值公式与关键词拆分
 """
 
+from datetime import date, timedelta
+
 import pytest
 
 from sequoia_x.core.config import Settings
@@ -42,6 +44,8 @@ _FILTER_ENV_VARS = (
     "HOLDER_REPORT_DATE",
     "MIN_TODAY_DROP",
     "MAX_TODAY_DROP",
+    "MIN_MA_DEVIATION",
+    "MA_WINDOW",
 )
 
 
@@ -135,8 +139,22 @@ def fake_rows(
     return rows
 
 
+def fake_history(closes: list[float], latest_date: str = MARKET_LATEST_DATE) -> list[dict]:
+    """由收盘价序列（**旧 → 新**）生成引擎返回的行情行，末行为全市场最新交易日。
+
+    均线维度要的是「最近 N 行的收盘价」，所以这里造的是完整序列，
+    让过滤器自己截窗口、自己算均值 —— 而不是直接 stub 均线值。
+    """
+    end = date.fromisoformat(latest_date)
+    n = len(closes)
+    return [
+        {"date": (end - timedelta(days=n - 1 - i)).isoformat(), "close": c}
+        for i, c in enumerate(closes)
+    ]
+
+
 class FakeEngine:
-    """最小 DataEngine 替身：全市场代码 + 本地成交额快照 + 最近两日行情。"""
+    """最小 DataEngine 替身：全市场代码 + 本地成交额快照 + 本地行情历史。"""
 
     def __init__(
         self,
@@ -144,11 +162,16 @@ class FakeEngine:
         turnover: dict[str, float] | None = None,
         drops: dict[str, float | None] | None = None,
         latest_date: str | None = MARKET_LATEST_DATE,
+        histories: dict[str, list[float]] | None = None,
     ):
         self._symbols = list(symbols)
         self._turnover = dict(turnover or {})
         self._latest_date = latest_date
-        self._rows = fake_rows(drops or {}, latest_date or MARKET_LATEST_DATE)
+        base = latest_date or MARKET_LATEST_DATE
+        self._rows = fake_rows(drops or {}, base)
+        # histories 与 drops 可并存：前者用于均线（长序列），后者用于今日跌幅（两行）。
+        for symbol, closes in (histories or {}).items():
+            self._rows[symbol] = fake_history(closes, base)
 
     def get_local_symbols(self):
         return list(self._symbols)
@@ -1076,3 +1099,188 @@ def test_get_passing_universe_staged_matches_single_pass_with_today_drop(monkeyp
 def test_describe_mentions_today_drop():
     f = UniverseFilter(settings=make_settings(max_today_drop=5))
     assert "今日跌幅 <=5%" in f.describe()
+
+
+# ── 均线维度：收盘价在 N 日均线上方 ──
+#
+# 构造思路：历史前 n-1 个点恒为 10，最后一点决定它站在均线的哪一侧。
+#   MA = ((n-1)*10 + last) / n ⇒ last > 10 时收盘价高于均线，last < 10 时低于均线。
+_FLAT = 10.0
+_MA_N = 120
+
+
+def flat_then(last: float, n: int = _MA_N) -> list[float]:
+    """n 个收盘价：前 n-1 个为 10，最后一个是 `last`。"""
+    return [_FLAT] * (n - 1) + [last]
+
+
+def test_ma_disabled_when_not_configured():
+    """未配置 MIN_MA_DEVIATION 时该维度不参与过滤。"""
+    assert UniverseFilter(settings=make_settings())._ma_enabled is False
+
+
+def test_ma_default_window_is_120():
+    assert make_settings().ma_window == 120
+
+
+def test_filter_by_ma_keeps_only_above_average():
+    """站上 120 日线的留下，跌破的剔除。"""
+    engine = FakeEngine(
+        ["000001", "000002"],
+        histories={"000001": flat_then(11.0), "000002": flat_then(9.0)},
+    )
+    f = UniverseFilter(settings=make_settings(min_ma_deviation=0), engine=engine)
+    assert f.apply(["000001", "000002"]) == ["000001"]
+
+
+def test_ma_close_exactly_on_average_passes():
+    """闭区间：收盘价恰好等于均线算「站在上方」。"""
+    engine = FakeEngine(
+        ["000001", "000002"],
+        histories={"000001": [_FLAT] * _MA_N, "000002": flat_then(9.0)},
+    )
+    f = UniverseFilter(settings=make_settings(min_ma_deviation=0), engine=engine)
+    assert f.apply(["000001", "000002"]) == ["000001"]
+
+
+def test_ma_rejects_insufficient_history():
+    """次新股历史不足 N 行 —— 算不出均线，无法证明它在均线上方，故剔除。"""
+    engine = FakeEngine(
+        ["000001", "000002"],
+        # 000001 只有 30 个交易日，不足 120
+        histories={"000001": flat_then(11.0, n=30), "000002": flat_then(11.0)},
+    )
+    f = UniverseFilter(settings=make_settings(min_ma_deviation=0), engine=engine)
+    assert f.apply(["000001", "000002"]) == ["000002"]
+
+
+def test_ma_deviation_threshold_requires_stronger_signal():
+    """MIN_MA_DEVIATION=5 时，只是小幅站上均线的股票不达标。"""
+    engine = FakeEngine(
+        ["000001", "000002"],
+        # 11.0 相对均线约 +9.9%；10.2 只有约 +2.0%
+        histories={"000001": flat_then(11.0), "000002": flat_then(10.2)},
+    )
+    f = UniverseFilter(settings=make_settings(min_ma_deviation=5), engine=engine)
+    assert f.apply(["000001", "000002"]) == ["000001"]
+
+
+def test_ma_window_is_configurable():
+    """窗口可配：MA_WINDOW=5 时按最近 5 个交易日算。"""
+    engine = FakeEngine(
+        ["000001", "000002"],
+        histories={"000001": [10.0, 10.0, 10.0, 10.0, 12.0], "000002": [10.0] * 4 + [8.0]},
+    )
+    f = UniverseFilter(settings=make_settings(min_ma_deviation=0, ma_window=5), engine=engine)
+    assert f.apply(["000001", "000002"]) == ["000001"]
+
+
+def test_ma_uses_only_the_recent_window():
+    """窗口必须严格截到最近 N 行，历史更早的高价不得影响均线。
+
+    000001 前 10 天是 100、之后 119 天是 10、最新 11：
+      只看最近 120 行 → 均线 ≈ 10.01，收盘价在上方（通过）；
+      若误用全部 130 行 → 均线 ≈ 16.9，会被误杀。
+    000002 直接跌破均线，确保这条用例真的在过滤而不是透传。
+    """
+    engine = FakeEngine(
+        ["000001", "000002"],
+        histories={
+            "000001": [100.0] * 10 + [10.0] * (_MA_N - 1) + [11.0],
+            "000002": flat_then(9.0),
+        },
+    )
+    f = UniverseFilter(settings=make_settings(min_ma_deviation=0), engine=engine)
+    assert f.apply(["000001", "000002"]) == ["000001"]
+
+
+def test_ma_does_not_require_baostock(monkeypatch):
+    """均线只用本地行情库，不应触发任何 baostock 指标请求。"""
+    calls = {"n": 0}
+
+    def counting(self, symbols):
+        calls["n"] += 1
+        return {}
+
+    monkeypatch.setattr(UniverseFilter, "_fetch_from_baostock", counting)
+    engine = FakeEngine(
+        ["600000", "600001"],
+        histories={"600000": flat_then(11.0), "600001": flat_then(9.0)},
+    )
+
+    f = UniverseFilter(settings=make_settings(min_ma_deviation=0), engine=engine)
+    assert f.apply(["600000", "600001"]) == ["600000"]
+    assert calls["n"] == 0
+
+
+def test_ma_failure_skips_only_that_dimension():
+    """本地行情整体取不到时只跳过均线维度，其余维度照常生效。"""
+    engine = FakeEngine(
+        ["000001", "000002"],
+        turnover={"000001": 10e8, "000002": 0.1e8},
+        histories={},  # 没有任何历史行情
+    )
+    f = UniverseFilter(settings=make_settings(min_ma_deviation=0, min_turnover=1), engine=engine)
+    # 均线维度被跳过；成交额维度生效，000002 成交额不足被剔除
+    assert f.apply(["000001", "000002"]) == ["000001"]
+
+
+def test_ma_without_engine_is_passthrough():
+    """没有 engine 就取不到本地行情 —— 必须跳过该维度，而不是把股票全剔除。"""
+    f = UniverseFilter(settings=make_settings(min_ma_deviation=0))
+    assert f.apply(["000001", "000002"]) == ["000001", "000002"]
+
+
+def test_get_passing_universe_applies_ma_in_stage_one(monkeypatch):
+    """均线取自本地库，属零边际成本，应放在第 1 级预筛、且不碰 baostock。"""
+    engine = FakeEngine(
+        ["600001", "600002"],
+        turnover={"600001": 10e8, "600002": 10e8},
+        histories={"600001": flat_then(11.0), "600002": flat_then(9.0)},
+    )
+    baostock_calls = {"n": 0}
+
+    def counting(self, symbols):
+        baostock_calls["n"] += 1
+        return {}
+
+    monkeypatch.setattr(UniverseFilter, "_fetch_from_baostock", counting)
+
+    f = UniverseFilter(settings=make_settings(min_turnover=1, min_ma_deviation=0), engine=engine)
+    assert f.get_passing_universe() == ["600001"]
+    assert baostock_calls["n"] == 0
+
+
+def test_get_passing_universe_staged_matches_single_pass_with_ma(monkeypatch):
+    """加入均线维度后，分级执行仍须与「一次完整过滤」结果一致。"""
+    symbols = ["600001", "600002", "600003"]
+    engine = FakeEngine(
+        symbols,
+        turnover={s: 10e8 for s in symbols},
+        histories={
+            "600001": flat_then(11.0),
+            "600002": flat_then(9.0),  # 跌破均线 -> 剔除
+            "600003": flat_then(12.0),
+        },
+    )
+    monkeypatch.setattr(
+        UniverseFilter,
+        "_fetch_from_baostock",
+        stub_metrics({s: metric(s, cap_yi=200) for s in symbols}),
+    )
+    settings = make_settings(min_turnover=1, min_ma_deviation=0, min_market_cap=100)
+    staged = UniverseFilter(settings=settings, engine=engine).get_passing_universe()
+    single = UniverseFilter(settings=settings, engine=engine).apply(symbols)
+    assert staged == single == ["600001", "600003"]
+
+
+def test_describe_mentions_ma():
+    f = UniverseFilter(settings=make_settings(min_ma_deviation=0))
+    assert "收盘价>=MA120" in f.describe()
+
+
+def test_describe_mentions_ma_deviation_and_window():
+    f = UniverseFilter(settings=make_settings(min_ma_deviation=3, ma_window=60))
+    text = f.describe()
+    assert "MA60" in text
+    assert "3%" in text
