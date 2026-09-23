@@ -18,7 +18,7 @@ from datetime import date
 
 import requests
 
-from sequoia_x.analysis.scorer import ScoreDetail
+from sequoia_x.analysis.scorer import ScoreDetail, composite_score, rank_by_composite
 from sequoia_x.core.config import Settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data import stock_meta as stock_meta_module
@@ -37,14 +37,18 @@ logger = get_logger(__name__)
 # 阈值项（市值/PE/成交额/换手）排在描述前面，所以截断牺牲的是尾部行业名单。
 _MAX_FILTER_CHARS = 120
 
-# 卡片里「高分榜」只放前 N 名：飞书交互卡片对元素数量与总长度都有限制，
+# 卡片里的「综合评分榜」只放前 N 名：飞书交互卡片对元素数量与总长度都有限制，
 # 完整排行放在本地 HTML 报告里（那张表可横向滚动、可搜索）。
-_TOP_RANKING = 5
-
-# 「形态匹配榜」同样只放前 N 名。它与评分榜是**两个不同视角**，故各占一个小节：
-# 评分来自量价五维（当下格局与位置风险），形态匹配来自历史相似窗口的后续走势。
-# 两者名单经常不一致，甚至方向相反（见 _pattern_match_section 的说明）。
-_TOP_PATTERN = 5
+#
+# 为什么是**一个**榜而不是过去的「评分 Top 5 + 形态匹配 Top 5」两个榜：
+# 两个榜的名单经常不一致、甚至方向相反（高分股胜率为 0、低分股胜率很高），
+# 摆在一起只会让人问「到底信哪个」。改成一个榜、一个明确的排序口径后，
+# 卡片上每一行都是同一个问题的答案：「按评分和胜率的综合排序，我最该先看谁」。
+#
+# 为什么给 10 而不是 5：两个榜各 5 是 10 个位置，合并后保持 10 个位置，
+# 信息量不缩水；且综合分天然把「高分低胜率」和「高胜率低分」都摆在中间地带，
+# 单看前 5 容易只剩高分那一类。
+_TOP_COMPOSITE = 10
 
 
 def _elide(text: str, limit: int = _MAX_FILTER_CHARS) -> str:
@@ -103,69 +107,43 @@ class FeishuNotifier:
         return "\n".join(lines)
 
     @classmethod
-    def _ranking_section(cls, scores: Sequence[ScoreDetail], meta: dict[str, StockMeta]) -> str:
-        """渲染「高分榜」小节：按评分降序列出前 `_TOP_RANKING` 名。
+    def _composite_section(cls, scores: Sequence[ScoreDetail], meta: dict[str, StockMeta]) -> str:
+        """渲染「综合评分 Top 10」小节：按评分 + 胜率的综合分降序。
 
-        分数只在这里出现 —— 各策略小节仍只显示代码+名称，避免整张卡片
-        都是数字而看不清结构。
+        综合分的口径完全交给 `scorer.composite_score()`（唯一真源），本方法
+        只负责排版 —— 排序口径散落在展示层迟早会漂移（报告页首、飞书卡片、
+        策略小节内的名次都要一致）。
+
+        **为什么把两个榜并成一个**：过去卡片上是「🎯 量化评分 Top 5」与
+        「📈 形态匹配 Top 5」两个榜。两个榜的名单经常不一致、甚至方向相反
+        （高分股胜率为 0、低分股胜率很高），摆在一起只会让人问「到底信哪个」。
+        合并成一个榜、一个明确口径后，每一行都是同一个问题的答案：
+        「按评分与胜率的综合排序，我最该先看谁」。
+
+        **为什么胜率要先按可信度收缩**：胜率 `prob_up = k / len(matches) * 100`，
+        分母是相似度最高的那 5 个历史窗口（`top_k=5`），**不是**候选总数 ——
+        分母越小越容易拿满分，一个「1/1 = 100%」不该把票顶上榜首。
+        `composite_score` 把胜率按 `prob_confidence` 向 50% 收缩：可信度低的
+        胜率自动趋近中性、几乎不影响排序，可信度高的才真正说话。
+
+        整批都缺胜率（未启用增强 / 旧数据）时综合分退化为评分，本小节照常
+        显示，只是每行少一段胜率文字 —— 不显示空值，也不拿 0 分去凑行数。
+
+        每行给三个数：**综合分**（排序依据）、评分、胜率，让人看得出融合过程。
         """
-        lines = [f"**🎯 量化评分 Top {min(_TOP_RANKING, len(scores))}**"]
-        for i, detail in enumerate(scores[:_TOP_RANKING], 1):
+        ranked = rank_by_composite(scores)[:_TOP_COMPOSITE]
+        lines = [f"**🎯 综合评分 Top {len(ranked)}**（评分 ×0.7 + 胜率 ×0.3，胜率按可信度收缩）"]
+        for i, detail in enumerate(ranked, 1):
             item = meta.get(detail.symbol)
             name = (item.name if item else None) or ""
             label = f"{detail.symbol} {name}".strip()
             link = f"[{label}](https://xueqiu.com/S/{to_xueqiu_code(detail.symbol)})"
             mark = f" `{detail.tags}`" if detail.tags else ""
-            lines.append(f"**{i}.** {link} · **{detail.score:.1f}**{mark}")
-        return "\n".join(lines)
-
-    @classmethod
-    def _pattern_match_section(
-        cls, scores: Sequence[ScoreDetail], meta: dict[str, StockMeta]
-    ) -> str:
-        """渲染「形态匹配 Top 5」小节：按**匹配可信度**降序。
-
-        为什么不按胜率排（读工具源码 + 真库实测后确认）：
-
-        胜率 `prob_up` = `k / len(matches) * 100`，分母是**相似度最高的 5 个
-        历史窗口**（`top_k=5`），不是候选总数。分母小到 5 时胜率只有
-        0/20/40/60/80/100 六档，分母为 1 时只能是 0% 或 100% —— 纯端点值、
-        并列扎堆，**窗口越少越容易拿满分**。纯按胜率排等于反向挑
-        「历史窗口最少的票」。`confidence` 由候选窗口数、最佳相似度、方向
-        一致性加权而成，排序明显更稳。
-
-        这一节与评分榜是**两个视角**，不合并：评分来自五维量价（当下格局与
-        位置风险），形态匹配来自历史相似窗口的后续走势，名单不一致甚至反向
-        是常态。**但要先排除分母过小的情况** —— 曾因喂给匹配器的历史太短
-        （只 250 行）导致每只票只剩 1~3 个候选窗口，胜率成片塌成 0%/100%，
-        看起来像「强势股必然胜率低」，实则是配置问题
-        （见 `scorer.ENHANCE_LOOKBACK`）。
-
-        胜率来自外部量化工具的增强层，**可能整批都缺**（未启用增强 /
-        历史数据不足 / 计算失败）。此时返回空串，调用方跳过该小节 ——
-        不显示空标题，也不拿 0 分去凑满 5 行。
-
-        排序键依次为 可信度、胜率、评分、代码：缺可信度（None）的票排最后，
-        但仍会出现在榜上，不至于因为缺一个字段就整只消失。
-        """
-        ranked = sorted(
-            (d for d in scores if d.prob_up is not None),
-            key=lambda d: (-(d.prob_confidence or 0.0), -d.prob_up, -d.adjusted, d.symbol),
-        )
-        if not ranked:
-            return ""
-
-        lines = [f"**📈 形态匹配 Top {min(_TOP_PATTERN, len(ranked))}**（按匹配可信度降序）"]
-        for i, detail in enumerate(ranked[:_TOP_PATTERN], 1):
-            item = meta.get(detail.symbol)
-            name = (item.name if item else None) or ""
-            label = f"{detail.symbol} {name}".strip()
-            link = f"[{label}](https://xueqiu.com/S/{to_xueqiu_code(detail.symbol)})"
-            mark = f" `{detail.tags}`" if detail.tags else ""
-            lines.append(
-                f"**{i}.** {link} · **胜率 {winrate_text(detail)}**"
-                f" · 评分 {detail.score:.1f}{mark}"
-            )
+            parts = [f"**{i}.** {link}", f"**综合 {composite_score(detail):.1f}**"]
+            parts.append(f"评分 {detail.score:.1f}")
+            if detail.prob_up is not None:
+                parts.append(f"胜率 {winrate_text(detail)}")
+            lines.append(" · ".join(parts) + mark)
         return "\n".join(lines)
 
     def _build_report_card(
@@ -179,9 +157,10 @@ class FeishuNotifier:
         Args:
             results: 各策略的选股结果，顺序即卡片中小节的顺序。
             filter_desc: 精筛条件描述，展示在卡片顶部便于解释结果为何偏少。
-            scores: 可选的量化评分（应按得分降序）。传入后卡片顶部多两个小节
-                ——「🎯 量化评分 Top 5」与「📈 形态匹配 Top 5」（后者在整批都
-                没有胜率时自动省略），且各策略小节**内部**改按评分降序排列。
+            scores: 可选的量化评分。传入后卡片顶部多一个「🎯 综合评分 Top 10」
+                小节（按评分与胜率的综合分排序，见 `_composite_section`），
+                且各策略小节**内部**改按综合分名次排列（综合分口径唯一，
+                见 `scorer.composite_score`）。
 
         Returns:
             飞书 `msg_type=interactive` 的请求体。
@@ -207,12 +186,7 @@ class FeishuNotifier:
             elements.append({"tag": "div", "text": {"tag": "lark_md", "content": content}})
 
         if score_list:
-            add_markdown(self._ranking_section(score_list, meta))
-            # 形态匹配榜紧跟评分榜，但整批缺胜率时不出空标题
-            # （见 _pattern_match_section）
-            pattern = self._pattern_match_section(score_list, meta)
-            if pattern:
-                add_markdown(pattern)
+            add_markdown(self._composite_section(score_list, meta))
 
         for strategy_name, symbols in results.items():
             if symbols:

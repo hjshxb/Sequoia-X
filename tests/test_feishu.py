@@ -296,51 +296,169 @@ def test_card_shows_summary_counts() -> None:
     assert "2" in text  # 选股总数
 
 
-# ── 量化评分高分榜 ──
+# ── 综合评分榜（评分 + 胜率，单一栏目）──
+# 卡片只推**一个**「🎯 综合评分 Top 10」栏目。过去拆成「量化评分 Top 5」+
+# 「形态匹配 Top 5」两个榜：两个视角的名单经常不一致甚至反向（高分股胜率为 0、
+# 低分股胜率很高），摆在一起只会让人问「信哪个」。现在统一按
+# `scorer.composite_score`（评分 ×0.7 + 胜率按可信度收缩后 ×0.3）排序，
+# 排序口径只有一处真源，展示层不再各写一个 key。
 
 
-def test_card_without_scores_has_no_ranking_section() -> None:
+def composite_section(text: str) -> str:
+    """截出「综合评分 Top N」小节，便于只在该节内部断言顺序。"""
+    assert "综合评分 Top" in text, "卡片里没有综合评分小节"
+    return text.split("综合评分 Top", 1)[1]
+
+
+def test_card_without_scores_has_no_composite_section() -> None:
     notifier = FeishuNotifier(make_settings())
     text = card_text(posted_card(notifier, {"TurtleTradeStrategy": ["600000"]}))
 
-    assert "量化评分 Top" not in text
+    assert "综合评分 Top" not in text
+    assert "量化评分 Top" not in text  # 旧的两个榜已合并，不应残留
+    assert "形态匹配 Top" not in text
 
 
-def test_card_shows_ranking_section_with_scores() -> None:
+def test_card_shows_composite_section_with_scores() -> None:
     notifier = FeishuNotifier(make_settings())
     scores = [make_score("300750", 86.0, tags="TR"), make_score("600000", 72.5)]
     text = card_text(
-        posted_card(
-            notifier, {"TurtleTradeStrategy": ["600000", "300750"]}, scores=scores
-        )
+        posted_card(notifier, {"TurtleTradeStrategy": ["600000", "300750"]}, scores=scores)
     )
 
-    assert "🎯 量化评分 Top 2" in text
+    assert "🎯 综合评分 Top 2" in text
     assert "**1.**" in text and "**2.**" in text
-    assert "**86.0**" in text and "**72.5**" in text
+    # 整批都没有胜率时，综合分退化为评分：两个数应当相同
+    assert "**综合 86.0**" in text and "**综合 72.5**" in text
+    assert "评分 86.0" in text and "评分 72.5" in text
     assert "`TR`" in text  # 命中的策略标记
-    assert "xueqiu.com/S/SZ300750" in text  # 高分榜里同样是可点链接
+    assert "xueqiu.com/S/SZ300750" in text  # 榜内同样是可点链接
 
 
-def test_card_ranking_is_capped_at_top_n() -> None:
-    """卡片元素数有限，高分榜只放前 N 名；完整排行在本地 HTML 报告里。"""
+def test_card_composite_section_is_capped_at_ten() -> None:
+    """卡片元素数有限，综合榜只放前 10 名；完整排行在本地 HTML 报告里。"""
     notifier = FeishuNotifier(make_settings())
-    symbols = [f"{i:06d}" for i in range(8)]
+    symbols = [f"{i:06d}" for i in range(12)]
     scores = [make_score(s, 90.0 - i) for i, s in enumerate(symbols)]
     text = card_text(posted_card(notifier, {"MaVolumeStrategy": symbols}, scores=scores))
 
-    assert "🎯 量化评分 Top 5" in text
-    assert "**6.**" not in text
+    assert "🎯 综合评分 Top 10" in text
+    assert "**11.**" not in composite_section(text)
+
+
+def test_card_composite_blends_winrate_into_score() -> None:
+    """高胜率能把评分略低的票抬上来 —— 这就是「结合胜率和分数」的含义。"""
+    notifier = FeishuNotifier(make_settings())
+    scores = [
+        make_score("600000", 80.0, prob_up=20.0, prob_samples=5, prob_confidence=100.0),
+        make_score("600601", 70.0, prob_up=80.0, prob_samples=5, prob_confidence=100.0),
+    ]
+    text = card_text(
+        posted_card(notifier, {"MaVolumeStrategy": ["600000", "600601"]}, scores=scores)
+    )
+
+    # 600000：0.7×80 + 0.3×20 = 62.0；600601：0.7×70 + 0.3×80 = 73.0
+    assert "**综合 73.0**" in text and "**综合 62.0**" in text
+    section = composite_section(text)
+    assert section.index("600601") < section.index("600000")
+    assert "胜率 1/5" in section and "胜率 4/5" in section
+
+
+def test_card_composite_shrinks_low_confidence_winrate() -> None:
+    """「1/1 = 100%」这类低可信度胜率不能主导排序 —— 按可信度向 50% 收缩。
+
+    若直接把胜率当权重，600000 会算出 0.7×70 + 0.3×100 = 79.0 直接夺榜首；
+    收缩后有效胜率只有 50 + 50×0.2 = 60，综合 67.0，输给更稳的 600601。
+    """
+    notifier = FeishuNotifier(make_settings())
+    scores = [
+        make_score("600000", 70.0, prob_up=100.0, prob_samples=1, prob_confidence=20.0),
+        make_score("600601", 75.0, prob_up=60.0, prob_samples=5, prob_confidence=100.0),
+    ]
+    text = card_text(
+        posted_card(notifier, {"MaVolumeStrategy": ["600000", "600601"]}, scores=scores)
+    )
+
+    section = composite_section(text)
+    assert section.index("600601") < section.index("600000")
+    assert "**综合 70.5**" in section and "**综合 67.0**" in section
+    assert "**综合 79.0**" not in section
+
+
+def test_card_composite_shows_winrate_k_over_n() -> None:
+    """有窗口数时胜率写成 `k/n`：单看「100%」看不出是 1 次还是 4 次。"""
+    notifier = FeishuNotifier(make_settings())
+    scores = [make_score("300750", 70.0, prob_up=75.0, prob_samples=4, prob_confidence=50.0)]
+    text = card_text(posted_card(notifier, {"MaVolumeStrategy": ["300750"]}, scores=scores))
+
+    assert "胜率 3/4" in text
+
+
+def test_card_composite_k_over_n_rounds() -> None:
+    """`prob_up` 是四舍五入过的百分比，回算 k 时会带上零点几，必须取整。"""
+    notifier = FeishuNotifier(make_settings())
+    scores = [make_score("300750", 70.0, prob_up=66.7, prob_samples=3, prob_confidence=50.0)]
+    text = card_text(posted_card(notifier, {"MaVolumeStrategy": ["300750"]}, scores=scores))
+
+    assert "胜率 2/3" in text
+
+
+def test_card_composite_omits_winrate_when_missing() -> None:
+    """没算出胜率的票照样进榜（综合分退化为评分），只是该行不显示胜率。
+
+    不能像旧「形态匹配榜」那样把它整只剔掉 —— 那会让人误以为这只票没被评分。
+    """
+    notifier = FeishuNotifier(make_settings())
+    scores = [
+        make_score("600000", 95.0),  # 无胜率
+        make_score("600601", 50.0, prob_up=42.0, prob_samples=5, prob_confidence=10.0),
+    ]
+    text = card_text(
+        posted_card(notifier, {"MaVolumeStrategy": ["600000", "600601"]}, scores=scores)
+    )
+
+    section = composite_section(text)
+    assert "600000" in section and "600601" in section
+    # 只看行内（标题里也带「胜率」二字）：只有 600601 那一行有胜率字段
+    assert section.count("· 胜率 ") == 1
+
+
+def test_card_composite_tie_breaks_by_score_then_symbol() -> None:
+    """综合分并列时按评分、再按代码升序 —— 同样输入恒定产出同样卡片。"""
+    notifier = FeishuNotifier(make_settings())
+    scores = [
+        make_score("600000", 80.0, prob_up=50.0, prob_samples=5, prob_confidence=100.0),
+        make_score("600601", 80.0, prob_up=50.0, prob_samples=5, prob_confidence=100.0),
+    ]
+    text = card_text(
+        posted_card(notifier, {"MaVolumeStrategy": ["600000", "600601"]}, scores=scores)
+    )
+
+    section = composite_section(text)
+    assert section.index("600000") < section.index("600601")
+
+
+def test_card_composite_links_to_xueqiu() -> None:
+    """综合榜里的票要可点跳雪球，并带股票名称。"""
+    notifier = FeishuNotifier(make_settings())
+    scores = [make_score("300750", 70.0, prob_up=60.0, prob_samples=5, prob_confidence=40.0)]
+    text = card_text(posted_card(notifier, {"MaVolumeStrategy": ["300750"]}, scores=scores))
+
+    section = composite_section(text)
+    assert "https://xueqiu.com/S/SZ300750" in section
+    assert "宁德时代" in section
 
 
 def test_card_sorts_strategy_rows_by_score_inside_board() -> None:
-    """策略小节内部按评分降序（板块分组保留）。"""
+    """策略小节内部按综合分名次排列（板块分组保留）。
+
+    这里两只票都没有胜率，综合分 == 评分，所以断言等价于「按评分降序」；
+    有胜率时的排序口径由 `scorer.composite_score` 单测覆盖。
+    """
     notifier = FeishuNotifier(make_settings())
     scores = [make_score("600601", 90.0), make_score("600000", 60.0)]
     text = card_text(
-        posted_card(
-            notifier, {"TurtleTradeStrategy": ["600000", "600601"]}, scores=scores
-        )
+        posted_card(notifier, {"TurtleTradeStrategy": ["600000", "600601"]}, scores=scores)
     )
 
     board_line = text.split(f"{BOARD_MAIN} 2：", 1)[1]
@@ -355,167 +473,16 @@ def test_card_keeps_code_order_without_scores() -> None:
     assert board_line.index("600000") < board_line.index("600601")
 
 
-def test_card_ranking_handles_missing_name() -> None:
+def test_card_composite_handles_missing_name() -> None:
     """名称取不到时只显示代码，但链接与名次仍在。"""
     notifier = FeishuNotifier(make_settings())
     scores = [make_score("999999", 61.0)]
     text = card_text(posted_card(notifier, {"MaVolumeStrategy": ["999999"]}, scores=scores))
 
-    assert "**1.** [999999](https://xueqiu.com/S/SZ999999) · **61.0**" in text
+    assert "**1.** [999999](https://xueqiu.com/S/SZ999999) · **综合 61.0** · 评分 61.0" in text
 
 
-# ── 形态匹配榜 ──
-# 这一节按 `prob_confidence`（匹配可信度）降序，而不是按胜率 ——
-# 胜率是 k/n 的离散值且 n 只有个位数，「100%」可能只是 1/1。
-
-
-def pattern_section(text: str) -> str:
-    """截出「形态匹配 Top N」小节，便于只在该节内部断言顺序。"""
-    assert "形态匹配 Top" in text, "卡片里没有形态匹配小节"
-    return text.split("形态匹配 Top", 1)[1]
-
-
-def test_card_without_prob_up_has_no_pattern_section() -> None:
-    """整批都没有胜率时不出现空标题（增强层未启用 / 计算失败都会是这种情况）。"""
-    notifier = FeishuNotifier(make_settings())
-    scores = [make_score("600000", 80.0), make_score("600601", 70.0)]
-    text = card_text(
-        posted_card(notifier, {"MaVolumeStrategy": ["600000", "600601"]}, scores=scores)
-    )
-
-    assert "量化评分 Top" in text  # 评分榜照常有
-    assert "形态匹配" not in text
-
-
-def test_card_pattern_section_falls_back_to_winrate_order() -> None:
-    """缺 `prob_confidence` 时（旧报告 / 增强层没给可信度）退回按胜率降序。"""
-    notifier = FeishuNotifier(make_settings())
-    scores = [
-        make_score("600000", 90.0, prob_up=55.0, tags="T"),
-        make_score("600601", 60.0, prob_up=80.0, tags="R"),
-        make_score("300750", 70.0, prob_up=70.0),
-    ]
-    text = card_text(
-        posted_card(
-            notifier,
-            {"MaVolumeStrategy": ["600000", "600601", "300750"]},
-            scores=scores,
-        )
-    )
-
-    # 标题里「Top N」被 `**` 包住，后缀在粗体之外，故分两段断言
-    assert "📈 形态匹配 Top 3" in text
-    assert "按匹配可信度降序" in text
-    assert "**胜率 80%**" in text and "**胜率 55%**" in text
-    section = pattern_section(text)
-    assert section.index("600601") < section.index("300750") < section.index("600000")
-    assert "评分 60.0" in section  # 胜率第一但评分最低，两个视角确实不同
-    assert "`R`" in section
-
-
-def test_card_pattern_section_sorts_by_confidence_not_winrate() -> None:
-    """可信度高的排前面，即使它的胜率更低 —— 这正是改排序口径的目的。"""
-    notifier = FeishuNotifier(make_settings())
-    scores = [
-        # 胜率满分但只有 1 个窗口 ⇒ 只能是端点值，可信度低，应排后面
-        make_score("600000", 90.0, prob_up=100.0, prob_samples=1, prob_confidence=22.0),
-        # 胜率一般但 5 个窗口都在 ⇒ 可信度高，应排第一
-        make_score("600601", 60.0, prob_up=60.0, prob_samples=5, prob_confidence=55.0),
-    ]
-    text = card_text(
-        posted_card(notifier, {"MaVolumeStrategy": ["600000", "600601"]}, scores=scores)
-    )
-
-    section = pattern_section(text)
-    assert section.index("600601") < section.index("600000")
-    assert "**胜率 3/5**" in section and "**胜率 1/1**" in section
-
-
-def test_card_pattern_section_shows_k_over_n() -> None:
-    """有样本数时胜率写成 `k/n`：单看「100%」看不出是 1 次还是 7 次。"""
-    notifier = FeishuNotifier(make_settings())
-    scores = [make_score("300750", 70.0, prob_up=100.0, prob_samples=4)]
-    text = card_text(posted_card(notifier, {"MaVolumeStrategy": ["300750"]}, scores=scores))
-
-    assert "**胜率 4/4**" in text
-
-
-def test_card_pattern_section_k_over_n_rounds() -> None:
-    """`prob_up` 是四舍五入过的百分比，回算 k 时会带上零点几，必须取整。"""
-    notifier = FeishuNotifier(make_settings())
-    scores = [make_score("300750", 70.0, prob_up=66.7, prob_samples=3)]
-    text = card_text(posted_card(notifier, {"MaVolumeStrategy": ["300750"]}, scores=scores))
-
-    assert "**胜率 2/3**" in text
-
-
-def test_card_pattern_section_sorts_missing_confidence_last() -> None:
-    """缺可信度的票排最后但**不消失** —— 不能因为少一个字段就整只丢掉。"""
-    notifier = FeishuNotifier(make_settings())
-    scores = [
-        make_score("600000", 90.0, prob_up=90.0),  # 无可信度
-        make_score("600601", 60.0, prob_up=40.0, prob_confidence=30.0),
-    ]
-    text = card_text(
-        posted_card(notifier, {"MaVolumeStrategy": ["600000", "600601"]}, scores=scores)
-    )
-
-    section = pattern_section(text)
-    assert section.index("600601") < section.index("600000")
-    assert "**2.**" in section  # 缺可信度那只仍在榜上
-
-
-def test_card_pattern_section_is_capped_at_top_n() -> None:
-    """形态匹配榜同样只放前 5 名，完整排行看本地 HTML 报告。"""
-    notifier = FeishuNotifier(make_settings())
-    symbols = [f"{i:06d}" for i in range(8)]
-    scores = [
-        make_score(s, 90.0 - i, prob_up=90.0 - i, prob_confidence=90.0 - i)
-        for i, s in enumerate(symbols)
-    ]
-    text = card_text(posted_card(notifier, {"MaVolumeStrategy": symbols}, scores=scores))
-
-    assert "📈 形态匹配 Top 5" in text
-    assert "**6.**" not in pattern_section(text)
-
-
-def test_card_pattern_section_skips_scores_without_prob_up() -> None:
-    """没算出胜率的票不进形态匹配榜 —— 不能拿 0 分凑数占位。"""
-    notifier = FeishuNotifier(make_settings())
-    scores = [
-        make_score("600000", 95.0, prob_confidence=99.0),  # 可信度很高但无胜率
-        make_score("600601", 50.0, prob_up=42.0, prob_confidence=10.0),
-    ]
-    text = card_text(
-        posted_card(notifier, {"MaVolumeStrategy": ["600000", "600601"]}, scores=scores)
-    )
-
-    section = pattern_section(text)
-    assert "**1.**" in section and "600601" in section
-    assert "**2.**" not in section
-
-
-def test_card_pattern_section_tie_breaks_by_winrate_then_score() -> None:
-    """可信度并列时依次按胜率、评分降序，保证同样输入恒定产出同样卡片。"""
-    notifier = FeishuNotifier(make_settings())
-    scores = [
-        make_score("600000", 60.0, prob_up=75.0, prob_confidence=40.0),
-        make_score("600601", 88.0, prob_up=75.0, prob_confidence=40.0),
-    ]
-    text = card_text(
-        posted_card(notifier, {"MaVolumeStrategy": ["600000", "600601"]}, scores=scores)
-    )
-
-    section = pattern_section(text)
-    assert section.index("600601") < section.index("600000")
-
-
-def test_card_pattern_section_links_to_xueqiu() -> None:
-    """形态匹配榜里的票同样要可点跳雪球。"""
-    notifier = FeishuNotifier(make_settings())
-    scores = [make_score("300750", 70.0, prob_up=66.0, prob_confidence=40.0)]
-    text = card_text(posted_card(notifier, {"MaVolumeStrategy": ["300750"]}, scores=scores))
-
-    section = pattern_section(text)
-    assert "https://xueqiu.com/S/SZ300750" in section
-    assert "宁德时代" in section
+# 旧的「📈 形态匹配 Top 5」单独栏目已并入「🎯 综合评分 Top 10」，
+# 相关用例（按可信度排序 / k over n / 缺可信度排最后 等）已由上面的
+# 综合榜用例覆盖；胜率的排序语义现在住在 `scorer.composite_score` 里，
+# 由 `tests/test_scorer.py` 覆盖。

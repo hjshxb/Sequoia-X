@@ -16,7 +16,7 @@ import sys
 
 from dotenv import load_dotenv
 
-from sequoia_x.analysis.scorer import ScoreDetail, score_from_settings
+from sequoia_x.analysis.scorer import ScoreDetail, composite_score, score_from_settings
 from sequoia_x.core.config import MAX_SYNC_WORKERS, get_settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data import stock_meta
@@ -176,9 +176,12 @@ def main() -> None:
                     tags=build_symbol_marks(results),
                 )
                 if ranking:
+                    # 排序口径是**综合分**（评分 + 胜率），所以榜首是综合分最高，
+                    # 不一定是评分最高 —— 两个数都打出来，免得日志误导。
                     logger.info(
                         f"量化评分完成：{len(ranking)} 只，"
-                        f"最高 {ranking[0].score:.1f}（{ranking[0].symbol}）"
+                        f"综合最高 {composite_score(ranking[0]):.1f}"
+                        f"（{ranking[0].symbol}，评分 {ranking[0].score:.1f}）"
                     )
             except Exception as exc:
                 logger.error(f"量化评分失败，本次报告与推送不含评分：{exc}")

@@ -9,11 +9,16 @@
 ⚠️ 这个脚本是**生产推送的镜像**：必须与 `main.py` 实际传给
 `FeishuNotifier.send_report()` 的参数保持一致（含 `scores=`），
 否则预览出来的卡片会比真实推送少小节，看起来"格式变了"。
-2026-09-24 修过一次：原先没传 `scores`，导致预览里看不到「量化评分 Top 5」，
-板块内部的排序也和真实卡片不同。同一处后来又补过一刀：卡片新增
-「📈 形态匹配 Top 5」后，`prob_up`（以及决定排序的 `prob_confidence`、
-展示用的 `prob_samples`）都得从排行表对应列还原出来，否则预览板块的
-**顺序**会和真实卡片不一样 —— 只看预览会以为"排序没生效"。
+2026-09-24 修过一次：原先没传 `scores`，导致预览里看不到「🎯 量化评分 Top 5」，
+板块内部的排序也和真实卡片不同。同一处后来又补过一刀：卡片新增胜率展示后，
+`prob_up`（以及决定排序的 `prob_confidence`、展示用的 `prob_samples`）都得从
+排行表对应列还原出来，否则预览板块的**顺序**会和真实卡片不一样。
+
+同日更晚一刀：卡片的「量化评分 Top 5」+「形态匹配 Top 5」两个小节**合并**成
+一个「🎯 综合评分 Top 10」（按 `scorer.composite_score` 排序，见
+`feishu._composite_section`）。这里无需改逻辑 —— 综合分由 `feishu` 内部现算，
+本脚本只管把 `prob_up / prob_samples / prob_confidence` 三个字段喂全，
+缺一个综合分就会退化（胜率不当权重、预览顺序与真实卡片不符）。
 """
 
 import argparse
@@ -74,19 +79,22 @@ for chunk in html.split('<section class="card"')[1:]:
                 names[code] = name
     results[label_to_class.get(label, label)] = codes
 
-# ── 评分：从报告页首的「量化评分排行」表还原 ──
+# ── 评分：从报告页首的「综合评分排行」表还原 ──
 # 真实推送里的分数来自 production 的 scorer；这里不重算（重算会因缺少
 # 估值/筹码入参而与报告里的分数不一致），而是直接读报告里已经算好的结果。
 # 锚定开头的 `<td class="rank">` 是刻意的：策略卡片里的行也有
 # `<td class="num score">` + `<td class="marks">`，但**没有** rank 单元格
 # （它前面是 industry/市值/换手/PE/十大流通 等列）。锚住 rank 就能保证
 # 只匹配排行表，不会把策略表里的行重复算进 `scores`。
+# 「综合」列（class="num composite"）写成**可选**：它排在「评分」与「标记」
+# 之间，新版报告有、刚改前的报告没有 —— 不写可选会把旧报告解析成 0 行。
 rank_re = re.compile(
     r'<td class="rank">\d+</td>\s*'
     r'<td class="code"><a[^>]*>(\d{6})</a></td>\s*'
     r'<td class="name">([^<]*)</td>\s*'
     r'<td class="board">[^<]*</td>\s*'
     r'<td class="num score"[^>]*>([\d.]+)</td>\s*'
+    r'(?:<td class="num composite"[^>]*>[^<]*</td>\s*)?'
     r'<td class="marks">([^<]*)</td>\s*'
     r"(.*?)</tr>"
 )
@@ -99,9 +107,12 @@ _CELL_RE = re.compile(r'<td class="num">([^<]*)</td>')
 # ⚠️ 不能写死正向下标：旧报告没有「窗口」「置信」，写死 7 会正好取到「回撤」，
 # 预览里就会出现「胜率 -21/-21」这种鬼值（2026-09-24 实测踩到）。
 # 改为**从行尾倒着数**（回撤永远是最末一列），并看表头有没有「窗口」决定偏移。
-# 卡片新增的「形态匹配 Top 5」要用到这三个字段：`prob_up` 用于显示，
-# `prob_confidence` **用于排序**（缺了它预览顺序就跟真实卡片不一样），
-# `prob_samples` 用于把胜率显示成 `k/n`。
+# 「综合」列用的是 `class="num composite"`（**不是** `class="num"`），所以下面
+# 的 `_CELL_RE` 抓不到它、不会把行尾的倒数下标整体挪位 —— 加列时特意用独立
+# class 就是为了不动这套下标。
+# 卡片的「综合评分 Top 10」要用到这三个字段：`prob_up` 用于显示胜率，
+# `prob_confidence` **参与综合分计算（决定排序）**（缺了它预览顺序就跟真实
+# 卡片不一样），`prob_samples` 用于把胜率显示成 `k/n`。
 _HAS_WINDOW_COLS = "<th>窗口</th>" in html
 
 if _HAS_WINDOW_COLS:
@@ -148,8 +159,8 @@ def _placeholder(
     """用报告里读得到的字段构造 ScoreDetail，其余填占位值。
 
     卡片渲染只用到 `symbol` / `score` / `tags` / `prob_up` / `prob_samples`
-    / `prob_confidence`（见 `feishu._ranking_section` 与
-    `feishu._pattern_match_section`），其余量价字段在卡片里不出现，故无需还原。
+    / `prob_confidence`（见 `feishu._composite_section` 与 `scorer.composite_score`），
+    其余量价字段在卡片里不出现，故无需还原。
     """
     return ScoreDetail(
         symbol=symbol,
@@ -196,7 +207,7 @@ with_winrate = sum(1 for d in scores if d.prob_up is not None)
 with_conf = sum(1 for d in scores if d.prob_confidence is not None)
 print(
     f"# 评分排行还原：{len(scores)} 只，其中带胜率 {with_winrate} 只、"
-    f"带匹配可信度 {with_conf} 只（胜率 0 只时卡片不含形态匹配小节）"
+    f"带匹配可信度 {with_conf} 只（缺胜率时综合分退化为评分）"
 )
 
 # 屏蔽 baostock：名称直接用报告里已有的，保证离线且与报告一致

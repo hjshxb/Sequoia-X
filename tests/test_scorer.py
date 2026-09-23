@@ -9,6 +9,8 @@
       一律降级且不影响基础分；`prob_up` 已是 0~100 百分数，**不得再乘 100**
     - 增强层的两个「样本」别混：胜率分母是 `len(matches)`（相似窗口数，≤5），
       `n_matches` 是候选总数；且喂给匹配器的历史必须比特征用的 lookback 长
+    - 综合分 `composite_score`（评分 + 胜率，展示层唯一排序口径）：胜率按
+      可信度向 50% 收缩、缺胜率时退化为评分、并列时的稳定次序
 """
 
 import sqlite3
@@ -790,3 +792,75 @@ def test_score_from_settings_against_real_db(db):
     )
     assert [d.symbol for d in got] == ["AAA", "BBB"]
     assert all(d.adjusted > 0 for d in got)
+
+
+# ── 综合分（评分 + 胜率）──
+# 综合分是展示层的**唯一**排序口径：报告页首排行、飞书卡片 Top N、
+# 策略小节内的名次都调它。口径散落成多份就会漂移，所以这里把公式的
+# 每个分支都钉住。
+
+
+def test_composite_equals_score_without_winrate() -> None:
+    """缺 `prob_up` 时综合分退化为评分（语义是「无胜率信息，不做修正」）。"""
+    detail = make_score("600000", 73.4)
+    assert scorer.composite_score(detail) == 73.4
+
+
+def test_composite_treats_missing_confidence_as_neutral() -> None:
+    """有胜率但缺可信度时，置信度按 0 处理 ⇒ 有效胜率 = 50（中性）。"""
+    detail = make_score("600000", 80.0, prob_up=100.0)
+    # 0.7×80 + 0.3×50 = 71.0（不因「100%」被抬到 86.0）
+    assert scorer.composite_score(detail) == pytest.approx(71.0)
+
+
+def test_composite_blends_score_and_winrate_by_weight() -> None:
+    """高可信度下：综合分 = 评分 ×0.7 + 胜率 ×0.3。"""
+    detail = make_score("600000", 80.0, prob_up=20.0, prob_confidence=100.0)
+    assert scorer.composite_score(detail) == pytest.approx(0.7 * 80 + 0.3 * 20)
+
+
+def test_composite_shrinks_winrate_toward_neutral_by_confidence() -> None:
+    """胜率按可信度向 50% 收缩：1/1 的「100%」在低可信度下几乎不影响排序。"""
+    low = make_score("600000", 70.0, prob_up=100.0, prob_samples=1, prob_confidence=20.0)
+    high = make_score("600601", 70.0, prob_up=100.0, prob_samples=5, prob_confidence=100.0)
+
+    # 有效胜率：50 + (100-50)×0.2 = 60 → 0.7×70 + 0.3×60 = 67.0
+    assert scorer.composite_score(low) == pytest.approx(67.0)
+    # 有效胜率：100 → 0.7×70 + 0.3×100 = 79.0
+    assert scorer.composite_score(high) == pytest.approx(79.0)
+    assert scorer.composite_score(low) < scorer.composite_score(high)
+
+
+def test_composite_clamps_out_of_range_confidence() -> None:
+    """可信度超出 0~100 时按边界裁剪，不能让脏数据把胜率放大。"""
+    over = make_score("600000", 60.0, prob_up=100.0, prob_confidence=180.0)
+    under = make_score("600601", 60.0, prob_up=100.0, prob_confidence=-30.0)
+
+    assert scorer.composite_score(over) == pytest.approx(0.7 * 60 + 0.3 * 100)
+    assert scorer.composite_score(under) == pytest.approx(0.7 * 60 + 0.3 * 50)
+
+
+def test_rank_by_composite_orders_by_composite_and_breaks_ties_stably() -> None:
+    """按综合分降序；并列时依次按评分、代码 —— 同样输入恒定产出同样顺序。"""
+    details = [
+        make_score("600000", 80.0, prob_up=20.0, prob_confidence=100.0),  # 综合 62.0
+        make_score("600601", 70.0, prob_up=80.0, prob_confidence=100.0),  # 综合 73.0
+        make_score("600602", 70.0, prob_up=80.0, prob_confidence=100.0),  # 综合 73.0 并列
+    ]
+    assert [d.symbol for d in scorer.rank_by_composite(details)] == [
+        "600601",
+        "600602",
+        "600000",
+    ]
+
+
+def test_score_from_settings_returns_composite_order(db, monkeypatch):
+    """`score_from_settings` 的返回值必须已按综合分排序 —— 报告与飞书都吃这个顺序。"""
+    details = [
+        make_score("600000", 80.0, prob_up=20.0, prob_confidence=100.0),  # 综合 62.0
+        make_score("600601", 70.0, prob_up=80.0, prob_confidence=100.0),  # 综合 73.0
+    ]
+    monkeypatch.setattr(scorer, "score_pool", lambda symbols, **kw: details)
+    got = scorer.score_from_settings(["AAA"], settings=_settings(db_path=db))
+    assert [d.symbol for d in got] == ["600601", "600000"]
+    assert [d.symbol for d in scorer.rank_by_composite(details)] == ["600601", "600000"]

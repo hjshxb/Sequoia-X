@@ -25,7 +25,7 @@ load_dotenv()
 
 from pathlib import Path
 
-from sequoia_x.analysis.scorer import ScoreDetail, score_from_settings
+from sequoia_x.analysis.scorer import ScoreDetail, composite_score, score_from_settings
 from sequoia_x.core.config import Settings
 from sequoia_x.data import stock_meta
 from sequoia_x.data.engine import DataEngine
@@ -112,7 +112,11 @@ if union and settings.score_enabled:
     except Exception as exc:
         print(f"量化评分失败（本次报告不含评分）：{exc}")
 if ranking:
-    print(f"量化评分：{len(ranking)} 只，最高 {ranking[0].score:.1f}（{ranking[0].symbol}）")
+    # 榜首按**综合分**（评分 + 胜率）排，不一定是评分最高那只 —— 两个数都打出来
+    print(
+        f"量化评分：{len(ranking)} 只，综合最高 {composite_score(ranking[0]):.1f}"
+        f"（{ranking[0].symbol}，评分 {ranking[0].score:.1f}）"
+    )
 
 path = HtmlReportGenerator(settings).generate(
     results,

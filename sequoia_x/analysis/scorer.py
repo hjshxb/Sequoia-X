@@ -608,6 +608,65 @@ def summarize(details: Iterable[ScoreDetail]) -> dict[str, list[ScoreDetail]]:
     }
 
 
+# ── 综合分（评分 + 胜率）──
+
+# 胜率在综合分里的权重。评分（量价五维）是主口径，胜率是**修正项**：
+# 给太高会让「1/1 = 100%」这类窗口噪声主导排序，给太低就等于没结合。
+WINRATE_WEIGHT = 0.3
+
+# 胜率的「中性值」。综合分把胜率按可信度向它收缩，缺胜率时也按它处理。
+NEUTRAL_WINRATE = 50.0
+
+
+def effective_winrate(detail: ScoreDetail) -> float | None:
+    """胜率按可信度向中性值收缩后的「有效胜率」；缺胜率时返回 None。
+
+    公式：`有效胜率 = 50 + (prob_up - 50) × 可信度/100`
+
+    为什么要收缩，而不是直接用 `prob_up`：胜率的分母最多只有 5 个相似窗口
+    （工具的 `top_k=5`），可信度低时它接近噪声 —— 实测修复前 36 只里
+    5 只 0%、4 只 100%，全是分母只有 1~3 造成的端点值。**直接平均会让一个
+    「1/1 = 100%」把票推到榜首**；按可信度收缩后，可信度低的胜率自动趋近
+    50%（中性），几乎不影响排序，可信度高的才真正说话。
+
+    可信度缺失时按 0 处理（等价于「胜率为中性」，不做修正），而不是按 100 ——
+    宁可不用这个字段，也不让来路不明的胜率夺榜首。可信度超界按 0/100 裁剪。
+
+    单独抽成函数是因为**展示层也要它**：报告页首的「综合」列悬停要写出
+    「评分 ×0.7 + 有效胜率 ×0.3」，若让展示层自己抄一遍公式，两处迟早漂移。
+    """
+    if detail.prob_up is None:
+        return None
+    confidence = max(0.0, min(1.0, (detail.prob_confidence or 0.0) / 100.0))
+    return NEUTRAL_WINRATE + (detail.prob_up - NEUTRAL_WINRATE) * confidence
+
+
+def composite_score(detail: ScoreDetail) -> float:
+    """综合分 = 评分与胜率的加权合成（唯一口径，展示层都调这里）。
+
+    公式：
+        `综合分 = 评分 × (1 - WINRATE_WEIGHT) + 有效胜率 × WINRATE_WEIGHT`
+        （有效胜率见 `effective_winrate`，已按可信度向 50% 收缩）
+
+    缺 `prob_up`（未启用增强 / 旧数据）时 `有效胜率` 为 None，直接返回评分 ——
+    语义是「没有胜率信息，不做修正」，而不是当作 0 分惩罚。
+    """
+    effective = effective_winrate(detail)
+    if effective is None:
+        return round(detail.adjusted, 1)
+    blended = (1 - WINRATE_WEIGHT) * detail.adjusted + WINRATE_WEIGHT * effective
+    return round(blended, 1)
+
+
+def rank_by_composite(details: Iterable[ScoreDetail]) -> list[ScoreDetail]:
+    """按综合分降序（并列时依次按评分、代码），供展示层统一排序口径。
+
+    报告页首的排行、飞书卡片的 Top N、策略小节里的板块内排序都调它，
+    避免三处各写一个 key 而漂移。
+    """
+    return sorted(details, key=lambda d: (-composite_score(d), -d.adjusted, d.symbol))
+
+
 # ── 配置驱动的入口（每日流程与离线重算共用）──
 
 
@@ -644,6 +703,9 @@ def score_from_settings(
         enhance_top=limit if settings.score_enhance else 0,
         skill_path=settings.quant_skill_path if settings.score_enhance else "",
     )
-    # 0 = 不限制（展示与增强都全量）；非零才截断
-    return ranking[: settings.score_top_n] if settings.score_top_n else ranking
-
+    # `score_top_n` 的截断仍按**评分**做（它同时决定增强算多少只，必须发生在
+    # 增强之前、且不能用只有增强后才知道的综合分）；截断之后统一改按
+    # **综合分**排序，让报告与飞书拿到的顺序一致。
+    if settings.score_top_n:
+        ranking = ranking[: settings.score_top_n]
+    return rank_by_composite(ranking)

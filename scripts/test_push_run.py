@@ -4,7 +4,7 @@
 
 ⚠️ 这个脚本是**生产链路的镜像**：除了不调用 `engine.sync_today_bulk()`，其余步骤必须与
 `main.py` 保持同构 —— 尤其传给 `send_report()` / `generate()` 的参数（含 `scores=`）。
-2026-09-24 修过一次：原先没传 `scores`，推出去的卡片比生产少「量化评分 Top 5」小节、
+2026-09-24 修过一次：原先没传 `scores`，推出去的卡片比生产少「🎯 综合评分 Top 10」小节、
 板块内排序也不同，**用它验证过的链路等于没验证**。
 
 刻意保留的一处差异：指标/筹码取数失败时降级为 `{}` 并记 WARNING，而不是中断。
@@ -17,7 +17,7 @@ socket.setdefaulttimeout(10.0)
 
 from dotenv import load_dotenv
 
-from sequoia_x.analysis.scorer import ScoreDetail, score_from_settings
+from sequoia_x.analysis.scorer import ScoreDetail, composite_score, score_from_settings
 from sequoia_x.core.config import get_settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data.engine import DataEngine
@@ -101,7 +101,9 @@ def main() -> None:
             )
             if ranking:
                 logger.info(
-                    f"量化评分完成：{len(ranking)} 只，最高 {ranking[0].score:.1f}（{ranking[0].symbol}）"
+                    f"量化评分完成：{len(ranking)} 只，"
+                    f"综合最高 {composite_score(ranking[0]):.1f}"
+                    f"（{ranking[0].symbol}，评分 {ranking[0].score:.1f}）"
                 )
         except Exception as exc:
             logger.error(f"量化评分失败，本次报告与推送不含评分：{exc}")

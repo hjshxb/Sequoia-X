@@ -19,7 +19,12 @@ from collections.abc import Mapping, Sequence
 from datetime import date
 from pathlib import Path
 
-from sequoia_x.analysis.scorer import ScoreDetail
+from sequoia_x.analysis.scorer import (
+    WINRATE_WEIGHT,
+    ScoreDetail,
+    composite_score,
+    effective_winrate,
+)
 from sequoia_x.core.config import Settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data import stock_meta as stock_meta_module
@@ -238,9 +243,11 @@ class HtmlReportGenerator:
                 市值 / 换手率 / PE(TTM) 三列；缺数据的股票显示为「—」。
             holdings: 可选的 {代码: 前十大流通股东合计占流通股比例(%)}。
                 传入后额外展示「十大流通(%)」一列，便于回看与调阈值。
-            scores: 可选的量化评分明细（应按得分降序）。传入后：页首多一张
-                「量化评分排行」卡片、各策略卡片追加「评分」列，且板块分组
-                **内部**改按评分降序排列（板块之间的先后顺序不变）。
+            scores: 可选的量化评分明细。传入后：页首多一张「综合评分排行」
+                卡片、各策略卡片追加「评分」列，且板块分组**内部**改按综合分
+                名次排列（板块之间的先后顺序不变）。**顺序即传入顺序** ——
+                调用方（`scorer.score_from_settings`）已按综合分排好，
+                渲染层不再自己重排，避免两处口径漂移。
 
         Returns:
             实际写入的报告文件路径。
@@ -570,17 +577,25 @@ class HtmlReportGenerator:
 """
 
     def _render_ranking(self, scores: Sequence[ScoreDetail], meta: dict[str, StockMeta]) -> str:
-        """渲染页首的「量化评分排行」卡片（已按风险调整后得分降序）。
+        """渲染页首的「综合评分排行」卡片（已按综合分降序）。
 
         回答的是策略答不了的问题：**入选的这几十只里，哪几只更值得看**。
         分数刻意做成可解释的 —— 鼠标悬停在分数上能看到五维分项与扣分，
         不让它变成一个黑箱数字。
+
+        **排序用综合分（评分 ×0.7 + 胜率按可信度收缩后 ×0.3），不是评分**：
+        只按量价评分排会把「高分但历史相似窗口一致看空」的票摆在前面。
+        综合分口径唯一（`scorer.composite_score`），与飞书卡片的
+        「🎯 综合评分 Top 10」完全一致 —— 两处顺序不同才是真的会误导人。
+        「评分」列保留原位（它是综合分的主成分、也是悬停提示的解释对象），
+        紧跟其后新增「综合」列，让排序依据直接可见。
         """
         if not scores:
             return ""
 
         head = (
-            "<th>#</th><th>代码</th><th>名称</th><th>板块</th><th>评分</th><th>标记</th>"
+            "<th>#</th><th>代码</th><th>名称</th><th>板块</th><th>评分</th><th>综合</th>"
+            "<th>标记</th>"
             "<th>当日</th><th>20日</th><th>量比</th><th>距高</th><th>MA20偏离</th>"
             "<th>波动</th><th>胜率</th><th>窗口</th><th>置信</th><th>回撤</th>"
         )
@@ -612,6 +627,16 @@ class HtmlReportGenerator:
             if detail.max_drawdown is not None:
                 tips.append(f"最大回撤 {detail.max_drawdown:.1f}%")
 
+            # 综合分的构成也做成悬停可读：评分与有效胜率各占多少一目了然
+            if detail.prob_up is None:
+                composite_tip = "无胜率信息，综合分 = 评分"
+            else:
+                effective = effective_winrate(detail)
+                composite_tip = (
+                    f"评分 {detail.score:.1f} ×{1 - WINRATE_WEIGHT:.1f}"
+                    f" + 有效胜率 {effective:.1f} ×{WINRATE_WEIGHT:.1f}"
+                )
+
             body.append(
                 "            <tr>"
                 f'<td class="rank">{i}</td>'
@@ -621,6 +646,8 @@ class HtmlReportGenerator:
                 f'<td class="board">{html.escape(board_of(detail.symbol))}</td>'
                 f'<td class="num score" title="{html.escape("、".join(tips))}">'
                 f"{detail.score:.1f}</td>"
+                f'<td class="num composite" title="{html.escape(composite_tip)}">'
+                f"{composite_score(detail):.1f}</td>"
                 f'<td class="marks">{html.escape(detail.tags or "—")}</td>'
                 f'<td class="num">{_fmt_pct(detail.chg1, signed=True)}</td>'
                 f'<td class="num">{_fmt_pct(detail.chg20, signed=True)}</td>'
@@ -637,9 +664,9 @@ class HtmlReportGenerator:
 
         return f"""<section class="card ranking" data-count="{len(scores)}">
       <div class="card-head">
-        <h2>量化评分排行</h2>
+        <h2>综合评分排行</h2>
         <span class="badge">{len(scores)}</span>
-        <span class="boards">按风险调整后得分降序 · 悬停分数可看构成</span>
+        <span class="boards">按综合分降序（评分 ×0.7 + 胜率 ×0.3）· 悬停数字可看构成</span>
       </div>
       <div class="table-wrap">
         <table>

@@ -495,7 +495,7 @@ def test_group_by_board_puts_unranked_last():
 def test_ranking_card_absent_without_scores(gen):
     text = gen.generate({"TurtleTradeStrategy": ["600000"]}).read_text(encoding="utf-8")
 
-    assert "量化评分排行" not in text
+    assert "综合评分排行" not in text
     assert '<td class="num score"' not in text
 
 
@@ -506,19 +506,49 @@ def test_ranking_card_rendered_with_scores(gen):
     ).read_text(encoding="utf-8")
 
     assert '<section class="card ranking"' in text
-    assert "量化评分排行" in text
+    assert "综合评分排行" in text
     assert '<td class="rank">1</td>' in text and '<td class="rank">2</td>' in text
     assert "86.0" in text and "72.5" in text
 
 
+def test_ranking_card_shows_composite_column(gen):
+    """「综合」列紧跟「评分」，排序依据必须直接在表里可见（不只是悬停里）。
+
+    无胜率时综合分 == 评分（两个单元格同值）；有胜率时综合分 = 评分×0.7 +
+    有效胜率×0.3，故两个值应当不同，且悬停能说明它是怎么算出来的。
+    """
+    scores = [
+        make_score("600000", 80.0, prob_up=20.0, prob_samples=5, prob_confidence=100.0),
+    ]
+    text = gen.generate({"TurtleTradeStrategy": ["600000"]}, scores=scores).read_text(
+        encoding="utf-8"
+    )
+
+    assert "<th>综合</th>" in text
+    # 0.7×80 + 0.3×20 = 62.0
+    assert '<td class="num composite"' in text and ">62.0</td>" in text
+    assert "评分 80.0 ×0.7 + 有效胜率 20.0 ×0.3" in text
+
+
+def test_ranking_card_composite_equals_score_without_winrate(gen):
+    """没有胜率信息时综合分退化为评分，并如实说明「无胜率信息」。"""
+    scores = [make_score("600000", 72.5)]
+    text = gen.generate({"TurtleTradeStrategy": ["600000"]}, scores=scores).read_text(
+        encoding="utf-8"
+    )
+
+    assert "无胜率信息，综合分 = 评分" in text
+    assert ">72.5</td>" in text
+
+
 def test_ranking_card_keeps_given_order(gen):
-    """名次由传入顺序决定（调用方已按得分降序排好）。"""
+    """名次由传入顺序决定（调用方已按综合分降序排好）。"""
     scores = [make_score("300750", 90.0), make_score("600000", 60.0)]
     text = gen.generate(
         {"TurtleTradeStrategy": ["600000", "300750"]}, scores=scores
     ).read_text(encoding="utf-8")
 
-    ranking = text.split("量化评分排行", 1)[1]
+    ranking = text.split("综合评分排行", 1)[1]
     assert ranking.index("300750") < ranking.index("600000")
 
 
