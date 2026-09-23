@@ -16,7 +16,7 @@ import sys
 
 from dotenv import load_dotenv
 
-from sequoia_x.analysis.scorer import ScoreDetail, score_pool
+from sequoia_x.analysis.scorer import ScoreDetail, score_from_settings
 from sequoia_x.core.config import MAX_SYNC_WORKERS, get_settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data import stock_meta
@@ -167,20 +167,14 @@ def main() -> None:
             logger.info("量化评分已关闭（SCORE_ENABLED=false）")
         elif displayed:
             try:
-                # 展示范围与增强范围必须一致：否则会出现「报告里排到了第 30 名、
-                # 但胜率/回撤列是空的」这种不一致。score_top_n=0 表示不限制。
-                limit = settings.score_top_n or len(displayed)
-                ranking = score_pool(
+                # 配置怎么读统一在 score_from_settings 里（离线重算脚本共用同一份实现）
+                ranking = score_from_settings(
                     displayed,
-                    db_path=settings.db_path,
+                    settings=settings,
                     metrics=metrics,
                     holdings=holdings,
                     tags=build_symbol_marks(results),
-                    enhance_top=limit if settings.score_enhance else 0,
-                    skill_path=settings.quant_skill_path if settings.score_enhance else "",
                 )
-                if settings.score_top_n:
-                    ranking = ranking[: settings.score_top_n]
                 if ranking:
                     logger.info(
                         f"量化评分完成：{len(ranking)} 只，"

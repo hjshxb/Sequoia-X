@@ -3,12 +3,15 @@
 
 职责边界（重要）：
     报告解析（HTML → 候选池）留在本脚本；**打分逻辑统一在
-    `sequoia_x.analysis.scorer`**，这里只做「取数 → 调模块 → 打印」。
-    这样 CLI 与 main.py 每日流程用的是同一套分数，不会各改各的而漂移。
+    `sequoia_x.analysis.scorer`**（含结构分组的阈值与口径 `summarize()`），
+    这里只做「取数 → 调模块 → 打印」。这样 CLI 与 main.py 每日流程用的是同一套
+    分数与同一套口径，不会各改各的而漂移。
 
-为什么需要 CLI：
-    main.py 每日跑完才有评分，但调参数、复盘、验证某一天时不想跑整条流程
-    （全市场同步可能几十分钟）。用已生成的报告 + 本地库即可离线复现。
+为什么需要 CLI（而不是并进 main.py 或 regen_report.py）：
+    main.py 只对「当天跑出来的候选池」评分，且必须先跑完整条流程（全市场同步
+    可能几十分钟）；regen_report.py 的输入是 `candidates_*.html` 策略快照，
+    只认当天/最新一个，不支持指定日期。**要对任意历史日期的报告复现评分
+    （调权重后回看、复盘、验证），本脚本是唯一入口** —— 秒级、零网络。
 
 用法（WSL，仓库根目录）：
     python scripts/quant_analyze.py                    # 自动取 reports/ 最新报告
@@ -29,7 +32,15 @@ sys.path.insert(0, ROOT)
 
 from dotenv import load_dotenv  # noqa: E402
 
-from sequoia_x.analysis.scorer import score_pool  # noqa: E402
+from sequoia_x.analysis.scorer import (  # noqa: E402
+    SHAPE_DEEP_PULLBACK,
+    SHAPE_NEAR_HIGH,
+    SHAPE_OVEREXTENDED,
+    SHAPE_PENALISED,
+    SHAPE_VOLUME_RALLY,
+    score_pool,
+    summarize,
+)
 from sequoia_x.data.universe_filter import StockMetric  # noqa: E402
 
 load_dotenv(os.path.join(ROOT, ".env"))
@@ -171,6 +182,9 @@ def main() -> int:
     if not result:
         return 1
 
+    # `--top N` 只限制**表格**打印多少行；结构提示始终基于完整池子 ——
+    # 否则「--top 3」会让「接近新高 3 只」这种结论悄悄变成只看前 3 名的结果。
+    full = result
     if args.top:
         result = result[: args.top]
 
@@ -196,18 +210,28 @@ def main() -> int:
             f"{(d.max_drawdown if d.max_drawdown is not None else float('nan')):>6.1f}"
         )
 
-    print("\n--- 分组提示 ---")
-    print("接近新高(距高<5%):", [pool.get(r.symbol, {}).get("name", r.symbol)
-                                 for r in result if (r.near_high or 0) >= 0.95])
-    print("深度回撤(距高>10%):", [pool.get(r.symbol, {}).get("name", r.symbol)
-                                  for r in result if (r.near_high or 1) < 0.90])
-    print("放量上涨(量比>=1.3):", [pool.get(r.symbol, {}).get("name", r.symbol)
-                                   for r in result if (r.chg1 or 0) > 0 and (r.vol_ratio or 0) >= 1.3])
-    print("偏离MA20>40%(重度追高):", [f"{pool.get(r.symbol, {}).get('name', r.symbol)}"
-                                      f"({r.dev_ma20:.1f}%)"
-                                      for r in result if (r.dev_ma20 or 0) > 40])
-    print("被扣分(位置/波动):", [f"{pool.get(r.symbol, {}).get('name', r.symbol)}(-{r.penalty:.0f})"
-                                 for r in result if r.penalty > 0])
+    print("\n--- 结构提示 ---")
+    # 分组逻辑在 `scorer.summarize()`（阈值与量价口径同源，可单测）；
+    # 这里只负责把代码换成名称 —— 分析层不认识股票名称。
+    name_of = {r.symbol: pool.get(r.symbol, {}).get("name", r.symbol) for r in full}
+    groups = summarize(full)
+    print(f"{SHAPE_NEAR_HIGH}(距高<5%):", [name_of[d.symbol] for d in groups[SHAPE_NEAR_HIGH]])
+    print(
+        f"{SHAPE_DEEP_PULLBACK}(距高>10%):",
+        [name_of[d.symbol] for d in groups[SHAPE_DEEP_PULLBACK]],
+    )
+    print(
+        f"{SHAPE_VOLUME_RALLY}(量比>=1.3):",
+        [name_of[d.symbol] for d in groups[SHAPE_VOLUME_RALLY]],
+    )
+    print(
+        f"{SHAPE_OVEREXTENDED}(偏离MA20>40%):",
+        [f"{name_of[d.symbol]}({d.dev_ma20:.1f}%)" for d in groups[SHAPE_OVEREXTENDED]],
+    )
+    print(
+        f"{SHAPE_PENALISED}(位置/波动):",
+        [f"{name_of[d.symbol]}(-{d.penalty:.0f})" for d in groups[SHAPE_PENALISED]],
+    )
     return 0
 
 

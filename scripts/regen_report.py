@@ -25,11 +25,12 @@ load_dotenv()
 
 from pathlib import Path
 
+from sequoia_x.analysis.scorer import ScoreDetail, score_from_settings
 from sequoia_x.core.config import Settings
 from sequoia_x.data import stock_meta
 from sequoia_x.data.engine import DataEngine
 from sequoia_x.data.universe_filter import UniverseFilter
-from sequoia_x.notify.html_report import HtmlReportGenerator
+from sequoia_x.notify.html_report import HtmlReportGenerator, build_symbol_marks
 
 
 def _find_candidates() -> Path:
@@ -93,13 +94,34 @@ for code in union:
     print(f"  {code}  {name:<10}{industry}")
 
 metrics = universe.fetch_metrics(union) if union else {}
+holdings = universe.cached_holder_ratios()
+
+# 离线重算出来的报告必须与 `main.py` 的**同构** —— 少了评分，会让人误以为
+# 「今天没评分」。评分只读本地库（零网络），且复用精筛刚拉取的 PE / 筹码，
+# 边际成本几乎为零；配置怎么读统一走 score_from_settings（与 main.py 同一份实现）。
+ranking: list[ScoreDetail] = []
+if union and settings.score_enabled:
+    try:
+        ranking = score_from_settings(
+            union,
+            settings=settings,
+            metrics=metrics,
+            holdings=holdings,
+            tags=build_symbol_marks(results),
+        )
+    except Exception as exc:
+        print(f"量化评分失败（本次报告不含评分）：{exc}")
+if ranking:
+    print(f"量化评分：{len(ranking)} 只，最高 {ranking[0].score:.1f}（{ranking[0].symbol}）")
+
 path = HtmlReportGenerator(settings).generate(
     results,
     filter_desc=universe.describe(),
     output_path=OUT,
     metrics=metrics,
     # 与 main.py 保持一致：仅在配置了筹码维度时展示该列，复用已加载的快照
-    holdings=universe.cached_holder_ratios(),
+    holdings=holdings,
+    scores=ranking,
 )
 print()
 print(f"候选快照：{SRC}")

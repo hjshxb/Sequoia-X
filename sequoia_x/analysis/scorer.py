@@ -39,6 +39,7 @@ import sys
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 
+from sequoia_x.core.config import Settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data.universe_filter import StockMetric
 
@@ -486,3 +487,90 @@ def score_pool(
             logger.info(f"评分增强：已对前 {top} 名补充形态/回撤，成功 {enhanced} 只")
 
     return details
+
+
+# ── 结构归纳 ──
+
+# `summarize()` 的分组名。刻意用固定字面量而不是「距高<5%」这类带阈值的字符串：
+# 阈值将来要调，键名不该跟着变（调用方与测试都按这些键取值）。
+SHAPE_NEAR_HIGH = "接近新高"
+SHAPE_DEEP_PULLBACK = "深度回撤"
+SHAPE_VOLUME_RALLY = "放量上涨"
+SHAPE_OVEREXTENDED = "重度追高"
+SHAPE_PENALISED = "被扣分"
+
+_NEAR_HIGH_MIN = 0.95
+_PULLBACK_MAX = 0.90
+_VOLUME_RALLY_MIN = 1.3
+_OVEREXTENDED_MIN = 40.0
+
+
+def summarize(details: Iterable[ScoreDetail]) -> dict[str, list[ScoreDetail]]:
+    """按「形态」把评分结果分组，回答「这批票是同一类机会还是混着两类」。
+
+    为什么值得单独一个函数：候选池经常出现**双峰** —— 一头是「接近新高」的突破型，
+    另一头是「深度回撤」的超跌反弹型，两者性质完全不同，混在一张排行榜里看会误判。
+    报告与飞书给的是逐只明细（排行/分数），这里是**结构性判断**，互补而非重复。
+
+    只返回明细、不返回名称：分析层不该知道股票名称从哪来（与策略标记同一原则）。
+
+    Returns:
+        {分组名: [ScoreDetail, ...]}，缺失数据的股票**不计入任何分组**（不猜）。
+    """
+    items = list(details)
+    return {
+        SHAPE_NEAR_HIGH: [
+            d for d in items if d.near_high is not None and d.near_high >= _NEAR_HIGH_MIN
+        ],
+        SHAPE_DEEP_PULLBACK: [
+            d for d in items if d.near_high is not None and d.near_high < _PULLBACK_MAX
+        ],
+        SHAPE_VOLUME_RALLY: [
+            d for d in items if (d.chg1 or 0) > 0 and (d.vol_ratio or 0) >= _VOLUME_RALLY_MIN
+        ],
+        SHAPE_OVEREXTENDED: [
+            d for d in items if d.dev_ma20 is not None and d.dev_ma20 > _OVEREXTENDED_MIN
+        ],
+        SHAPE_PENALISED: [d for d in items if d.penalty > 0],
+    }
+
+
+# ── 配置驱动的入口（每日流程与离线重算共用）──
+
+
+def score_from_settings(
+    symbols: Iterable[str],
+    *,
+    settings: Settings,
+    metrics: Mapping[str, StockMetric] | None = None,
+    holdings: Mapping[str, float] | None = None,
+    tags: Mapping[str, str] | None = None,
+) -> list[ScoreDetail]:
+    """按配置开关打分，`main.py`（每日）与 `scripts/regen_report.py`（离线重算）共用。
+
+    把「配置怎么读」收敛到一处。开关组合与那条容易忘的约定（**展示范围必须等于
+    增强范围**，否则报告里排到后面几名的「胜率/回撤」列会是空的）散落在两个入口里，
+    迟早会各改各的而漂移。
+
+    不抛异常、不记日志 —— 调用方决定「评分失败要不要影响主流程」。
+    评分关闭或无候选时返回空列表，语义等同于「本次没有评分」。
+    """
+    if not settings.score_enabled:
+        return []
+    wanted = list(symbols)
+    if not wanted:
+        return []
+
+    limit = settings.score_top_n or len(wanted)
+    ranking = score_pool(
+        wanted,
+        db_path=settings.db_path,
+        metrics=metrics,
+        holdings=holdings,
+        tags=tags,
+        enhance_top=limit if settings.score_enhance else 0,
+        skill_path=settings.quant_skill_path if settings.score_enhance else "",
+    )
+    # 0 = 不限制（展示与增强都全量）；非零才截断
+    return ranking[: settings.score_top_n] if settings.score_top_n else ranking
+

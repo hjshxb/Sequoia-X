@@ -17,7 +17,17 @@ from datetime import date, timedelta
 import pytest
 
 from sequoia_x.analysis import scorer
+from sequoia_x.analysis.scorer import (
+    SHAPE_DEEP_PULLBACK,
+    SHAPE_NEAR_HIGH,
+    SHAPE_OVEREXTENDED,
+    SHAPE_PENALISED,
+    SHAPE_VOLUME_RALLY,
+    summarize,
+)
+from sequoia_x.core.config import Settings
 from sequoia_x.data.universe_filter import StockMetric
+from tests._score_factory import make_score
 
 _CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS stock_daily (
@@ -544,3 +554,123 @@ def test_annual_vol_is_positive_for_noisy_series():
     closes[55] = closes[54] * 1.1
     vol = scorer._annual_vol(closes)
     assert vol is not None and vol > 0
+
+
+# ── 结构归纳（summarize）──
+
+
+def test_summarize_groups_by_shape():
+    details = [
+        make_score("A", near_high=0.99, chg1=2.0, vol_ratio=1.5),
+        make_score("B", near_high=0.50),
+        make_score("C", dev_ma20=45.0, near_high=0.85, penalty=10.0),
+    ]
+    groups = summarize(details)
+    assert [d.symbol for d in groups[SHAPE_NEAR_HIGH]] == ["A"]
+    assert [d.symbol for d in groups[SHAPE_DEEP_PULLBACK]] == ["B", "C"]
+    assert [d.symbol for d in groups[SHAPE_VOLUME_RALLY]] == ["A"]
+    assert [d.symbol for d in groups[SHAPE_OVEREXTENDED]] == ["C"]
+    assert [d.symbol for d in groups[SHAPE_PENALISED]] == ["C"]
+
+
+def test_summarize_skips_missing_data_instead_of_guessing():
+    """缺数据的股票不能靠「默认值」掉进某个分组 —— 那会造出假信号。"""
+    details = [make_score("A", near_high=None, chg1=None, vol_ratio=None, dev_ma20=None)]
+    groups = summarize(details)
+    for key in (SHAPE_NEAR_HIGH, SHAPE_DEEP_PULLBACK, SHAPE_VOLUME_RALLY, SHAPE_OVEREXTENDED):
+        assert groups[key] == []
+
+
+def test_summarize_returns_same_objects():
+    detail = make_score("A", near_high=0.99)
+    assert summarize([detail])[SHAPE_NEAR_HIGH][0] is detail
+
+
+def test_summarize_empty():
+    assert all(group == [] for group in summarize([]).values())
+
+
+# ── 配置驱动入口（score_from_settings）──
+
+
+def _settings(**overrides) -> Settings:
+    """构造隔离的 Settings：不读仓库 .env，避免真实配置渗入断言。"""
+    base = {"db_path": "data/test.db", "_env_file": None}
+    base.update(overrides)
+    return Settings(**base)
+
+
+def _unexpected(*_args, **_kwargs):
+    """替换 score_pool：一旦被调用就说明开关判断漏了。"""
+    raise AssertionError("该场景不该调用 score_pool")
+
+
+def test_score_from_settings_disabled_returns_empty(monkeypatch):
+    monkeypatch.setattr(scorer, "score_pool", _unexpected)
+    assert scorer.score_from_settings(["AAA"], settings=_settings(score_enabled=False)) == []
+
+
+def test_score_from_settings_empty_symbols_skips_pool(monkeypatch):
+    monkeypatch.setattr(scorer, "score_pool", _unexpected)
+    assert scorer.score_from_settings([], settings=_settings()) == []
+
+
+def test_score_from_settings_passes_switches(db, monkeypatch):
+    """配置 -> score_pool 参数的映射（展示范围必须等于增强范围）。"""
+    captured: dict = {}
+
+    def fake_pool(symbols, **kwargs):
+        captured["symbols"] = list(symbols)
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(scorer, "score_pool", fake_pool)
+    scorer.score_from_settings(
+        ["AAA", "BBB"],
+        settings=_settings(db_path=db, quant_skill_path="/skill"),
+        metrics={"AAA": StockMetric(symbol="AAA", pe_ttm=20.0)},
+        holdings={"AAA": 70.0},
+        tags={"AAA": "T"},
+    )
+    assert captured["symbols"] == ["AAA", "BBB"]
+    assert captured["db_path"] == db
+    assert captured["enhance_top"] == 2  # 未设 SCORE_TOP_N -> 与展示范围一致
+    assert captured["skill_path"] == "/skill"
+    assert captured["metrics"]["AAA"].pe_ttm == 20.0
+    assert captured["holdings"] == {"AAA": 70.0}
+    assert captured["tags"] == {"AAA": "T"}
+
+
+def test_score_from_settings_enhance_off_clears_skill_path(db, monkeypatch):
+    captured: dict = {}
+    monkeypatch.setattr(
+        scorer, "score_pool", lambda symbols, **kw: captured.update(kw) or []
+    )
+    scorer.score_from_settings(
+        ["AAA"], settings=_settings(db_path=db, score_enhance=False, quant_skill_path="/skill")
+    )
+    assert captured["enhance_top"] == 0
+    assert captured["skill_path"] == ""  # 关闭增强就不该再去加载外部工具
+
+
+def test_score_from_settings_top_n_truncates(db, monkeypatch):
+    details = [make_score(f"{i:06d}", 90.0 - i) for i in range(5)]
+    monkeypatch.setattr(scorer, "score_pool", lambda symbols, **kw: details)
+    got = scorer.score_from_settings(["AAA"], settings=_settings(db_path=db, score_top_n=2))
+    assert [d.symbol for d in got] == ["000000", "000001"]
+
+
+def test_score_from_settings_top_n_zero_keeps_all(db, monkeypatch):
+    details = [make_score(f"{i:06d}", 90.0 - i) for i in range(5)]
+    monkeypatch.setattr(scorer, "score_pool", lambda symbols, **kw: details)
+    got = scorer.score_from_settings(["AAA"], settings=_settings(db_path=db, score_top_n=0))
+    assert len(got) == 5
+
+
+def test_score_from_settings_against_real_db(db):
+    """不打桩跑一遍：真实库 + 真实开关组合，确认返回的是排好序的明细。"""
+    got = scorer.score_from_settings(
+        ["AAA", "BBB"], settings=_settings(db_path=db, score_enhance=False)
+    )
+    assert [d.symbol for d in got] == ["AAA", "BBB"]
+    assert all(d.adjusted > 0 for d in got)
