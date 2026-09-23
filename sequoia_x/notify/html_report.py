@@ -169,6 +169,18 @@ def _fmt_pct(value: float | None, digits: int = 2, signed: bool = False) -> str:
     return f"{value:+.{digits}f}%" if signed else f"{value:.{digits}f}%"
 
 
+def _fmt_int(value: float | int | None) -> str:
+    """整数格式化（样本数、可信度这种没有小数的量）；缺失显示为「—」。"""
+    if value is None:
+        return "—"
+    try:
+        if not math.isfinite(float(value)):
+            return "—"
+    except (TypeError, ValueError):
+        return "—"
+    return f"{round(float(value)):d}"
+
+
 class HtmlReportGenerator:
     """把各策略选股结果渲染成本地单文件 HTML 报告。"""
 
@@ -551,7 +563,7 @@ class HtmlReportGenerator:
         head = (
             "<th>#</th><th>代码</th><th>名称</th><th>板块</th><th>评分</th><th>标记</th>"
             "<th>当日</th><th>20日</th><th>量比</th><th>距高</th><th>MA20偏离</th>"
-            "<th>波动</th><th>胜率</th><th>回撤</th>"
+            "<th>波动</th><th>胜率</th><th>样本</th><th>置信</th><th>回撤</th>"
         )
         body: list[str] = []
         for i, detail in enumerate(scores, 1):
@@ -565,6 +577,12 @@ class HtmlReportGenerator:
                 tips.append(f"惩罚 -{detail.penalty:.0f}")
             if detail.prob_up is not None:
                 tips.append(f"形态胜率 {detail.prob_up:.0f}%")
+            # 胜率必须带上样本数才可解读：`prob_up` 是 k/n 的离散值，
+            # 「100%」在 n=3 和 n=8 时含义天差地别。
+            if detail.prob_samples is not None:
+                tips.append(f"样本 {detail.prob_samples}")
+            if detail.prob_confidence is not None:
+                tips.append(f"匹配可信度 {detail.prob_confidence:.0f}")
             if detail.max_drawdown is not None:
                 tips.append(f"最大回撤 {detail.max_drawdown:.1f}%")
 
@@ -585,6 +603,8 @@ class HtmlReportGenerator:
                 f'<td class="num">{_fmt_pct(detail.dev_ma20)}</td>'
                 f'<td class="num">{_fmt_pct(detail.vol20, digits=1)}</td>'
                 f'<td class="num">{_fmt_pct(detail.prob_up, digits=1)}</td>'
+                f'<td class="num">{_fmt_int(detail.prob_samples)}</td>'
+                f'<td class="num">{_fmt_int(detail.prob_confidence)}</td>'
                 f'<td class="num">{_fmt_pct(detail.max_drawdown, digits=1)}</td>'
                 "</tr>"
             )

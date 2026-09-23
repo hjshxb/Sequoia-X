@@ -537,6 +537,35 @@ def test_ranking_card_explains_score_on_hover(gen):
     assert "66.7%" in text and "18.4%" in text
 
 
+def test_ranking_card_shows_sample_count_and_confidence(gen):
+    """胜率必须带样本数才可解读：悬停给「样本 7」「匹配可信度 55」，表格也各占一列。
+
+    `prob_up` 是 k/n 除出来的离散值，实测 n 只有个位数 —— 只写「57%」
+    看不出它是「7 次里涨了 4 次」还是「1 次里恰好蒙对」。
+    """
+    scores = [
+        make_score("600000", 72.5, prob_up=57.0, prob_samples=7, prob_confidence=55.0)
+    ]
+    text = gen.generate({"TurtleTradeStrategy": ["600000"]}, scores=scores).read_text(
+        encoding="utf-8"
+    )
+
+    assert "<th>样本</th>" in text and "<th>置信</th>" in text
+    assert "样本 7" in text and "匹配可信度 55" in text
+    assert '<td class="num">7</td>' in text and '<td class="num">55</td>' in text  # 表格单元格
+
+
+def test_ranking_card_omits_sample_hints_without_enhancement(gen):
+    """没跑增强层（或旧口径数据）时不给样本/置信提示，不留空标签。"""
+    scores = [make_score("600000", 72.5, prob_up=66.7)]
+    text = gen.generate({"TurtleTradeStrategy": ["600000"]}, scores=scores).read_text(
+        encoding="utf-8"
+    )
+
+    assert "形态胜率 67%" in text  # 原有的胜率提示照旧
+    assert "样本 " not in text.lower() and "匹配可信度" not in text
+
+
 def test_ranking_card_shows_marks_and_placeholder_for_missing_meta(gen):
     scores = [make_score("600601", 55.0, tags="T")]  # 600601 不在桩 meta 里
     text = gen.generate({"TurtleTradeStrategy": ["600601"]}, scores=scores).read_text(

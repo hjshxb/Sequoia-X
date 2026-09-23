@@ -40,15 +40,28 @@ _MAX_FILTER_CHARS = 120
 # 完整排行放在本地 HTML 报告里（那张表可横向滚动、可搜索）。
 _TOP_RANKING = 5
 
-# 「形态胜率榜」同样只放前 N 名。它与评分榜是**两个不同视角**，故各占一个小节：
-# 评分来自量价五维（综合质地），胜率来自形态匹配（历史上长这样的票之后 5 日涨的比例）。
-# 两者名单经常不一致 —— 这正是要分开列的原因，而不是取交集或合并排序。
-_TOP_WINRATE = 5
+# 「形态匹配榜」同样只放前 N 名。它与评分榜是**两个不同视角**，故各占一个小节：
+# 评分来自量价五维（当下格局与位置风险），形态匹配来自历史相似窗口的后续走势。
+# 两者名单经常不一致，甚至方向相反（见 _pattern_match_section 的说明）。
+_TOP_PATTERN = 5
 
 
 def _elide(text: str, limit: int = _MAX_FILTER_CHARS) -> str:
     """超长文本截断并加省略号；未超长时原样返回。"""
     return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _winrate_text(detail: ScoreDetail) -> str:
+    """胜率的展示文本：有样本数时写成 `k/n`，否则退回百分比。
+
+    `prob_up` 是 k/n 除出来的离散值（实测 n 只有 1~7），单看「100%」
+    会误以为样本充足 —— 它可能只是「1 次里涨了 1 次」。带上 n 才能区分
+    「2/2」和「7/7」。样本数缺失（旧报告 / 增强层未启用）时保持百分比写法。
+    """
+    up = detail.prob_up or 0.0
+    if detail.prob_samples:
+        return f"{round(up / 100 * detail.prob_samples)}/{detail.prob_samples}"
+    return f"{up:.0f}%"
 
 
 class FeishuNotifier:
@@ -119,36 +132,47 @@ class FeishuNotifier:
         return "\n".join(lines)
 
     @classmethod
-    def _winrate_section(cls, scores: Sequence[ScoreDetail], meta: dict[str, StockMeta]) -> str:
-        """渲染「形态胜率 Top 5」小节：按 `prob_up` 降序，只列真的有胜率的票。
+    def _pattern_match_section(
+        cls, scores: Sequence[ScoreDetail], meta: dict[str, StockMeta]
+    ) -> str:
+        """渲染「形态匹配 Top 5」小节：按**匹配可信度**降序。
 
-        与高分榜是两个视角，不合并：评分答「综合质地排第几」，胜率答
-        「历史上相似形态之后 5 日上涨的比例有多高」。同一只票在两张榜上
-        的名次经常不同，两张都看比取交集更有信息量。
+        为什么不按胜率排：`prob_up` 是 k/n 的离散值，而实测 n 只有 1~7
+        （2026-09-24 实测 36 只：最小 1、最大 7），并列扎堆，而且
+        **样本越少越容易拿满分**（那年 4 只 100% 里就有一只 n=1），
+        纯按胜率排等于反向挑「历史样本最少的票」。`confidence` 由相似度与
+        样本量共同决定，排序更稳；胜率改写为 `k/n` 与样本数一起展示，
+        让人自己判断这条胜率值不值得信。
+
+        与评分榜是两个视角，不合并：实测同一批票里评分前 5 的胜率是
+        0/33/60/67/67，而胜率 100% 的四只评分只有 67/61/56/45 —— 错开甚至
+        反向是常态，因为评分看「当下格局」，形态匹配看「历史上这种形态
+        之后涨过几次」。评分最高那只（国恩股份 86 分）甚至只有 1 个样本、
+        那次还是跌的，所以显示 0%。
 
         胜率来自外部量化工具的增强层，**可能整批都缺**（未启用增强 /
         历史数据不足 / 计算失败）。此时返回空串，调用方跳过该小节 ——
         不显示空标题，也不拿 0 分去凑满 5 行。
 
-        并列时依次按评分、代码排序，保证同样的输入恒定产出同样的卡片
-        （`scores` 已按评分降序传入，故并列时天然按评分优先）。
+        排序键依次为 可信度、胜率、评分、代码：缺可信度（None）的票排最后，
+        但仍会出现在榜上，不至于因为缺一个字段就整只消失。
         """
         ranked = sorted(
             (d for d in scores if d.prob_up is not None),
-            key=lambda d: (-d.prob_up, -d.adjusted, d.symbol),
+            key=lambda d: (-(d.prob_confidence or 0.0), -d.prob_up, -d.adjusted, d.symbol),
         )
         if not ranked:
             return ""
 
-        lines = [f"**📈 形态胜率 Top {min(_TOP_WINRATE, len(ranked))}**（相似形态后 5 日上涨比例）"]
-        for i, detail in enumerate(ranked[:_TOP_WINRATE], 1):
+        lines = [f"**📈 形态匹配 Top {min(_TOP_PATTERN, len(ranked))}**（按匹配可信度降序）"]
+        for i, detail in enumerate(ranked[:_TOP_PATTERN], 1):
             item = meta.get(detail.symbol)
             name = (item.name if item else None) or ""
             label = f"{detail.symbol} {name}".strip()
             link = f"[{label}](https://xueqiu.com/S/{to_xueqiu_code(detail.symbol)})"
             mark = f" `{detail.tags}`" if detail.tags else ""
             lines.append(
-                f"**{i}.** {link} · **胜率 {detail.prob_up:.0f}%**"
+                f"**{i}.** {link} · **胜率 {_winrate_text(detail)}**"
                 f" · 评分 {detail.score:.1f}{mark}"
             )
         return "\n".join(lines)
@@ -165,7 +189,7 @@ class FeishuNotifier:
             results: 各策略的选股结果，顺序即卡片中小节的顺序。
             filter_desc: 精筛条件描述，展示在卡片顶部便于解释结果为何偏少。
             scores: 可选的量化评分（应按得分降序）。传入后卡片顶部多两个小节
-                ——「🎯 量化评分 Top 5」与「📈 形态胜率 Top 5」（后者在整批都
+                ——「🎯 量化评分 Top 5」与「📈 形态匹配 Top 5」（后者在整批都
                 没有胜率时自动省略），且各策略小节**内部**改按评分降序排列。
 
         Returns:
@@ -193,10 +217,11 @@ class FeishuNotifier:
 
         if score_list:
             add_markdown(self._ranking_section(score_list, meta))
-            # 胜率榜紧跟评分榜，但整批缺胜率时不出空标题（见 _winrate_section）
-            winrate = self._winrate_section(score_list, meta)
-            if winrate:
-                add_markdown(winrate)
+            # 形态匹配榜紧跟评分榜，但整批缺胜率时不出空标题
+            # （见 _pattern_match_section）
+            pattern = self._pattern_match_section(score_list, meta)
+            if pattern:
+                add_markdown(pattern)
 
         for strategy_name, symbols in results.items():
             if symbols:

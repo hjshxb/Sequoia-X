@@ -101,6 +101,11 @@ class ScoreDetail:
     prob_up: float | None = None  # 形态匹配胜率 %
     expected_pct: float | None = None  # 形态匹配预期涨跌幅 %
     max_drawdown: float | None = None  # 区间最大回撤 %
+    # 下面是胜率的两个「可信度陪衬」字段，缺了它们胜率就没法解读：
+    # `prob_up` 是 k/n 的离散值，实测 n 常只有 3~8（例如「100%」= 3 次里涨了 3 次）。
+    # 只给百分比时无法区分 3/3 与 5/5，也没法把「样本太少」的票排到后面。
+    prob_samples: int | None = None  # 形态匹配的样本数（n_matches）
+    prob_confidence: float | None = None  # 形态匹配可信度 0~100（相似度+样本量）
 
     @property
     def score(self) -> float:
@@ -378,9 +383,10 @@ def load_quant_skill(skill_path: str):
 
 
 def _enhance(detail: ScoreDetail, closes: list[float], funcs) -> ScoreDetail:
-    """给单只股票补充形态胜率与最大回撤；任一步失败则保持原值。"""
+    """给单只股票补充形态胜率、可信度、样本数与最大回撤；任一步失败则保持原值。"""
     quick_pattern_forecast, drawdown_report = funcs
     prob_up = expected = max_dd = None
+    samples = confidence = None
 
     try:
         fc = quick_pattern_forecast(closes, horizon=5)
@@ -392,6 +398,12 @@ def _enhance(detail: ScoreDetail, closes: list[float], funcs) -> ScoreDetail:
             # 真实值 0.5（即 0.5%）会被误放大成 50%。
             if raw is not None and fc.get("data_mode") in (None, "ok"):
                 prob_up = float(raw)
+                # 样本数与可信度和 prob_up 同源，必须一起取、一起受 data_mode 约束，
+                # 否则会出现「胜率是真实值、样本数是降级值」的错配。
+                n = fc.get("n_matches")
+                samples = int(n) if n is not None else None
+                conf = fc.get("confidence")
+                confidence = float(conf) if conf is not None else None
             exp = fc.get("predicted_pct")
             expected = float(exp) if exp is not None else None
     except Exception as exc:
@@ -406,7 +418,14 @@ def _enhance(detail: ScoreDetail, closes: list[float], funcs) -> ScoreDetail:
 
     if prob_up is None and max_dd is None:
         return detail
-    return replace(detail, prob_up=prob_up, expected_pct=expected, max_drawdown=max_dd)
+    return replace(
+        detail,
+        prob_up=prob_up,
+        expected_pct=expected,
+        max_drawdown=max_dd,
+        prob_samples=samples,
+        prob_confidence=confidence,
+    )
 
 
 # ── 对外主入口 ──

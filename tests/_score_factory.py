@@ -26,6 +26,8 @@ def make_score(
     tags: str = "",
     penalty: float = 0.0,
     prob_up: float | None = None,
+    prob_samples: int | None = None,
+    prob_confidence: float | None = None,
     max_drawdown: float | None = None,
     **overrides,
 ) -> ScoreDetail:
@@ -37,6 +39,9 @@ def make_score(
         tags: 命中的策略字母标记。
         penalty: 位置惩罚分（>0 时报告的悬停提示里应出现「惩罚」）。
         prob_up: 形态匹配胜率（%，0~100 口径）。
+        prob_samples: 形态匹配的样本数（`prob_up` 的分母）。缺省 `None`
+            表示不还原样本数，展示层会退回百分比写法。
+        prob_confidence: 形态匹配可信度（0~100），飞书卡片按它降序排。
         max_drawdown: 最大回撤（%）。
         **overrides: 覆盖任意默认量价特征，如 `chg1=2.35`。
     """
@@ -61,6 +66,8 @@ def make_score(
         "penalty": penalty,
         "adjusted": adjusted,
         "prob_up": prob_up,
+        "prob_samples": prob_samples,
+        "prob_confidence": prob_confidence,
         "expected_pct": None,
         "max_drawdown": max_drawdown,
     }
