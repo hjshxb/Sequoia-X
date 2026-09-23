@@ -1,17 +1,29 @@
 # 行尾符规则
 #
-# 为什么必须显式写死：本机 core.autocrlf=true，checkout 时会把仓库里的 LF
+# 为什么必须显式写死：本机的 **core.autocrlf=true 来自 Windows 侧 Git 的系统级配置**
+# （`git config --system --get core.autocrlf` → true；WSL 内的 git 没有这个设置）。
+# 所以只要某次 git 操作走的是 Windows 侧那个 git（不显式经 wsl.exe 时就是它），
+# checkout / reset --hard / stash 这类会回写工作区的命令，就会把仓库里的 LF
 # 重新写成 CRLF 落到工作区。Python 不在乎，但 **bash 在乎** ——
 # 带 CRLF 的脚本一执行就报 `$'\r': command not found` / `syntax error near
 # unexpected token`，`scripts/daily_run.sh`（定时任务入口）会直接失败。
 #
 # 更坑的是：git 里**看不出任何差异** —— blob 本来就是 LF，`git add` 时
 # 又被规范化回 LF，所以 `git status` 干净、`git diff` 为空，而脚本已经跑不了了。
-# 2026-09-24 就这么被坑过一次（一次 `git checkout` 恢复把 scripts/ 下
-# 5 个 .sh 全变成 CRLF，全仓无 diff 但定时任务会失败）。
+# 2026-09-24 被坑过两次：
+#   ① 一次 `git checkout` 恢复把 scripts/ 下 5 个 .sh 全变成 CRLF，全仓无 diff
+#      但定时任务会失败；
+#   ② 之后又发现 7 个 .py 也被悄悄转成 CRLF，`git diff --numstat` 显示
+#      「75 行改 / 75 行删」这种整文件假 diff，正是行尾符被整体替换的特征。
+#
+# 自查 / 修复（三条命令足够）：
+#   file scripts/*.sh                      # 出现 "with CRLF line terminators" 就是中招
+#   git diff --ignore-cr-at-eol --numstat  # 无输出 ⇒ 剩余差异全是行尾符，不是真改动
+#   git -c core.autocrlf=false checkout HEAD -- scripts/   # 按 LF 还原工作区
 #
 # 只锚定 .sh：Python 文件在 HEAD 里本来就混着 CRLF，强行统一会产生
-# 24 个大文件的整体 diff，收益为零。
+# 一批大文件的整体 diff，收益为零。代价是 `*.py` 没有 eol 属性，
+# Windows 侧 git 仍可能把 .py 的工作区文件转成 CRLF，需要时用上面第 3 条还原。
 *.sh text eol=lf
 # 这行让规则文件自己也不被转成 CRLF（属性文件若带 CR，个别 git 版本解析会出偏差）
 /.gitattributes text eol=lf
