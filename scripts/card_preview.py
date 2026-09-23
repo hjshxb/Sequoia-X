@@ -6,7 +6,9 @@
 `FeishuNotifier.send_report()` 的参数保持一致（含 `scores=`），
 否则预览出来的卡片会比真实推送少小节，看起来"格式变了"。
 2026-09-24 修过一次：原先没传 `scores`，导致预览里看不到「量化评分 Top 5」，
-板块内部的排序也和真实卡片不同。
+板块内部的排序也和真实卡片不同。同一处后来又补过一刀：卡片新增
+「📈 形态胜率 Top 5」后，`prob_up` 也得从排行表的「胜率」列还原出来，
+否则预览仍然会少一节。
 """
 
 import json
@@ -71,15 +73,41 @@ rank_re = re.compile(
     r'<td class="name">([^<]*)</td>\s*'
     r'<td class="board">[^<]*</td>\s*'
     r'<td class="num score"[^>]*>([\d.]+)</td>\s*'
-    r'<td class="marks">([^<]*)</td>'
+    r'<td class="marks">([^<]*)</td>\s*'
+    r"(.*?)</tr>"
 )
 
+_CELL_RE = re.compile(r'<td class="num">([^<]*)</td>')
 
-def _placeholder(symbol: str, score: float, tags: str) -> ScoreDetail:
-    """用报告里读得到的三个字段构造 ScoreDetail，其余填占位值。
+# 排行表「标记」列之后的列顺序（见 html_report._render_ranking）：
+# 当日 / 20日 / 量比 / 距高 / MA20偏离 / 波动 / **胜率** / 回撤
+# 卡片新加的「形态胜率 Top 5」要用到 prob_up，必须从这一列还原，
+# 否则预览又会比真实推送少一节（2026-09-24 第二次踩同类问题）。
+_WINRATE_IDX = 6
 
-    卡片渲染只用到 `symbol` / `score` / `tags`（见 `feishu._ranking_section`
-    与 `group_by_board(order=…)`），其余量价字段在卡片里不出现，故无需还原。
+
+def _prob_up_from_tail(tail: str) -> float | None:
+    """从排行表行尾的 `<td class="num">` 里取胜率；缺失或「—」返回 None。"""
+    cells = _CELL_RE.findall(tail)
+    if len(cells) <= _WINRATE_IDX:
+        return None
+    raw = cells[_WINRATE_IDX].strip().removesuffix("%")
+    if not raw or raw == "—":
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _placeholder(
+    symbol: str, score: float, tags: str, prob_up: float | None = None
+) -> ScoreDetail:
+    """用报告里读得到的字段构造 ScoreDetail，其余填占位值。
+
+    卡片渲染只用到 `symbol` / `score` / `tags` / `prob_up`
+    （见 `feishu._ranking_section` 与 `feishu._winrate_section`），
+    其余量价字段在卡片里不出现，故无需还原。
     """
     return ScoreDetail(
         symbol=symbol,
@@ -98,6 +126,7 @@ def _placeholder(symbol: str, score: float, tags: str) -> ScoreDetail:
         new_high60=False,
         new_high120=False,
         adjusted=score,
+        prob_up=prob_up,
     )
 
 
@@ -105,11 +134,19 @@ scores: list[ScoreDetail] = []
 ranking_chunks = html.split('<section class="card ranking"')[1:]
 if ranking_chunks:
     for hit in rank_re.finditer(ranking_chunks[0]):
-        symbol, name, score, marks = hit.groups()
+        symbol, name, score, marks, tail = hit.groups()
         if name and name != "—":
             names.setdefault(symbol, name)
-        scores.append(_placeholder(symbol, float(score), "" if marks == "—" else marks))
-print(f"# 评分排行还原：{len(scores)} 只（报告里没有排行表时为 0，卡片会少一节）")
+        scores.append(
+            _placeholder(
+                symbol,
+                float(score),
+                "" if marks == "—" else marks,
+                _prob_up_from_tail(tail),
+            )
+        )
+with_winrate = sum(1 for d in scores if d.prob_up is not None)
+print(f"# 评分排行还原：{len(scores)} 只，其中带胜率 {with_winrate} 只（0 只时卡片不含胜率小节）")
 
 # 屏蔽 baostock：名称直接用报告里已有的，保证离线且与报告一致
 meta = {c: StockMeta(c, n, None) for c, n in names.items()}

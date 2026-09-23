@@ -40,6 +40,11 @@ _MAX_FILTER_CHARS = 120
 # 完整排行放在本地 HTML 报告里（那张表可横向滚动、可搜索）。
 _TOP_RANKING = 5
 
+# 「形态胜率榜」同样只放前 N 名。它与评分榜是**两个不同视角**，故各占一个小节：
+# 评分来自量价五维（综合质地），胜率来自形态匹配（历史上长这样的票之后 5 日涨的比例）。
+# 两者名单经常不一致 —— 这正是要分开列的原因，而不是取交集或合并排序。
+_TOP_WINRATE = 5
+
 
 def _elide(text: str, limit: int = _MAX_FILTER_CHARS) -> str:
     """超长文本截断并加省略号；未超长时原样返回。"""
@@ -113,6 +118,41 @@ class FeishuNotifier:
             lines.append(f"**{i}.** {link} · **{detail.score:.1f}**{mark}")
         return "\n".join(lines)
 
+    @classmethod
+    def _winrate_section(cls, scores: Sequence[ScoreDetail], meta: dict[str, StockMeta]) -> str:
+        """渲染「形态胜率 Top 5」小节：按 `prob_up` 降序，只列真的有胜率的票。
+
+        与高分榜是两个视角，不合并：评分答「综合质地排第几」，胜率答
+        「历史上相似形态之后 5 日上涨的比例有多高」。同一只票在两张榜上
+        的名次经常不同，两张都看比取交集更有信息量。
+
+        胜率来自外部量化工具的增强层，**可能整批都缺**（未启用增强 /
+        历史数据不足 / 计算失败）。此时返回空串，调用方跳过该小节 ——
+        不显示空标题，也不拿 0 分去凑满 5 行。
+
+        并列时依次按评分、代码排序，保证同样的输入恒定产出同样的卡片
+        （`scores` 已按评分降序传入，故并列时天然按评分优先）。
+        """
+        ranked = sorted(
+            (d for d in scores if d.prob_up is not None),
+            key=lambda d: (-d.prob_up, -d.adjusted, d.symbol),
+        )
+        if not ranked:
+            return ""
+
+        lines = [f"**📈 形态胜率 Top {min(_TOP_WINRATE, len(ranked))}**（相似形态后 5 日上涨比例）"]
+        for i, detail in enumerate(ranked[:_TOP_WINRATE], 1):
+            item = meta.get(detail.symbol)
+            name = (item.name if item else None) or ""
+            label = f"{detail.symbol} {name}".strip()
+            link = f"[{label}](https://xueqiu.com/S/{to_xueqiu_code(detail.symbol)})"
+            mark = f" `{detail.tags}`" if detail.tags else ""
+            lines.append(
+                f"**{i}.** {link} · **胜率 {detail.prob_up:.0f}%**"
+                f" · 评分 {detail.score:.1f}{mark}"
+            )
+        return "\n".join(lines)
+
     def _build_report_card(
         self,
         results: dict[str, list[str]],
@@ -124,8 +164,9 @@ class FeishuNotifier:
         Args:
             results: 各策略的选股结果，顺序即卡片中小节的顺序。
             filter_desc: 精筛条件描述，展示在卡片顶部便于解释结果为何偏少。
-            scores: 可选的量化评分（应按得分降序）。传入后卡片顶部多一个
-                「高分榜」小节，且各策略小节**内部**改按评分降序排列。
+            scores: 可选的量化评分（应按得分降序）。传入后卡片顶部多两个小节
+                ——「🎯 量化评分 Top 5」与「📈 形态胜率 Top 5」（后者在整批都
+                没有胜率时自动省略），且各策略小节**内部**改按评分降序排列。
 
         Returns:
             飞书 `msg_type=interactive` 的请求体。
@@ -152,6 +193,10 @@ class FeishuNotifier:
 
         if score_list:
             add_markdown(self._ranking_section(score_list, meta))
+            # 胜率榜紧跟评分榜，但整批缺胜率时不出空标题（见 _winrate_section）
+            winrate = self._winrate_section(score_list, meta)
+            if winrate:
+                add_markdown(winrate)
 
         for strategy_name, symbols in results.items():
             if symbols:

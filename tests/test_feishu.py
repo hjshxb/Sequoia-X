@@ -362,3 +362,101 @@ def test_card_ranking_handles_missing_name() -> None:
     text = card_text(posted_card(notifier, {"MaVolumeStrategy": ["999999"]}, scores=scores))
 
     assert "**1.** [999999](https://xueqiu.com/S/SZ999999) · **61.0**" in text
+
+
+# ── 形态胜率榜 ──
+
+
+def winrate_section(text: str) -> str:
+    """截出「形态胜率 Top N」小节，便于只在该节内部断言顺序。"""
+    assert "形态胜率 Top" in text, "卡片里没有胜率小节"
+    return text.split("形态胜率 Top", 1)[1]
+
+
+def test_card_without_prob_up_has_no_winrate_section() -> None:
+    """整批都没有胜率时不出现空标题（增强层未启用 / 计算失败都会是这种情况）。"""
+    notifier = FeishuNotifier(make_settings())
+    scores = [make_score("600000", 80.0), make_score("600601", 70.0)]
+    text = card_text(
+        posted_card(notifier, {"MaVolumeStrategy": ["600000", "600601"]}, scores=scores)
+    )
+
+    assert "量化评分 Top" in text  # 评分榜照常有
+    assert "形态胜率" not in text
+
+
+def test_card_shows_winrate_sorted_desc() -> None:
+    """胜率榜按 prob_up 降序，且带上评分与策略标记便于交叉比对。"""
+    notifier = FeishuNotifier(make_settings())
+    scores = [
+        make_score("600000", 90.0, prob_up=55.0, tags="T"),
+        make_score("600601", 60.0, prob_up=80.0, tags="R"),
+        make_score("300750", 70.0, prob_up=70.0),
+    ]
+    text = card_text(
+        posted_card(
+            notifier,
+            {"MaVolumeStrategy": ["600000", "600601", "300750"]},
+            scores=scores,
+        )
+    )
+
+    assert "📈 形态胜率 Top 3" in text
+    assert "**胜率 80%**" in text and "**胜率 55%**" in text
+    section = winrate_section(text)
+    assert section.index("600601") < section.index("300750") < section.index("600000")
+    assert "评分 60.0" in section  # 胜率第一但评分最低，两个视角确实不同
+    assert "`R`" in section
+
+
+def test_card_winrate_is_capped_at_top_n() -> None:
+    """胜率榜同样只放前 5 名，完整排行看本地 HTML 报告。"""
+    notifier = FeishuNotifier(make_settings())
+    symbols = [f"{i:06d}" for i in range(8)]
+    scores = [make_score(s, 90.0 - i, prob_up=90.0 - i) for i, s in enumerate(symbols)]
+    text = card_text(posted_card(notifier, {"MaVolumeStrategy": symbols}, scores=scores))
+
+    assert "📈 形态胜率 Top 5" in text
+    assert "**6.**" not in winrate_section(text)
+
+
+def test_card_winrate_skips_scores_without_prob_up() -> None:
+    """没算出胜率的票不进胜率榜 —— 不能拿 0 分凑数占位。"""
+    notifier = FeishuNotifier(make_settings())
+    scores = [
+        make_score("600000", 95.0),  # 评分最高但无胜率
+        make_score("600601", 50.0, prob_up=42.0),
+    ]
+    text = card_text(
+        posted_card(notifier, {"MaVolumeStrategy": ["600000", "600601"]}, scores=scores)
+    )
+
+    section = winrate_section(text)
+    assert "**1.**" in section and "600601" in section
+    assert "**2.**" not in section
+
+
+def test_card_winrate_tie_breaks_by_score() -> None:
+    """胜率并列时按评分降序，保证同样输入恒定产出同样卡片。"""
+    notifier = FeishuNotifier(make_settings())
+    scores = [
+        make_score("600000", 60.0, prob_up=75.0),
+        make_score("600601", 88.0, prob_up=75.0),
+    ]
+    text = card_text(
+        posted_card(notifier, {"MaVolumeStrategy": ["600000", "600601"]}, scores=scores)
+    )
+
+    section = winrate_section(text)
+    assert section.index("600601") < section.index("600000")
+
+
+def test_card_winrate_links_to_xueqiu() -> None:
+    """胜率榜里的票同样要可点跳雪球。"""
+    notifier = FeishuNotifier(make_settings())
+    scores = [make_score("300750", 70.0, prob_up=66.0)]
+    text = card_text(posted_card(notifier, {"MaVolumeStrategy": ["300750"]}, scores=scores))
+
+    section = winrate_section(text)
+    assert "https://xueqiu.com/S/SZ300750" in section
+    assert "宁德时代" in section
