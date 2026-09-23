@@ -23,6 +23,7 @@ import sequoia_x.notify.feishu as feishu_module
 from sequoia_x.core.config import Settings
 from sequoia_x.data.stock_meta import BOARD_CHINEXT, BOARD_MAIN, BOARD_STAR, StockMeta
 from sequoia_x.notify.feishu import FeishuNotifier
+from tests._score_factory import make_score
 
 # 桩数据：覆盖 主板 / 创业板 / 科创板 / 北交所，其中一只有行业、一只无行业
 _FAKE_META = {
@@ -293,3 +294,71 @@ def test_card_shows_summary_counts() -> None:
 
     assert "1 / 2" in text  # 命中 1 个策略 / 共 2 个
     assert "2" in text  # 选股总数
+
+
+# ── 量化评分高分榜 ──
+
+
+def test_card_without_scores_has_no_ranking_section() -> None:
+    notifier = FeishuNotifier(make_settings())
+    text = card_text(posted_card(notifier, {"TurtleTradeStrategy": ["600000"]}))
+
+    assert "量化评分 Top" not in text
+
+
+def test_card_shows_ranking_section_with_scores() -> None:
+    notifier = FeishuNotifier(make_settings())
+    scores = [make_score("300750", 86.0, tags="TR"), make_score("600000", 72.5)]
+    text = card_text(
+        posted_card(
+            notifier, {"TurtleTradeStrategy": ["600000", "300750"]}, scores=scores
+        )
+    )
+
+    assert "🎯 量化评分 Top 2" in text
+    assert "**1.**" in text and "**2.**" in text
+    assert "**86.0**" in text and "**72.5**" in text
+    assert "`TR`" in text  # 命中的策略标记
+    assert "xueqiu.com/S/SZ300750" in text  # 高分榜里同样是可点链接
+
+
+def test_card_ranking_is_capped_at_top_n() -> None:
+    """卡片元素数有限，高分榜只放前 N 名；完整排行在本地 HTML 报告里。"""
+    notifier = FeishuNotifier(make_settings())
+    symbols = [f"{i:06d}" for i in range(8)]
+    scores = [make_score(s, 90.0 - i) for i, s in enumerate(symbols)]
+    text = card_text(posted_card(notifier, {"MaVolumeStrategy": symbols}, scores=scores))
+
+    assert "🎯 量化评分 Top 5" in text
+    assert "**6.**" not in text
+
+
+def test_card_sorts_strategy_rows_by_score_inside_board() -> None:
+    """策略小节内部按评分降序（板块分组保留）。"""
+    notifier = FeishuNotifier(make_settings())
+    scores = [make_score("600601", 90.0), make_score("600000", 60.0)]
+    text = card_text(
+        posted_card(
+            notifier, {"TurtleTradeStrategy": ["600000", "600601"]}, scores=scores
+        )
+    )
+
+    board_line = text.split(f"{BOARD_MAIN} 2：", 1)[1]
+    assert board_line.index("600601") < board_line.index("600000")
+
+
+def test_card_keeps_code_order_without_scores() -> None:
+    notifier = FeishuNotifier(make_settings())
+    text = card_text(posted_card(notifier, {"TurtleTradeStrategy": ["600601", "600000"]}))
+
+    board_line = text.split(f"{BOARD_MAIN} 2：", 1)[1]
+    assert board_line.index("600000") < board_line.index("600601")
+
+
+def test_card_ranking_handles_missing_name() -> None:
+    """名称取不到时只显示代码，但链接与名次仍在。"""
+    notifier = FeishuNotifier(make_settings())
+    scores = [make_score("999999", 61.0)]
+    text = card_text(posted_card(notifier, {"MaVolumeStrategy": ["999999"]}, scores=scores))
+
+    assert "**1.** [999999](https://xueqiu.com/S/SZ999999) · **61.0**" in text

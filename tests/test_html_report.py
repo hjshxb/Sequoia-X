@@ -31,9 +31,11 @@ from sequoia_x.data.stock_meta import (
 from sequoia_x.data.universe_filter import StockMetric
 from sequoia_x.notify.html_report import (
     HtmlReportGenerator,
+    build_symbol_marks,
     group_by_board,
     to_xueqiu_code,
 )
+from tests._score_factory import make_score
 
 _FAKE_META = {
     "600000": StockMeta("600000", "浦发银行", "货币金融服务"),
@@ -444,3 +446,158 @@ def test_missing_holding_renders_placeholder(gen):
 
     assert "十大流通" in text
     assert "—" in text
+
+
+# ── 量化评分：策略标记 ──
+
+
+def test_build_symbol_marks_merges_and_sorts():
+    """同一只股票命中多个策略时标记合并、按字典序排列（保证与飞书一致）。"""
+    marks = build_symbol_marks(
+        {
+            "TurtleTradeStrategy": ["600000"],
+            "RpsBreakoutStrategy": ["600000", "600601"],
+            "MaVolumeStrategy": ["600601"],
+        }
+    )
+    assert marks == {"600000": "RT", "600601": "MR"}
+
+
+def test_build_symbol_marks_ignores_unknown_strategy():
+    """未收录标记的策略不应让股票凭空获得标记。"""
+    assert build_symbol_marks({"BrandNewStrategy": ["600000"]}) == {}
+
+
+def test_build_symbol_marks_empty_results():
+    assert build_symbol_marks({}) == {}
+
+
+# ── 量化评分：板块内按名次排序 ──
+
+
+def test_group_by_board_sorts_by_rank_within_board():
+    symbols = ["600601", "600000"]  # 主板，输入顺序为代码降序
+    ranked = dict(group_by_board(symbols, order={"600601": 0, "600000": 1}))
+    assert ranked[BOARD_MAIN] == ["600601", "600000"]
+    # 不传 order 时保持原有的代码升序
+    assert dict(group_by_board(symbols))[BOARD_MAIN] == ["600000", "600601"]
+
+
+def test_group_by_board_puts_unranked_last():
+    """没算出评分的股票不能被丢掉，排在所属板块末尾。"""
+    ranked = dict(group_by_board(["600000", "600601"], order={"600601": 0}))
+    assert ranked[BOARD_MAIN] == ["600601", "600000"]
+
+
+# ── 量化评分：排行卡片 ──
+
+
+def test_ranking_card_absent_without_scores(gen):
+    text = gen.generate({"TurtleTradeStrategy": ["600000"]}).read_text(encoding="utf-8")
+
+    assert "量化评分排行" not in text
+    assert '<td class="num score"' not in text
+
+
+def test_ranking_card_rendered_with_scores(gen):
+    scores = [make_score("300750", 86.0), make_score("600000", 72.5)]
+    text = gen.generate(
+        {"TurtleTradeStrategy": ["600000", "300750"]}, scores=scores
+    ).read_text(encoding="utf-8")
+
+    assert '<section class="card ranking"' in text
+    assert "量化评分排行" in text
+    assert '<td class="rank">1</td>' in text and '<td class="rank">2</td>' in text
+    assert "86.0" in text and "72.5" in text
+
+
+def test_ranking_card_keeps_given_order(gen):
+    """名次由传入顺序决定（调用方已按得分降序排好）。"""
+    scores = [make_score("300750", 90.0), make_score("600000", 60.0)]
+    text = gen.generate(
+        {"TurtleTradeStrategy": ["600000", "300750"]}, scores=scores
+    ).read_text(encoding="utf-8")
+
+    ranking = text.split("量化评分排行", 1)[1]
+    assert ranking.index("300750") < ranking.index("600000")
+
+
+def test_ranking_card_explains_score_on_hover(gen):
+    """分数必须是可解释的：悬停能看到五维分项、扣分、胜率与回撤。"""
+    scores = [make_score("600000", 72.5, penalty=6.0, prob_up=66.7, max_drawdown=18.4)]
+    text = gen.generate({"TurtleTradeStrategy": ["600000"]}, scores=scores).read_text(
+        encoding="utf-8"
+    )
+
+    assert "策略共振 20" in text
+    assert "惩罚 -6" in text
+    assert "形态胜率 67%" in text
+    assert "最大回撤 18.4%" in text
+    # 表格单元格本身也要显示增强层的两个数字
+    assert "66.7%" in text and "18.4%" in text
+
+
+def test_ranking_card_shows_marks_and_placeholder_for_missing_meta(gen):
+    scores = [make_score("600601", 55.0, tags="T")]  # 600601 不在桩 meta 里
+    text = gen.generate({"TurtleTradeStrategy": ["600601"]}, scores=scores).read_text(
+        encoding="utf-8"
+    )
+
+    assert ">T</td>" in text  # 标记列
+    assert '<td class="name">—</td>' in text  # 缺名称的降级展示
+
+
+# ── 量化评分：策略卡片追加评分列 ──
+
+
+def test_strategy_card_shows_score_column(gen):
+    scores = [make_score("600000", 80.0)]
+    text = gen.generate({"TurtleTradeStrategy": ["600000"]}, scores=scores).read_text(
+        encoding="utf-8"
+    )
+
+    assert "<th>评分</th>" in text
+    assert '<td class="num score" title="' in text
+    assert "80.0" in text
+
+
+def test_strategy_card_score_placeholder_for_unscored_symbol(gen):
+    """历史不足没算出评分的股票，评分列显示「—」而不是 0。"""
+    scores = [make_score("600000", 80.0)]
+    text = gen.generate(
+        {"TurtleTradeStrategy": ["600000", "000001"]}, scores=scores
+    ).read_text(encoding="utf-8")
+
+    assert '<td class="num score">—</td>' in text
+
+
+def test_strategy_card_sorts_rows_by_score_inside_board(gen):
+    """板块内部按评分降序，翻掉默认的代码升序。"""
+    scores = [make_score("600601", 90.0), make_score("600000", 60.0)]
+    text = gen.generate(
+        {"TurtleTradeStrategy": ["600000", "600601"]}, scores=scores
+    ).read_text(encoding="utf-8")
+
+    section = text.split("<h2>海龟突破</h2>", 1)[1]
+    assert section.index("600601") < section.index("600000")
+
+
+def test_strategy_card_keeps_code_order_without_scores(gen):
+    text = gen.generate({"TurtleTradeStrategy": ["600601", "600000"]}).read_text(encoding="utf-8")
+
+    section = text.split("<h2>海龟突破</h2>", 1)[1]
+    assert section.index("600000") < section.index("600601")
+
+
+def test_score_column_follows_holding_column(gen):
+    """列顺序稳定：基础列 → 市值/换手/PE → 十大流通 → 评分。"""
+    text = gen.generate(
+        {"TurtleTradeStrategy": ["600000"]},
+        holdings={"600000": 74.87},
+        scores=[make_score("600000", 80.0)],
+    ).read_text(encoding="utf-8")
+
+    # 必须先定位到策略卡片 —— 页首的排行卡片排在最前面，直接取第一个 <thead> 会取错
+    section = text.split("<h2>海龟突破</h2>", 1)[1]
+    header = section.split("<thead><tr>", 1)[1].split("</tr>", 1)[0]
+    assert header.index("十大流通") < header.index("评分")

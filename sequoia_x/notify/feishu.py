@@ -13,10 +13,12 @@
 """
 
 import json
+from collections.abc import Sequence
 from datetime import date
 
 import requests
 
+from sequoia_x.analysis.scorer import ScoreDetail
 from sequoia_x.core.config import Settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data import stock_meta as stock_meta_module
@@ -33,6 +35,10 @@ logger = get_logger(__name__)
 # 实际配置动辄几十个关键词，不截断会把整张卡片撑爆。
 # 阈值项（市值/PE/成交额/换手）排在描述前面，所以截断牺牲的是尾部行业名单。
 _MAX_FILTER_CHARS = 120
+
+# 卡片里「高分榜」只放前 N 名：飞书交互卡片对元素数量与总长度都有限制，
+# 完整排行放在本地 HTML 报告里（那张表可横向滚动、可搜索）。
+_TOP_RANKING = 5
 
 
 def _elide(text: str, limit: int = _MAX_FILTER_CHARS) -> str:
@@ -71,23 +77,55 @@ class FeishuNotifier:
         return f"[{label}](https://xueqiu.com/S/{to_xueqiu_code(symbol)})"
 
     @classmethod
-    def _strategy_section(cls, label: str, symbols: list[str], meta: dict[str, StockMeta]) -> str:
-        """渲染一个策略小节：标题行 + 每个板块一行（板块内代码升序）。
+    def _strategy_section(
+        cls,
+        label: str,
+        symbols: list[str],
+        meta: dict[str, StockMeta],
+        order: dict[str, int] | None = None,
+    ) -> str:
+        """渲染一个策略小节：标题行 + 每个板块一行。
 
         板块标题带只数，例如 `主板 3：600000 浦发银行、600601 方正科技`。
+        传入 `order`（代码 → 评分名次）时，板块**内部**改按评分降序 ——
+        保留板块分组便于手机阅读，同时让高分股先出现。
         """
         lines = [f"**{label}**（{len(symbols)} 只）"]
-        for board, group in group_by_board(symbols):
+        for board, group in group_by_board(symbols, order=order):
             stocks = "、".join(cls._stock_text(s, meta) for s in group)
             lines.append(f"{board} {len(group)}：{stocks}")
         return "\n".join(lines)
 
-    def _build_report_card(self, results: dict[str, list[str]], filter_desc: str = "") -> dict:
+    @classmethod
+    def _ranking_section(cls, scores: Sequence[ScoreDetail], meta: dict[str, StockMeta]) -> str:
+        """渲染「高分榜」小节：按评分降序列出前 `_TOP_RANKING` 名。
+
+        分数只在这里出现 —— 各策略小节仍只显示代码+名称，避免整张卡片
+        都是数字而看不清结构。
+        """
+        lines = [f"**🎯 量化评分 Top {min(_TOP_RANKING, len(scores))}**"]
+        for i, detail in enumerate(scores[:_TOP_RANKING], 1):
+            item = meta.get(detail.symbol)
+            name = (item.name if item else None) or ""
+            label = f"{detail.symbol} {name}".strip()
+            link = f"[{label}](https://xueqiu.com/S/{to_xueqiu_code(detail.symbol)})"
+            mark = f" `{detail.tags}`" if detail.tags else ""
+            lines.append(f"**{i}.** {link} · **{detail.score:.1f}**{mark}")
+        return "\n".join(lines)
+
+    def _build_report_card(
+        self,
+        results: dict[str, list[str]],
+        filter_desc: str = "",
+        scores: Sequence[ScoreDetail] = (),
+    ) -> dict:
         """把 {策略类名: 代码列表} 渲染成一张飞书交互卡片。
 
         Args:
             results: 各策略的选股结果，顺序即卡片中小节的顺序。
             filter_desc: 精筛条件描述，展示在卡片顶部便于解释结果为何偏少。
+            scores: 可选的量化评分（应按得分降序）。传入后卡片顶部多一个
+                「高分榜」小节，且各策略小节**内部**改按评分降序排列。
 
         Returns:
             飞书 `msg_type=interactive` 的请求体。
@@ -96,6 +134,8 @@ class FeishuNotifier:
         today = date.today().strftime("%Y-%m-%d")
         total = sum(len(v) for v in results.values())
         hit = sum(1 for v in results.values() if v)
+        score_list = list(scores or [])
+        order = {d.symbol: i for i, d in enumerate(score_list)}
 
         summary = [f"**日期：** {today}", f"**命中策略：** {hit} / {len(results)}"]
         summary.append(f"**选股数量：** {total}")
@@ -110,9 +150,19 @@ class FeishuNotifier:
             elements.append({"tag": "hr"})
             elements.append({"tag": "div", "text": {"tag": "lark_md", "content": content}})
 
+        if score_list:
+            add_markdown(self._ranking_section(score_list, meta))
+
         for strategy_name, symbols in results.items():
             if symbols:
-                add_markdown(self._strategy_section(strategy_label(strategy_name), symbols, meta))
+                add_markdown(
+                    self._strategy_section(
+                        strategy_label(strategy_name),
+                        symbols,
+                        meta,
+                        order=order if score_list else None,
+                    )
+                )
 
         if total == 0:
             # 全空时不留白卡片：明确说明「跑了但没选出来」
@@ -166,6 +216,7 @@ class FeishuNotifier:
         results: dict[str, list[str]],
         filter_desc: str = "",
         webhook_key: str = "default",
+        scores: Sequence[ScoreDetail] = (),
     ) -> None:
         """把所有策略的选股结果汇总成一张卡片推送出去。
 
@@ -173,10 +224,11 @@ class FeishuNotifier:
             results: {策略类名: 选股代码列表}，顺序决定卡片中小节的顺序。
             filter_desc: 精筛条件描述。
             webhook_key: 用于路由 Webhook；未配置专属地址时回退到默认地址。
+            scores: 可选的量化评分（应按得分降序），用于生成高分榜与节内排序。
 
         Raises:
             不抛出异常，HTTP 失败时记录 ERROR 日志。
         """
         url = self.settings.get_webhook_url(webhook_key)
-        payload = self._build_report_card(results, filter_desc)
+        payload = self._build_report_card(results, filter_desc, scores)
         self._post(url, payload, webhook_key, sum(len(v) for v in results.values()))

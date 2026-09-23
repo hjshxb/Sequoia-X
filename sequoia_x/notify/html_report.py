@@ -14,9 +14,12 @@
 from __future__ import annotations
 
 import html
+import math
+from collections.abc import Mapping, Sequence
 from datetime import date
 from pathlib import Path
 
+from sequoia_x.analysis.scorer import ScoreDetail
 from sequoia_x.core.config import Settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data import stock_meta as stock_meta_module
@@ -48,10 +51,39 @@ STRATEGY_LABELS: dict[str, str] = {
 # 兼容旧引用（原名带下划线，仅供历史代码/测试使用）
 _STRATEGY_LABELS = STRATEGY_LABELS
 
+# 策略类名 -> 单字母标记，用于一眼看出「这只命中过哪些策略」。
+# 与 STRATEGY_LABELS 同属展示层公共词汇；评分器只接收拼好的字母串，
+# 不依赖策略名（分析层不该知道有哪些策略）。
+STRATEGY_MARKS: dict[str, str] = {
+    "MaVolumeStrategy": "M",
+    "TurtleTradeStrategy": "T",
+    "HighTightFlagStrategy": "F",
+    "LimitUpShakeoutStrategy": "S",
+    "UptrendLimitDownStrategy": "D",
+    "RpsBreakoutStrategy": "R",
+    "PrivatePlacementStrategy": "P",
+}
+
 
 def strategy_label(strategy_name: str) -> str:
     """取策略的中文展示名；未收录时回退为类名本身。"""
     return STRATEGY_LABELS.get(strategy_name, strategy_name)
+
+
+def build_symbol_marks(results: Mapping[str, list[str]]) -> dict[str, str]:
+    """把 {策略类名: 代码列表} 压成 {代码: 字母标记}。
+
+    同一只股票被多个策略选中时字母合并并按字典序排列，例如同时命中海龟与
+    RPS 得到 `"RT"`。排序保证报告与飞书卡片对同一只股票给出相同标记。
+    """
+    marks: dict[str, set[str]] = {}
+    for strategy_name, symbols in results.items():
+        letter = STRATEGY_MARKS.get(strategy_name)
+        if not letter:
+            continue
+        for symbol in symbols:
+            marks.setdefault(symbol, set()).add(letter)
+    return {symbol: "".join(sorted(letters)) for symbol, letters in marks.items()}
 
 
 def to_xueqiu_code(symbol: str) -> str:
@@ -63,20 +95,30 @@ def to_xueqiu_code(symbol: str) -> str:
     return f"SZ{symbol}"
 
 
-def group_by_board(symbols: list[str]) -> list[tuple[str, list[str]]]:
+def group_by_board(
+    symbols: list[str], order: Mapping[str, int] | None = None
+) -> list[tuple[str, list[str]]]:
     """按上市板块归类并排序。
 
-    板块顺序为 主板 → 创业板 → 科创板 → 北交所 → 其他，板块内按代码升序。
-    只返回非空的板块，因此调用方可以直接遍历生成分组标题。
+    板块顺序为 主板 → 创业板 → 科创板 → 北交所 → 其他。
+    板块内默认按**代码升序**；传入 `order`（如「代码 → 评分名次」）时改为按该
+    名次升序 —— 既保留板块分组的可读性，又让高分股排在前面。
 
     Args:
         symbols: 纯数字股票代码列表。
+        order: 可选 {代码: 名次}。未收录的代码排在所属板块末尾（不会丢失）。
 
     Returns:
         [(板块名, 该板块下的代码列表)]，按板块顺序排列。
     """
+
+    def sort_key(symbol: str) -> tuple:
+        if order is None:
+            return (board_rank(symbol), symbol)
+        return (board_rank(symbol), order.get(symbol, 1 << 30), symbol)
+
     buckets: dict[str, list[str]] = {}
-    for symbol in sorted(symbols, key=lambda s: (board_rank(s), s)):
+    for symbol in sorted(symbols, key=sort_key):
         buckets.setdefault(board_of(symbol), []).append(symbol)
     return [(board, buckets[board]) for board in BOARD_ORDER if board in buckets]
 
@@ -109,6 +151,24 @@ def _fmt_holding(ratio: float | None) -> str:
     return f"{ratio:.1f}"
 
 
+def _fmt_num(value: float | None, digits: int = 2) -> str:
+    """通用数值格式化；None / 非有限值一律显示为「—」。
+
+    评分卡片里的指标缺失是常态（历史不足、增强层未启用），统一走这里，
+    避免每处都重复写 None 判断。
+    """
+    if value is None or not math.isfinite(value):
+        return "—"
+    return f"{value:.{digits}f}"
+
+
+def _fmt_pct(value: float | None, digits: int = 2, signed: bool = False) -> str:
+    """百分比格式化；`signed=True` 时带正负号（涨跌幅这种有方向的量）。"""
+    if value is None or not math.isfinite(value):
+        return "—"
+    return f"{value:+.{digits}f}%" if signed else f"{value:.{digits}f}%"
+
+
 class HtmlReportGenerator:
     """把各策略选股结果渲染成本地单文件 HTML 报告。"""
 
@@ -135,6 +195,7 @@ class HtmlReportGenerator:
         output_path: str | Path | None = None,
         metrics: dict[str, StockMetric] | None = None,
         holdings: dict[str, float] | None = None,
+        scores: Sequence[ScoreDetail] | None = None,
     ) -> Path:
         """生成 HTML 报告并写入磁盘。
 
@@ -146,6 +207,9 @@ class HtmlReportGenerator:
                 市值 / 换手率 / PE(TTM) 三列；缺数据的股票显示为「—」。
             holdings: 可选的 {代码: 前十大流通股东合计占流通股比例(%)}。
                 传入后额外展示「十大流通(%)」一列，便于回看与调阈值。
+            scores: 可选的量化评分明细（应按得分降序）。传入后：页首多一张
+                「量化评分排行」卡片、各策略卡片追加「评分」列，且板块分组
+                **内部**改按评分降序排列（板块之间的先后顺序不变）。
 
         Returns:
             实际写入的报告文件路径。
@@ -155,6 +219,7 @@ class HtmlReportGenerator:
             metrics = {}
         if holdings is None:
             holdings = {}
+        score_list = list(scores or [])
         missing = 0
         for symbols in results.values():
             for symbol in symbols:
@@ -163,7 +228,7 @@ class HtmlReportGenerator:
         if missing:
             logger.warning(f"HTML 报告：{missing} 条记录缺少名称/行业，将显示为「—」")
 
-        content = self._render(results, meta, filter_desc, metrics, holdings)
+        content = self._render(results, meta, filter_desc, metrics, holdings, score_list)
 
         path = Path(output_path) if output_path else self.default_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -179,6 +244,7 @@ class HtmlReportGenerator:
         filter_desc: str,
         metrics: dict[str, StockMetric],
         holdings: dict[str, float] | None = None,
+        scores: Sequence[ScoreDetail] = (),
     ) -> str:
         today = date.today().strftime("%Y-%m-%d")
         total = sum(len(v) for v in results.values())
@@ -188,10 +254,16 @@ class HtmlReportGenerator:
         # 只有部分股票有股东数据时也展示该列，缺失的显示为「—」
         holdings = holdings or {}
         show_holdings = bool(holdings)
+        # 评分：{代码: 明细} 用于展示分数，{代码: 名次} 用于板块内排序。
+        # `scores` 已按得分降序传入，故这里的名次天然就是排名。
+        score_of = {d.symbol: d for d in scores}
+        show_scores = bool(score_of)
+        rank_of = {d.symbol: i for i, d in enumerate(scores)}
         headers = (
             _BASE_COLUMNS
             + (_METRIC_COLUMNS if show_metrics else ())
             + (_HOLDING_COLUMNS if show_holdings else ())
+            + (("评分",) if show_scores else ())
         )
         n_cols = len(headers)
         thead = "".join(f"<th>{html.escape(h)}</th>" for h in headers)
@@ -200,7 +272,8 @@ class HtmlReportGenerator:
         for strategy_name, symbols in results.items():
             label = _STRATEGY_LABELS.get(strategy_name, strategy_name)
             if symbols:
-                grouped = group_by_board(symbols)
+                # 有评分时，板块**内部**按评分降序（板块之间的先后顺序不变）
+                grouped = group_by_board(symbols, order=rank_of if show_scores else None)
                 parts: list[str] = []
                 for board, group in grouped:
                     parts.append(self._render_group_row(board, len(group), n_cols))
@@ -211,8 +284,10 @@ class HtmlReportGenerator:
                                 meta.get(symbol),
                                 metrics.get(symbol),
                                 holdings.get(symbol),
+                                score_of.get(symbol),
                                 show_metrics,
                                 show_holdings,
+                                show_scores,
                             )
                         )
                 rows = "\n".join(parts)
@@ -245,6 +320,7 @@ class HtmlReportGenerator:
         filter_line = (
             f'<span class="filter">{html.escape(filter_desc)}</span>' if filter_desc else ""
         )
+        ranking_html = self._render_ranking(scores, meta)
 
         return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -365,6 +441,11 @@ class HtmlReportGenerator:
   td.industry {{ color: var(--muted); }}
   .boards {{ margin-left: auto; color: var(--muted); font-size: 12px; }}
   .empty {{ color: var(--muted); font-size: 13px; margin: 4px 0 16px; }}
+  .card.ranking {{ border-color: #efd2d2; }}
+  .card.ranking h2::before {{ content: "▍"; color: var(--accent); margin-right: 4px; }}
+  td.rank {{ color: var(--muted); font-variant-numeric: tabular-nums; width: 34px; }}
+  td.score {{ font-weight: 700; color: var(--accent); cursor: help; }}
+  td.marks {{ color: var(--muted); font-size: 12px; letter-spacing: 0.04em; }}
   footer {{ margin-top: 28px; color: var(--muted); font-size: 12px; text-align: center; }}
   mark {{ background: #ffe9a8; padding: 0 1px; border-radius: 2px; }}
   @media (max-width: 560px) {{
@@ -393,6 +474,7 @@ class HtmlReportGenerator:
 
   <main id="report">
 {empty_hint}
+{ranking_html}
 {chr(10).join(sections)}
   </main>
 
@@ -456,6 +538,73 @@ class HtmlReportGenerator:
 </html>
 """
 
+    def _render_ranking(self, scores: Sequence[ScoreDetail], meta: dict[str, StockMeta]) -> str:
+        """渲染页首的「量化评分排行」卡片（已按风险调整后得分降序）。
+
+        回答的是策略答不了的问题：**入选的这几十只里，哪几只更值得看**。
+        分数刻意做成可解释的 —— 鼠标悬停在分数上能看到五维分项与扣分，
+        不让它变成一个黑箱数字。
+        """
+        if not scores:
+            return ""
+
+        head = (
+            "<th>#</th><th>代码</th><th>名称</th><th>板块</th><th>评分</th><th>标记</th>"
+            "<th>当日</th><th>20日</th><th>量比</th><th>距高</th><th>MA20偏离</th>"
+            "<th>波动</th><th>胜率</th><th>回撤</th>"
+        )
+        body: list[str] = []
+        for i, detail in enumerate(scores, 1):
+            item = meta.get(detail.symbol)
+            name = html.escape(item.name) if item and item.name else "—"
+            dist_high = (1 - detail.near_high) * 100 if detail.near_high else None
+
+            # 悬停提示：把分数拆开，说明它为什么高 / 为什么被扣分
+            tips = [f"{key} {value:.0f}" for key, value in detail.dims.items()]
+            if detail.penalty:
+                tips.append(f"惩罚 -{detail.penalty:.0f}")
+            if detail.prob_up is not None:
+                tips.append(f"形态胜率 {detail.prob_up:.0f}%")
+            if detail.max_drawdown is not None:
+                tips.append(f"最大回撤 {detail.max_drawdown:.1f}%")
+
+            body.append(
+                "            <tr>"
+                f'<td class="rank">{i}</td>'
+                f'<td class="code"><a href="https://xueqiu.com/S/{to_xueqiu_code(detail.symbol)}"'
+                f' target="_blank" rel="noopener">{detail.symbol}</a></td>'
+                f'<td class="name">{name}</td>'
+                f'<td class="board">{html.escape(board_of(detail.symbol))}</td>'
+                f'<td class="num score" title="{html.escape("、".join(tips))}">'
+                f"{detail.score:.1f}</td>"
+                f'<td class="marks">{html.escape(detail.tags or "—")}</td>'
+                f'<td class="num">{_fmt_pct(detail.chg1, signed=True)}</td>'
+                f'<td class="num">{_fmt_pct(detail.chg20, signed=True)}</td>'
+                f'<td class="num">{_fmt_num(detail.vol_ratio)}</td>'
+                f'<td class="num">{_fmt_pct(dist_high)}</td>'
+                f'<td class="num">{_fmt_pct(detail.dev_ma20)}</td>'
+                f'<td class="num">{_fmt_pct(detail.vol20, digits=1)}</td>'
+                f'<td class="num">{_fmt_pct(detail.prob_up, digits=1)}</td>'
+                f'<td class="num">{_fmt_pct(detail.max_drawdown, digits=1)}</td>'
+                "</tr>"
+            )
+
+        return f"""<section class="card ranking" data-count="{len(scores)}">
+      <div class="card-head">
+        <h2>量化评分排行</h2>
+        <span class="badge">{len(scores)}</span>
+        <span class="boards">按风险调整后得分降序 · 悬停分数可看构成</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>{head}</tr></thead>
+          <tbody>
+{chr(10).join(body)}
+          </tbody>
+        </table>
+      </div>
+    </section>"""
+
     @staticmethod
     def _render_group_row(board: str, count: int, n_cols: int) -> str:
         """板块分组标题行，整行合并单元格。"""
@@ -471,8 +620,10 @@ class HtmlReportGenerator:
         meta: StockMeta | None,
         metric: StockMetric | None,
         holding: float | None,
+        score: ScoreDetail | None,
         show_metrics: bool,
         show_holdings: bool = False,
+        show_scores: bool = False,
     ) -> str:
         name = html.escape(meta.name) if meta and meta.name else "—"
         industry = html.escape(meta.industry) if meta and meta.industry else "—"
@@ -494,5 +645,15 @@ class HtmlReportGenerator:
             )
         if show_holdings:
             cells += f'<td class="num">{_fmt_holding(holding)}</td>'
+        if show_scores:
+            # 该股可能没算出评分（历史数据不足），此时显示「—」而不是凭空给 0
+            text = f"{score.score:.1f}" if score else "—"
+            tips = ""
+            if score:
+                parts = [f"{key} {value:.0f}" for key, value in score.dims.items()]
+                if score.penalty:
+                    parts.append(f"惩罚 -{score.penalty:.0f}")
+                tips = f' title="{html.escape("、".join(parts))}"'
+            cells += f'<td class="num score"{tips}>{text}</td>'
 
         return f'            <tr data-board="{html.escape(board)}">{cells}</tr>'

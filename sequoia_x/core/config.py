@@ -88,6 +88,24 @@ class Settings(BaseSettings):
     report_enabled: bool = True
     report_dir: str = "reports"
 
+    # ── 候选股量化评分（量价打分排序）──
+    # 策略只回答「入选 / 未入选」，答不了「这几十只里哪几只更值得看」。
+    # 评分器用本地行情库（零网络开销）算量价特征并给出 0~100 分，
+    # 报告与飞书卡片据此排序展示。见 sequoia_x/analysis/scorer.py。
+    score_enabled: bool = True
+    # 报告「量化评分排行」卡片最多展示前 N 名，**同时决定**增强层算多少只。
+    # 两者必须一致，否则会出现「行展示了、增强列却是空的 —」这种不一致。
+    # 0 = 不限制（全部展示、全部增强）；实测 36 只全量增强仅约 1 秒，
+    # 故默认不限制。
+    score_top_n: int = 0
+    # 是否调用外部量化工具补充「形态匹配胜率 / 最大回撤」两列。
+    # 该工具不属于本项目依赖，未配置路径 / 导入失败会自动跳过，
+    # 主评分链路完全不受影响。
+    score_enhance: bool = True
+    # 外部量化工具（stock-researcher）的根目录；留空 = 不加载增强层。
+    # 例：QUANT_SKILL_PATH=/mnt/c/Users/hxb/.workbuddy/skills/aistockresearcher__skillhub
+    quant_skill_path: str = ""
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -167,6 +185,30 @@ class Settings(BaseSettings):
         """TTL 允许为 0（每次都刷新），但不接受负数。"""
         if v < 0:
             raise ValueError(f"stock_meta_ttl_days 不能为负，当前为 {v}")
+        return v
+
+    @field_validator("score_top_n", mode="before")
+    @classmethod
+    def _blank_score_top_n_to_default(cls, v: object) -> object:
+        """`SCORE_TOP_N=` 留空视为未配置，回落默认 0（不限制）。"""
+        if isinstance(v, str) and v.strip() == "":
+            return 0
+        return v
+
+    @field_validator("score_top_n", mode="after")
+    @classmethod
+    def _check_score_top_n(cls, v: int) -> int:
+        """Top N 允许为 0（不限制），但不接受负数。"""
+        if v < 0:
+            raise ValueError(f"score_top_n 不能为负（0 表示不限制），当前为 {v}")
+        return v
+
+    @field_validator("score_enabled", "score_enhance", mode="before")
+    @classmethod
+    def _blank_switch_to_default(cls, v: object) -> object:
+        """布尔开关留空视为「未配置」，回落 True（默认开启）。"""
+        if isinstance(v, str) and v.strip() == "":
+            return True
         return v
 
     @classmethod

@@ -16,13 +16,14 @@ import sys
 
 from dotenv import load_dotenv
 
+from sequoia_x.analysis.scorer import ScoreDetail, score_pool
 from sequoia_x.core.config import MAX_SYNC_WORKERS, get_settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data import stock_meta
 from sequoia_x.data.engine import BaostockUnavailable, DataEngine
 from sequoia_x.data.universe_filter import UniverseFilter
 from sequoia_x.notify.feishu import FeishuNotifier
-from sequoia_x.notify.html_report import HtmlReportGenerator
+from sequoia_x.notify.html_report import HtmlReportGenerator, build_symbol_marks
 from sequoia_x.strategy.base import BaseStrategy
 from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
 from sequoia_x.strategy.limit_up_shakeout import LimitUpShakeoutStrategy
@@ -153,7 +154,42 @@ def main() -> None:
             results[strategy_name] = selected
             logger.info(f"{strategy_name} 选出 {len(selected)} 只股票")
 
-        # 7. 推送：各策略汇总成单张卡片（中文策略名 + 按板块分组，只给代码+名称）
+        # 6.5 量化评分：把「入选 / 未入选」的布尔结果变成可排序的分数。
+        #     全部数据取自本地行情库，零网络开销；精筛已拉取的指标直接复用。
+        #     评分失败**不能**阻断主流程 —— 报告和推送仍要照常产出，
+        #     少一个评分列远好过当天什么都收不到。
+        displayed = sorted({s for symbols in results.values() for s in symbols})
+        metrics = universe.fetch_metrics(displayed) if displayed else {}
+        holdings = universe.cached_holder_ratios()
+
+        ranking: list[ScoreDetail] = []
+        if not settings.score_enabled:
+            logger.info("量化评分已关闭（SCORE_ENABLED=false）")
+        elif displayed:
+            try:
+                # 展示范围与增强范围必须一致：否则会出现「报告里排到了第 30 名、
+                # 但胜率/回撤列是空的」这种不一致。score_top_n=0 表示不限制。
+                limit = settings.score_top_n or len(displayed)
+                ranking = score_pool(
+                    displayed,
+                    db_path=settings.db_path,
+                    metrics=metrics,
+                    holdings=holdings,
+                    tags=build_symbol_marks(results),
+                    enhance_top=limit if settings.score_enhance else 0,
+                    skill_path=settings.quant_skill_path if settings.score_enhance else "",
+                )
+                if settings.score_top_n:
+                    ranking = ranking[: settings.score_top_n]
+                if ranking:
+                    logger.info(
+                        f"量化评分完成：{len(ranking)} 只，"
+                        f"最高 {ranking[0].score:.1f}（{ranking[0].symbol}）"
+                    )
+            except Exception as exc:
+                logger.error(f"量化评分失败，本次报告与推送不含评分：{exc}")
+
+        # 7. 推送：各策略汇总成单张卡片（中文策略名 + 板块分组 + 高分榜）
         if args.no_push:
             logger.info("已指定 --no-push，跳过飞书推送")
         elif not any(results.values()):
@@ -167,25 +203,23 @@ def main() -> None:
                     # 必须用 brief=True：完整版里 40+ 个行业关键词会把后面的条款挤出
                     # 卡片可视长度（实测「前十大流通股东」曾被截掉）。
                     filter_desc=universe.describe(brief=True).removeprefix("精筛："),
+                    scores=ranking,
                 )
             except Exception as exc:
                 logger.error(f"飞书推送异常，已忽略：{exc}")
 
-        # 8. 生成本地 HTML 报告（按策略分块 + 板块分组，不依赖飞书）
+        # 8. 生成本地 HTML 报告（按策略分块 + 板块分组 + 评分排行，不依赖飞书）
         if settings.report_enabled:
             try:
-                # 展示 市值/换手率/PE 三列。精筛若已启用，这些指标在精筛阶段
-                # 就已拉取并进了进程内缓存，此处不会再产生网络请求；
+                # metrics / holdings 在第 6.5 步已算好：精筛若已启用，这些指标
+                # 在精筛阶段就已拉取并进了进程内缓存，此处不会再产生网络请求；
                 # 只有精筛完全未配置时才会新拉一次。
-                displayed = sorted({s for symbols in results.values() for s in symbols})
-                metrics = universe.fetch_metrics(displayed) if displayed else {}
-                # 前十大流通股东占比：仅当配置了筹码维度时才展示，
-                # 且直接复用精筛已加载的市场级快照，零额外请求。
                 report_path = HtmlReportGenerator(settings).generate(
                     results,
                     filter_desc=universe.describe(),
                     metrics=metrics,
-                    holdings=universe.cached_holder_ratios(),
+                    holdings=holdings,
+                    scores=ranking,
                 )
                 logger.info(f"HTML 报告已生成：{report_path.resolve()}")
             except Exception as exc:
