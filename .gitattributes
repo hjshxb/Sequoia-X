@@ -1,0 +1,17 @@
+# 行尾符规则
+#
+# 为什么必须显式写死：本机 core.autocrlf=true，checkout 时会把仓库里的 LF
+# 重新写成 CRLF 落到工作区。Python 不在乎，但 **bash 在乎** ——
+# 带 CRLF 的脚本一执行就报 `$'\r': command not found` / `syntax error near
+# unexpected token`，`scripts/daily_run.sh`（定时任务入口）会直接失败。
+#
+# 更坑的是：git 里**看不出任何差异** —— blob 本来就是 LF，`git add` 时
+# 又被规范化回 LF，所以 `git status` 干净、`git diff` 为空，而脚本已经跑不了了。
+# 2026-09-24 就这么被坑过一次（一次 `git checkout` 恢复把 scripts/ 下
+# 5 个 .sh 全变成 CRLF，全仓无 diff 但定时任务会失败）。
+#
+# 只锚定 .sh：Python 文件在 HEAD 里本来就混着 CRLF，强行统一会产生
+# 24 个大文件的整体 diff，收益为零。
+*.sh text eol=lf
+# 这行让规则文件自己也不被转成 CRLF（属性文件若带 CR，个别 git 版本解析会出偏差）
+/.gitattributes text eol=lf

@@ -39,12 +39,18 @@ build/
 
 # 运行时生成物（均不入 git）
 # logs/    : **仅**放运行日志与临时产物（*.log / *.txt）
-# scripts/ : 可复用的运维脚本（定时任务入口 daily_run.sh / 探针 / 验证 / 报告重算），**入库**
+# scripts/ : **只放长期需要的脚本**（定时任务入口、日常运维、排障、回归测试），**入库**
+# tmp/     : 一次性 / 探索性脚本（环境搭建、旧引导流程、维度验证、临时探针），**不入库**
+#            ⇒ 判断标准：这个脚本半年后还大概率会被再跑一次吗？
+#              不是 ⇒ 放 tmp/。tmp/ 里的东西随时可删，也能从 git 历史里捞回来
+#              （`git log --diff-filter=D --name-only -- scripts/xxx.sh` 找到删除它的提交）。
 # reports/ : **所有生成的 HTML 报告只放这里**，不进版本库
 #            candidates_<日期>.html    策略候选快照（离线分析/重算的输入源）
 #            stock_report_<日期>.html  选股报告（main.py 与本机重算脚本的输出）
 logs/
 reports/
+# 根目录锚定，避免顺带忽略掉 data/tmp/ 之类同名子目录
+/tmp/
 
 # Hypothesis 测试缓存
 .hypothesis/
