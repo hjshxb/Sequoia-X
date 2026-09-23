@@ -27,6 +27,7 @@ from sequoia_x.notify.html_report import (
     group_by_board,
     strategy_label,
     to_xueqiu_code,
+    winrate_text,
 )
 
 logger = get_logger(__name__)
@@ -49,19 +50,6 @@ _TOP_PATTERN = 5
 def _elide(text: str, limit: int = _MAX_FILTER_CHARS) -> str:
     """超长文本截断并加省略号；未超长时原样返回。"""
     return text if len(text) <= limit else text[:limit] + "…"
-
-
-def _winrate_text(detail: ScoreDetail) -> str:
-    """胜率的展示文本：有样本数时写成 `k/n`，否则退回百分比。
-
-    `prob_up` 是 k/n 除出来的离散值（实测 n 只有 1~7），单看「100%」
-    会误以为样本充足 —— 它可能只是「1 次里涨了 1 次」。带上 n 才能区分
-    「2/2」和「7/7」。样本数缺失（旧报告 / 增强层未启用）时保持百分比写法。
-    """
-    up = detail.prob_up or 0.0
-    if detail.prob_samples:
-        return f"{round(up / 100 * detail.prob_samples)}/{detail.prob_samples}"
-    return f"{up:.0f}%"
 
 
 class FeishuNotifier:
@@ -137,18 +125,21 @@ class FeishuNotifier:
     ) -> str:
         """渲染「形态匹配 Top 5」小节：按**匹配可信度**降序。
 
-        为什么不按胜率排：`prob_up` 是 k/n 的离散值，而实测 n 只有 1~7
-        （2026-09-24 实测 36 只：最小 1、最大 7），并列扎堆，而且
-        **样本越少越容易拿满分**（那年 4 只 100% 里就有一只 n=1），
-        纯按胜率排等于反向挑「历史样本最少的票」。`confidence` 由相似度与
-        样本量共同决定，排序更稳；胜率改写为 `k/n` 与样本数一起展示，
-        让人自己判断这条胜率值不值得信。
+        为什么不按胜率排（读工具源码 + 真库实测后确认）：
 
-        与评分榜是两个视角，不合并：实测同一批票里评分前 5 的胜率是
-        0/33/60/67/67，而胜率 100% 的四只评分只有 67/61/56/45 —— 错开甚至
-        反向是常态，因为评分看「当下格局」，形态匹配看「历史上这种形态
-        之后涨过几次」。评分最高那只（国恩股份 86 分）甚至只有 1 个样本、
-        那次还是跌的，所以显示 0%。
+        胜率 `prob_up` = `k / len(matches) * 100`，分母是**相似度最高的 5 个
+        历史窗口**（`top_k=5`），不是候选总数。分母小到 5 时胜率只有
+        0/20/40/60/80/100 六档，分母为 1 时只能是 0% 或 100% —— 纯端点值、
+        并列扎堆，**窗口越少越容易拿满分**。纯按胜率排等于反向挑
+        「历史窗口最少的票」。`confidence` 由候选窗口数、最佳相似度、方向
+        一致性加权而成，排序明显更稳。
+
+        这一节与评分榜是**两个视角**，不合并：评分来自五维量价（当下格局与
+        位置风险），形态匹配来自历史相似窗口的后续走势，名单不一致甚至反向
+        是常态。**但要先排除分母过小的情况** —— 曾因喂给匹配器的历史太短
+        （只 250 行）导致每只票只剩 1~3 个候选窗口，胜率成片塌成 0%/100%，
+        看起来像「强势股必然胜率低」，实则是配置问题
+        （见 `scorer.ENHANCE_LOOKBACK`）。
 
         胜率来自外部量化工具的增强层，**可能整批都缺**（未启用增强 /
         历史数据不足 / 计算失败）。此时返回空串，调用方跳过该小节 ——
@@ -172,7 +163,7 @@ class FeishuNotifier:
             link = f"[{label}](https://xueqiu.com/S/{to_xueqiu_code(detail.symbol)})"
             mark = f" `{detail.tags}`" if detail.tags else ""
             lines.append(
-                f"**{i}.** {link} · **胜率 {_winrate_text(detail)}**"
+                f"**{i}.** {link} · **胜率 {winrate_text(detail)}**"
                 f" · 评分 {detail.score:.1f}{mark}"
             )
         return "\n".join(lines)

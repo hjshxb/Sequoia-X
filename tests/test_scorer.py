@@ -7,6 +7,8 @@
     - `score_pool` 的排序语义与 metrics / holdings / tags 的接线
     - 增强层是**可选**的：未配置路径、导入失败、样本不足、工具抛异常，
       一律降级且不影响基础分；`prob_up` 已是 0~100 百分数，**不得再乘 100**
+    - 增强层的两个「样本」别混：胜率分母是 `len(matches)`（相似窗口数，≤5），
+      `n_matches` 是候选总数；且喂给匹配器的历史必须比特征用的 lookback 长
 """
 
 import sqlite3
@@ -491,6 +493,69 @@ def test_score_pool_enhance_only_top_n(db, monkeypatch):
     assert details[2].prob_up is None
 
 
+def test_enhancer_reads_longer_history_than_feature_lookback(db, monkeypatch):
+    """回归：喂给形态匹配的历史必须长于量价特征用的 `lookback`。
+
+    实测踩过：只喂 250 行时每只票仅剩 1~3 个候选窗口（窗口 20 日、
+    要求相关系数 >= 0.5），胜率于是塌成 0%/100% 端点值 ——
+    表现为「评分很高、胜率却是 0%」，看代码却查不出错。
+    """
+    seen: dict[str, int] = {}
+    real = scorer.read_price_series
+
+    def spy(db_path, symbols, lookback):
+        seen["lookback"] = lookback
+        return real(db_path, symbols, lookback)
+
+    monkeypatch.setattr(scorer, "read_price_series", spy)
+    monkeypatch.setattr(scorer, "load_quant_skill", lambda _p: (lambda *a, **k: {}, lambda *a: {}))
+
+    scorer.score_pool(
+        ["AAA"], db_path=db, lookback=scorer.LOOKBACK, enhance_top=1, skill_path="/x"
+    )
+    assert seen["lookback"] >= scorer.ENHANCE_LOOKBACK > scorer.LOOKBACK
+
+
+def test_feature_lookback_unchanged_without_enhancement(db, monkeypatch):
+    """不增强时不额外读历史：特征口径与读库量都保持原样。"""
+    seen: dict[str, int] = {}
+    real = scorer.read_price_series
+
+    def spy(db_path, symbols, lookback):
+        seen["lookback"] = lookback
+        return real(db_path, symbols, lookback)
+
+    monkeypatch.setattr(scorer, "read_price_series", spy)
+    scorer.score_pool(["AAA"], db_path=db, lookback=scorer.LOOKBACK, enhance_top=0)
+    assert seen["lookback"] == scorer.LOOKBACK
+
+
+def test_drawdown_keeps_feature_window(tmp_path, monkeypatch):
+    """形态匹配吃长历史，但最大回撤仍按 `lookback` 窗口算。
+
+    否则同一只票的「回撤」会从 -21% 跳到 -46%（全历史最深），
+    与旧报告和阈值设定都不可比。
+    """
+    long_db = write_db(tmp_path, {"AAA": make_rows("AAA", 400, daily=0.004)})
+    seen: dict[str, int] = {}
+
+    def fake_forecast(closes, horizon=5):
+        seen["forecast"] = len(closes)
+        return {"prob_up": 60.0, "data_mode": "ok"}
+
+    def fake_drawdown(closes):
+        seen["drawdown"] = len(closes)
+        return {"max_drawdown": 0.1}
+
+    monkeypatch.setattr(scorer, "load_quant_skill", lambda _p: (fake_forecast, fake_drawdown))
+    scorer.score_pool(
+        ["AAA"], db_path=long_db, lookback=scorer.LOOKBACK, enhance_top=1, skill_path="/x"
+    )
+
+    assert seen["forecast"] == 400  # 全历史都喂给形态匹配
+    assert seen["drawdown"] == scorer.LOOKBACK  # 回撤只到特征窗口
+
+
 def test_enhance_ignores_degraded_pattern_result(db):
     """工具降级返回（data_mode 非 ok）时不能把占位值当真实胜率。"""
     rows = scorer.read_price_series(db, ["AAA"])["AAA"]
@@ -507,6 +572,57 @@ def test_enhance_ignores_degraded_pattern_result(db):
     assert enhanced.prob_up is None  # 降级值不入库
     assert enhanced.max_drawdown == pytest.approx(25.0)  # 回撤照常可用
     assert enhanced.adjusted == detail.adjusted  # 基础分不受影响
+
+
+def test_enhance_uses_match_window_count_as_denominator(db):
+    """回归：`prob_samples` 取「相似窗口数」(`len(matches)`)，不是候选总数。
+
+    工具里 `prob_up = k / len(matches) * 100`（只保留最像的 top_k=5 个窗口），
+    而 `n_matches` 是通过相似度门槛的候选总数 —— 两者混用会写出
+    「20% 却显示 1/7」这种假分数。
+    """
+    rows = scorer.read_price_series(db, ["AAA"])["AAA"]
+    detail = scorer.build_detail("AAA", rows)
+    assert detail is not None
+
+    def fake_forecast(closes, horizon=5):
+        return {
+            "prob_up": 20.0,  # = 1/5
+            "predicted_pct": 1.0,
+            "data_mode": "ok",
+            "n_matches": 7,  # 候选总数：明显多于窗口数
+            "confidence": 55.0,
+            "matches": [
+                {"start": i, "similarity": 0.9, "forward_pct": fp}
+                for i, fp in enumerate([1.0, -2.0, -1.0, -3.0, 0.5])
+            ],
+        }
+
+    def fake_drawdown(closes):
+        return {"max_drawdown": 0.1}
+
+    enhanced = scorer._enhance(detail, [r[3] for r in rows], (fake_forecast, fake_drawdown))
+    assert enhanced.prob_samples == 5  # k/n 的 n
+    assert enhanced.prob_candidates == 7  # 候选数单独存，别混进分母
+    assert enhanced.prob_confidence == pytest.approx(55.0)
+
+
+def test_enhance_without_matches_leaves_window_count_none(db):
+    """工具没给 `matches` 时窗口数保持 None（而不是 0），免得渲染出「0/0」。"""
+    rows = scorer.read_price_series(db, ["AAA"])["AAA"]
+    detail = scorer.build_detail("AAA", rows)
+    assert detail is not None
+
+    def fake_forecast(closes, horizon=5):
+        return {"prob_up": 66.7, "predicted_pct": 2.0, "data_mode": "ok"}
+
+    def fake_drawdown(closes):
+        return {"max_drawdown": 0.1}
+
+    enhanced = scorer._enhance(detail, [r[3] for r in rows], (fake_forecast, fake_drawdown))
+    assert enhanced.prob_up == pytest.approx(66.7)
+    assert enhanced.prob_samples is None
+    assert enhanced.prob_candidates is None
 
 
 def test_enhance_swallows_tool_exceptions(db):

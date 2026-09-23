@@ -48,6 +48,20 @@ logger = get_logger(__name__)
 # 每只股票回看的交易日数。250 ≈ 一年，够算 120 日均线与年内高点位置。
 LOOKBACK = 250
 
+# 增强层（`quick_pattern_forecast`）单独的回看长度，**刻意比 LOOKBACK 长**。
+#
+# 形态匹配是在历史上找「与最近 20 日走势相似」的窗口（窗口 20 日、要求
+# 相关系数 >= 0.5），再统计这些窗口之后 5 日的涨跌。候选窗口数直接取决于
+# 喂进去多少历史：只喂 250 行时实测每只只有 **1~3 个**窗口能通过门槛，
+# 于是 `prob_up` 只能取 0/100 这类端点值（分母就是窗口数，1~3 个时
+# 根本谈不上比例）—— 这正是「评分很高、胜率却是 0%」的主因。
+# 喂全历史（库里中位 662 行）后候选数升到 4~14、窗口数补满 5，
+# 胜率变成 20%~80% 的连续分布，置信度也大致翻倍（实测 25.7 → 56.0）。
+#
+# 特征计算仍用 `LOOKBACK`（区间高点、MA120 等口径不能跟着变），
+# 所以这里只影响「喂给增强层的那一串收盘价」。
+ENHANCE_LOOKBACK = 750
+
 # 少于该行数直接跳过：算不出 MA60 与区间位置，硬算会给出误导性分数。
 # 130 = MA120 窗口(120) + 计算偏离所需的缓冲。
 MIN_ROWS = 130
@@ -101,11 +115,17 @@ class ScoreDetail:
     prob_up: float | None = None  # 形态匹配胜率 %
     expected_pct: float | None = None  # 形态匹配预期涨跌幅 %
     max_drawdown: float | None = None  # 区间最大回撤 %
-    # 下面是胜率的两个「可信度陪衬」字段，缺了它们胜率就没法解读：
-    # `prob_up` 是 k/n 的离散值，实测 n 常只有 3~8（例如「100%」= 3 次里涨了 3 次）。
-    # 只给百分比时无法区分 3/3 与 5/5，也没法把「样本太少」的票排到后面。
-    prob_samples: int | None = None  # 形态匹配的样本数（n_matches）
-    prob_confidence: float | None = None  # 形态匹配可信度 0~100（相似度+样本量）
+    # 下面是胜率的三个「可解读性」字段 —— 缺了它们胜率就是个没法证伪的数字。
+    # 注意区分两个「样本」（读源码 `quantitative_pattern_predictor.py` 确认）：
+    #   · `prob_samples` = **实际参与算胜率的相似窗口数**，即 `len(matches)`。
+    #     窗口数上限是 `top_k=5`，所以 `prob_up` 只能是 0/20/40/60/80/100 这几档，
+    #     **它就是 k/n 里的 n**（1 时只能是 0% 或 100%，纯端点值）。
+    #   · `prob_candidates` = `n_matches`，通过相关系数门槛的**候选窗口总数**，
+    #     比窗口数多；它不进胜率公式，只喂给置信度的「样本量分」。
+    # 曾把两者混为一谈（拿 n_matches 当 n 显示），会出现「20% 却写成 1/7」这种错。
+    prob_samples: int | None = None  # 相似窗口数（k/n 的 n，≤ top_k=5）
+    prob_confidence: float | None = None  # 形态匹配可信度 0~100
+    prob_candidates: int | None = None  # 通过门槛的候选窗口数（n_matches）
 
     @property
     def score(self) -> float:
@@ -382,11 +402,26 @@ def load_quant_skill(skill_path: str):
     return quick_pattern_forecast, drawdown_report
 
 
-def _enhance(detail: ScoreDetail, closes: list[float], funcs) -> ScoreDetail:
-    """给单只股票补充形态胜率、可信度、样本数与最大回撤；任一步失败则保持原值。"""
+def _enhance(
+    detail: ScoreDetail,
+    closes: list[float],
+    funcs,
+    dd_closes: list[float] | None = None,
+) -> ScoreDetail:
+    """补充形态胜率、窗口数、候选数、可信度与最大回撤；失败则保持原值。
+
+    Args:
+        detail: 基础评分明细。
+        closes: 喂给形态匹配的收盘价序列（**要够长**，候选窗口数直接决定
+            胜率有几个档次可用，见 `ENHANCE_LOOKBACK`）。
+        funcs: `(quick_pattern_forecast, drawdown_report)`。
+        dd_closes: 算最大回撤用的序列，默认与 `closes` 相同。调用方会给它传
+            **较短的特征窗口**，让「回撤」列的口径（近 `LOOKBACK` 日）保持不变 ——
+            否则同一只票的回撤会从 -21% 跳到 -46%，和旧报告没法对比。
+    """
     quick_pattern_forecast, drawdown_report = funcs
     prob_up = expected = max_dd = None
-    samples = confidence = None
+    samples = confidence = candidates = None
 
     try:
         fc = quick_pattern_forecast(closes, horizon=5)
@@ -398,10 +433,15 @@ def _enhance(detail: ScoreDetail, closes: list[float], funcs) -> ScoreDetail:
             # 真实值 0.5（即 0.5%）会被误放大成 50%。
             if raw is not None and fc.get("data_mode") in (None, "ok"):
                 prob_up = float(raw)
-                # 样本数与可信度和 prob_up 同源，必须一起取、一起受 data_mode 约束，
-                # 否则会出现「胜率是真实值、样本数是降级值」的错配。
+                # 窗口数/候选数/可信度与 prob_up 同源，必须一起取、一起受
+                # data_mode 约束，否则会出现「胜率是真实值、样本数是降级值」的错配。
+                #
+                # 分母是 `len(matches)`（工具只保留相似度最高的 top_k=5 个），
+                # **不是** `n_matches`（那是通过门槛的候选总数，另一个量）。
+                matches = fc.get("matches") or []
+                samples = len(matches) if matches else None
                 n = fc.get("n_matches")
-                samples = int(n) if n is not None else None
+                candidates = int(n) if n is not None else None
                 conf = fc.get("confidence")
                 confidence = float(conf) if conf is not None else None
             exp = fc.get("predicted_pct")
@@ -410,7 +450,7 @@ def _enhance(detail: ScoreDetail, closes: list[float], funcs) -> ScoreDetail:
         logger.debug(f"评分增强：形态匹配失败（{detail.symbol}）：{exc}")
 
     try:
-        dd = drawdown_report(closes)
+        dd = drawdown_report(closes if dd_closes is None else dd_closes)
         if isinstance(dd, dict) and dd.get("max_drawdown") is not None:
             max_dd = float(dd["max_drawdown"]) * 100
     except Exception as exc:
@@ -425,6 +465,7 @@ def _enhance(detail: ScoreDetail, closes: list[float], funcs) -> ScoreDetail:
         max_drawdown=max_dd,
         prob_samples=samples,
         prob_confidence=confidence,
+        prob_candidates=candidates,
     )
 
 
@@ -450,7 +491,8 @@ def score_pool(
         metrics: 可选 {代码: StockMetric}，提供 PE 用于估值维度。
         holdings: 可选 {代码: 前十大流通股东合计占比 %}，提供筹码维度。
         tags: 可选 {代码: 策略标记字母}，提供策略共振维度。
-        lookback: 每只股票回看的交易日数。
+        lookback: 每只股票回看的交易日数（**只作用于量价特征**；
+            `enhance_top > 0` 时形态匹配会额外读满 `ENHANCE_LOOKBACK` 行）。
         enhance_top: 仅对排名前 N 名调用外部量化工具做增强；0 = 不增强。
         skill_path: 外部量化工具根目录；留空则不增强。
 
@@ -461,7 +503,13 @@ def score_pool(
     holdings = holdings or {}
     tags = tags or {}
 
-    series = read_price_series(db_path, symbols, lookback)
+    # 需要增强时多读一截历史：特征照旧只用最后 `lookback` 行（口径不变），
+    # 但形态匹配吃满 `ENHANCE_LOOKBACK` —— 候选窗口数直接决定 `prob_up`
+    # 有几个档次可用（详见 ENHANCE_LOOKBACK 的注释）。
+    need_enhance = enhance_top > 0 and bool(skill_path)
+    read_back = max(lookback, ENHANCE_LOOKBACK) if need_enhance else lookback
+
+    series = read_price_series(db_path, symbols, read_back)
     if not series:
         return []
 
@@ -470,7 +518,7 @@ def score_pool(
     for symbol, rows in series.items():
         detail = build_detail(
             symbol,
-            rows,
+            rows[-lookback:],
             metric=metrics.get(symbol),
             holding=holdings.get(symbol),
             tags=tags.get(symbol, ""),
@@ -485,7 +533,7 @@ def score_pool(
 
     details.sort(key=lambda d: (-d.adjusted, d.symbol))
 
-    if enhance_top > 0 and skill_path:
+    if need_enhance:
         funcs = None
         try:
             funcs = load_quant_skill(skill_path)
@@ -499,7 +547,13 @@ def score_pool(
                 rows = series.get(detail.symbol) or []
                 if len(rows) < 60:
                     continue
-                details[i] = _enhance(detail, [r[3] for r in rows], funcs)
+                # 形态匹配吃满历史；回撤仍按特征窗口算（口径与旧报告一致）。
+                details[i] = _enhance(
+                    detail,
+                    [r[3] for r in rows],
+                    funcs,
+                    dd_closes=[r[3] for r in rows[-lookback:]],
+                )
                 if details[i].prob_up is not None or details[i].max_drawdown is not None:
                     enhanced += 1
             top = min(enhance_top, len(details))

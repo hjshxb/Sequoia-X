@@ -417,10 +417,10 @@ def test_card_pattern_section_sorts_by_confidence_not_winrate() -> None:
     """可信度高的排前面，即使它的胜率更低 —— 这正是改排序口径的目的。"""
     notifier = FeishuNotifier(make_settings())
     scores = [
-        # 胜率满分但只有 1 个样本 ⇒ 可信度低，应排后面
+        # 胜率满分但只有 1 个窗口 ⇒ 只能是端点值，可信度低，应排后面
         make_score("600000", 90.0, prob_up=100.0, prob_samples=1, prob_confidence=22.0),
-        # 胜率一般但 7 个样本 ⇒ 可信度高，应排第一
-        make_score("600601", 60.0, prob_up=57.0, prob_samples=7, prob_confidence=55.0),
+        # 胜率一般但 5 个窗口都在 ⇒ 可信度高，应排第一
+        make_score("600601", 60.0, prob_up=60.0, prob_samples=5, prob_confidence=55.0),
     ]
     text = card_text(
         posted_card(notifier, {"MaVolumeStrategy": ["600000", "600601"]}, scores=scores)
@@ -428,7 +428,7 @@ def test_card_pattern_section_sorts_by_confidence_not_winrate() -> None:
 
     section = pattern_section(text)
     assert section.index("600601") < section.index("600000")
-    assert "**胜率 4/7**" in section and "**胜率 1/1**" in section
+    assert "**胜率 3/5**" in section and "**胜率 1/1**" in section
 
 
 def test_card_pattern_section_shows_k_over_n() -> None:

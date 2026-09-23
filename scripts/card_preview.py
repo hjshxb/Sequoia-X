@@ -95,16 +95,16 @@ _CELL_RE = re.compile(r'<td class="num">([^<]*)</td>')
 
 # 排行表「标记」列之后的列顺序（见 html_report._render_ranking）：
 #   旧报告：当日 / 20日 / 量比 / 距高 / MA20偏离 / 波动 / **胜率** / 回撤
-#   新报告：在上面基础上，胜率后插入 **样本** / **置信** 两列
-# ⚠️ 不能写死正向下标：旧报告没有「样本」「置信」，写死 7 会正好取到「回撤」，
+#   新报告：在上面基础上，胜率后插入 **窗口** / **置信** 两列
+# ⚠️ 不能写死正向下标：旧报告没有「窗口」「置信」，写死 7 会正好取到「回撤」，
 # 预览里就会出现「胜率 -21/-21」这种鬼值（2026-09-24 实测踩到）。
-# 改为**从行尾倒着数**（回撤永远是最末一列），并看表头有没有「样本」决定偏移。
+# 改为**从行尾倒着数**（回撤永远是最末一列），并看表头有没有「窗口」决定偏移。
 # 卡片新增的「形态匹配 Top 5」要用到这三个字段：`prob_up` 用于显示，
 # `prob_confidence` **用于排序**（缺了它预览顺序就跟真实卡片不一样），
 # `prob_samples` 用于把胜率显示成 `k/n`。
-_HAS_SAMPLE_COLS = "<th>样本</th>" in html
+_HAS_WINDOW_COLS = "<th>窗口</th>" in html
 
-if _HAS_SAMPLE_COLS:
+if _HAS_WINDOW_COLS:
     _WINRATE_IDX: int | None = -4
     _SAMPLES_IDX: int | None = -3
     _CONFIDENCE_IDX: int | None = -2
@@ -116,7 +116,7 @@ def _num_from_tail(tail: str, index: int | None) -> float | None:
     """从排行表行尾的 `<td class="num">` 里按（倒数）下标取值；缺列/「—」返回 None。
 
     `index` 为负表示从末尾数（`-1` = 最后一列）。传 `None` 表示这张报告
-    根本没有这一列（例如旧报告的「样本」「置信」）。
+    根本没有这一列（例如旧报告的「窗口」「置信」）。
     """
     if index is None:
         return None

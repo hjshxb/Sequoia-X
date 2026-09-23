@@ -170,7 +170,7 @@ def _fmt_pct(value: float | None, digits: int = 2, signed: bool = False) -> str:
 
 
 def _fmt_int(value: float | int | None) -> str:
-    """整数格式化（样本数、可信度这种没有小数的量）；缺失显示为「—」。"""
+    """整数格式化（窗口数、可信度这种没有小数的量）；缺失显示为「—」。"""
     if value is None:
         return "—"
     try:
@@ -179,6 +179,25 @@ def _fmt_int(value: float | int | None) -> str:
     except (TypeError, ValueError):
         return "—"
     return f"{round(float(value)):d}"
+
+
+def winrate_text(detail: ScoreDetail) -> str:
+    """胜率的展示文本：有窗口数时写成 `k/n`，否则退回百分比。
+
+    `prob_up` 就是 `k / len(matches) * 100`（读工具源码确认），所以 `k/n`
+    是**精确**还原、不是近似。分母是相似度最高的那 5 个窗口，**不是**候选总数
+    `prob_candidates` —— 把候选数当分母会写出「20% 却显示 1/7」这种假分数。
+
+    写成 `k/n` 是为了让人一眼看到分母有多小：`1/1` 和 `4/5` 都是「100%」，
+    但含义天差地别。窗口数缺失（旧报告 / 未启用增强）时保持百分比写法。
+
+    飞书卡片与 HTML 报告共用这一份实现（`feishu` 从本模块导入），
+    避免两处对同一字段各写一套格式化。
+    """
+    up = detail.prob_up or 0.0
+    if detail.prob_samples:
+        return f"{round(up / 100 * detail.prob_samples)}/{detail.prob_samples}"
+    return f"{up:.0f}%"
 
 
 class HtmlReportGenerator:
@@ -563,7 +582,7 @@ class HtmlReportGenerator:
         head = (
             "<th>#</th><th>代码</th><th>名称</th><th>板块</th><th>评分</th><th>标记</th>"
             "<th>当日</th><th>20日</th><th>量比</th><th>距高</th><th>MA20偏离</th>"
-            "<th>波动</th><th>胜率</th><th>样本</th><th>置信</th><th>回撤</th>"
+            "<th>波动</th><th>胜率</th><th>窗口</th><th>置信</th><th>回撤</th>"
         )
         body: list[str] = []
         for i, detail in enumerate(scores, 1):
@@ -576,11 +595,18 @@ class HtmlReportGenerator:
             if detail.penalty:
                 tips.append(f"惩罚 -{detail.penalty:.0f}")
             if detail.prob_up is not None:
-                tips.append(f"形态胜率 {detail.prob_up:.0f}%")
-            # 胜率必须带上样本数才可解读：`prob_up` 是 k/n 的离散值，
-            # 「100%」在 n=3 和 n=8 时含义天差地别。
-            if detail.prob_samples is not None:
-                tips.append(f"样本 {detail.prob_samples}")
+                # 胜率必须带上分母才可解读：「100%」在 1/1 和 4/5 时含义完全不同。
+                # 没有窗口数（旧数据）时不要写成「67%（67%）」这种重复。
+                if detail.prob_samples:
+                    tips.append(
+                        f"形态胜率 {winrate_text(detail)}（{detail.prob_up:.0f}%）"
+                    )
+                else:
+                    tips.append(f"形态胜率 {detail.prob_up:.0f}%")
+            if detail.prob_candidates is not None:
+                # 候选数（通过相似度门槛的窗口总数）≠ 胜率的分母（只取最像的 5 个），
+                # 它进的是置信度的「样本量分」，所以单独标注、别和窗口数混淆。
+                tips.append(f"候选窗口 {detail.prob_candidates}")
             if detail.prob_confidence is not None:
                 tips.append(f"匹配可信度 {detail.prob_confidence:.0f}")
             if detail.max_drawdown is not None:
