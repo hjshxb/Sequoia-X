@@ -62,6 +62,52 @@ def test_sync_workers_rejects_out_of_range(bad: int) -> None:
         )
 
 
+# ── 单次同步允许的未更新占比上限 ──
+
+
+def test_sync_max_fail_ratio_defaults_to_five_percent() -> None:
+    """默认 5%：正常交易日的缺失只有停牌股（几十只），远在这条线以内。"""
+    from sequoia_x.core.config import Settings
+
+    s = Settings(_env_file=None, feishu_webhook_url="https://example.com/hook")
+    assert s.sync_max_fail_ratio == 0.05
+
+
+def test_sync_max_fail_ratio_blank_falls_back_to_default() -> None:
+    """`.env` 里 `SYNC_MAX_FAIL_RATIO=` 留空视为未配置，回落 0.05。"""
+    from sequoia_x.core.config import Settings
+
+    s = Settings(
+        _env_file=None, feishu_webhook_url="https://example.com/hook", sync_max_fail_ratio=""
+    )
+    assert s.sync_max_fail_ratio == 0.05
+
+
+def test_sync_max_fail_ratio_accepts_zero_and_one() -> None:
+    """0 = 一只都不许缺（最严格）；1 = 不因缺失中止（等同关闭该保护）。"""
+    from sequoia_x.core.config import Settings
+
+    base = {"_env_file": None, "feishu_webhook_url": "https://example.com/hook"}
+    assert Settings(**base, sync_max_fail_ratio=0).sync_max_fail_ratio == 0.0
+    assert Settings(**base, sync_max_fail_ratio=1).sync_max_fail_ratio == 1.0
+
+
+@pytest.mark.parametrize("bad", [5, 50, -0.1, 1.5])
+def test_sync_max_fail_ratio_rejects_percent_style_input(bad: float) -> None:
+    """写成百分数（`5` 表示 5%）是最容易犯的错 —— 必须在启动时挡掉。
+
+    否则 `missing/requested > 5` 恒为假，保护会静默失效，等于没配。
+    """
+    from sequoia_x.core.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            feishu_webhook_url="https://example.com/hook",
+            sync_max_fail_ratio=bad,
+        )
+
+
 def test_ma_window_defaults_to_120() -> None:
     """均线窗口默认 120 个交易日。"""
     from sequoia_x.core.config import Settings

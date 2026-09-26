@@ -109,6 +109,12 @@ def main() -> None:
             logger.error(f"量化评分失败，本次报告与推送不含评分：{exc}")
 
     # 5. 汇总成一张卡片推送
+    # 数据状态：生产里由 main._format_data_status 生成；这里没有同步步骤，
+    # 就照同样的「日期 · 详情」形状如实写明是本地库现有数据 —— 卡片多这一行，
+    # 是为了让预览/测试也覆盖到它，而不是在测试模式下悄悄少一行。
+    latest = engine.get_market_latest_date()
+    data_status = f"{latest or '未知'} · 测试模式：未执行增量同步，使用本地库现有数据"
+
     if not any(results.values()):
         logger.info("所有策略均无选股结果，跳过飞书推送")
     else:
@@ -117,6 +123,7 @@ def main() -> None:
                 results,
                 filter_desc=universe.describe(brief=True).removeprefix("精筛："),
                 scores=ranking,
+                data_status=data_status,
             )
             logger.info("飞书汇总卡片推送完成")
         except Exception as exc:
@@ -129,8 +136,10 @@ def main() -> None:
         metrics=metrics,
         holdings=holdings,
         scores=ranking,
+        data_status=data_status,
     )
     logger.info(f"HTML 报告：{path.resolve()}")
+    logger.info(f"数据状态：{data_status}")
     logger.info("测试模式运行完成")
 
 

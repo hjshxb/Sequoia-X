@@ -19,9 +19,14 @@
 `feishu._composite_section`）。这里无需改逻辑 —— 综合分由 `feishu` 内部现算，
 本脚本只管把 `prob_up / prob_samples / prob_confidence` 三个字段喂全，
 缺一个综合分就会退化（胜率不当权重、预览顺序与真实卡片不符）。
+
+再一刀（同步完整性）：卡片摘要多一行「**数据日期：** …」，值来自
+`main._format_data_status`。这里从报告页首的 `<span class="status">` 还原 ——
+报告与卡片是同一份值渲染两次，所以必须传进去，不传预览就少一行。
 """
 
 import argparse
+import html as html_module
 import json
 import re
 import sys
@@ -217,11 +222,19 @@ feishu_module.stock_meta_module.load_stock_meta = lambda: meta  # type: ignore[a
 settings = Settings(_env_file=root / ".env")
 desc = UniverseFilter(settings=settings, engine=None).describe(brief=True).removeprefix("精筛：")
 
-card = FeishuNotifier(settings)._build_report_card(results, filter_desc=desc, scores=scores)
+# 数据状态：报告页首那个 `<span class="status">数据日期：…</span>` 里就是卡片要发的值。
+# 旧报告没有这一行 ⇒ 取到空串，卡片少一行（与当时的真实卡片一致）。
+status_match = re.search(r'<span class="status">数据日期：([^<]*)</span>', html)
+data_status = html_module.unescape(status_match.group(1)).strip() if status_match else ""
+
+card = FeishuNotifier(settings)._build_report_card(
+    results, filter_desc=desc, scores=scores, data_status=data_status
+)
 
 print("# 各策略只数：" + "、".join(f"{k} {len(v)}" for k, v in results.items()))
 print(f"# 命中策略数：{sum(1 for v in results.values() if v)} / {len(results)}")
 print(f"# 选股总数：{sum(len(v) for v in results.values())}")
+print(f"# 数据状态：{data_status or '（报告未记录）'}")
 print()
 print("=" * 72)
 for el in card["card"]["elements"]:

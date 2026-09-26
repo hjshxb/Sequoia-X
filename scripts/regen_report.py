@@ -126,6 +126,9 @@ path = HtmlReportGenerator(settings).generate(
     # 与 main.py 保持一致：仅在配置了筹码维度时展示该列，复用已加载的快照
     holdings=holdings,
     scores=ranking,
+    # 报告页首的日期是**运行日**，而这里的数据来自历史候选快照，必须写明，
+    # 否则一份重算出来的旧报告看起来就像「今天跑了盘」。
+    data_status=f"{DATE} · 候选快照重算（未联网增量同步）",
 )
 print()
 print(f"候选快照：{SRC}")

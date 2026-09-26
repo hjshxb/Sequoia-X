@@ -8,6 +8,10 @@
   --no-push                    # 只跑策略并生成本地 HTML 报告，跳过飞书推送
   --workers N                  # 覆盖 SYNC_WORKERS，指定增量同步的并发进程数（1~32）
                                # 默认取配置，未配置即单进程串行
+
+当日增量数据未就绪时（登录被拒 / 整批查询失败 / 一行没拿到 / 未更新占比超
+SYNC_MAX_FAIL_RATIO），主流程直接以退出码 1 终止：不生成报告、不推送飞书。
+宁可当天不出结果，也不用上一交易日的旧数据冒充当日选股结果。
 """
 
 import argparse
@@ -20,7 +24,7 @@ from sequoia_x.analysis.scorer import ScoreDetail, composite_score, score_from_s
 from sequoia_x.core.config import MAX_SYNC_WORKERS, get_settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data import stock_meta
-from sequoia_x.data.engine import BaostockUnavailable, DataEngine
+from sequoia_x.data.engine import BaostockUnavailable, DataEngine, SyncIncomplete, SyncStats
 from sequoia_x.data.universe_filter import UniverseFilter
 from sequoia_x.notify.feishu import FeishuNotifier
 from sequoia_x.notify.html_report import HtmlReportGenerator, build_symbol_marks
@@ -37,6 +41,32 @@ from sequoia_x.strategy.uptrend_limit_down import UptrendLimitDownStrategy
 # 必须早于任何 socket 建立 —— 放在 import 之后即可（导入阶段不会建连接）。
 # 注：这行刻意不夹在 import 中间，否则后面的 import 全会被判为 E402。
 socket.setdefaulttimeout(10.0)
+
+
+def _format_data_status(stats: SyncStats, latest_date: str | None) -> str:
+    """把本次同步结果压成一行「数据日期 + 更新情况」，随卡片与报告一起发出去。
+
+    拿到榜单的人最需要先确认两件事：**这份数据是哪一天的**、**全不全**。
+    标题里的日期只是**运行日**，数据却可能来自更早的交易日（非交易日重跑、
+    数据源当天未发布行情等），两者必须在页面上分得清。
+
+    返回的是**值**（`2026-09-24 · 全市场 5221 只已更新`），「数据日期：」这个
+    标签由渲染层补 —— 卡片用 lark_md、报告用 HTML，标签写法不同，但值一致。
+
+    Args:
+        stats: `sync_today_bulk()` 的返回值。
+        latest_date: 同步后库内全市场最新交易日（`get_market_latest_date()`）。
+
+    Returns:
+        形如 `2026-09-24 · 全市场 5221 只已更新` 的单行文本。
+    """
+    if stats.requested == 0:
+        detail = "无需更新（已是最新）"
+    elif stats.missing:
+        detail = f"更新 {stats.updated} 只，未更新 {stats.missing} 只（{stats.missing_ratio:.1%}）"
+    else:
+        detail = f"全市场 {stats.updated} 只已更新"
+    return f"{latest_date or '未知'} · {detail}"
 
 
 def main() -> None:
@@ -107,13 +137,18 @@ def main() -> None:
         # ── 日常模式：单次 API 补今天 + 策略 + 推送 ──
         logger.info("开始拉取最新快照...")
         try:
-            count = engine.sync_today_bulk()
-        except BaostockUnavailable as exc:
-            # 数据源不可用 ⇒ 直接终止。绝不拿上一交易日的旧数据照跑策略并推送，
+            stats = engine.sync_today_bulk()
+        except (BaostockUnavailable, SyncIncomplete) as exc:
+            # 数据源不可用（登录被拒 / 整批失败 / 一行没拿到），或拿到的数据不完整
+            # （未更新占比超阈值）⇒ 一律终止。绝不拿上一交易日的旧数据照跑策略并推送：
             # 那等于用陈旧数据冒充当日选股结果，比不出结果更糟。
-            logger.error(f"数据源不可用，本次不生成报告、不推送飞书：{exc}")
+            logger.error(f"当日数据未就绪，本次不生成报告、不推送飞书：{exc}")
             sys.exit(1)
-        logger.info(f"快照同步完成，写入 {count} 只股票")
+
+        # 「数据状态」一行随卡片与报告发出，让看榜单的人先知道数据是哪天的、全不全。
+        # 取同步**之后**的全市场 MAX(date)，即这批结果真正的数据基准日。
+        data_status = _format_data_status(stats, engine.get_market_latest_date())
+        logger.info(f"快照同步完成：{data_status}")
 
         # 4. 前置过滤：先算出全市场合格股票池，再交给各策略执行。
         #    精筛未启用时该池即全市场（零网络开销）；启用时分级执行
@@ -201,6 +236,7 @@ def main() -> None:
                     # 卡片可视长度（实测「前十大流通股东」曾被截掉）。
                     filter_desc=universe.describe(brief=True).removeprefix("精筛："),
                     scores=ranking,
+                    data_status=data_status,
                 )
             except Exception as exc:
                 logger.error(f"飞书推送异常，已忽略：{exc}")
@@ -217,6 +253,7 @@ def main() -> None:
                     metrics=metrics,
                     holdings=holdings,
                     scores=ranking,
+                    data_status=data_status,
                 )
                 logger.info(f"HTML 报告已生成：{report_path.resolve()}")
             except Exception as exc:

@@ -209,6 +209,34 @@ def test_totals_and_counts_in_header(gen):
     assert "策略命中：2 / 2" in text
 
 
+# ── 数据状态一行 ──
+# 页首的「日期」是**运行日**，数据可能来自更早的交易日（非交易日重跑、
+# 数据源当天未发布行情等）。单列一个「数据日期」标签，两者才不会被读成同一件事。
+
+
+def test_header_shows_data_status(gen):
+    out = gen.generate(
+        {"TurtleTradeStrategy": ["600000"]},
+        data_status="2026-09-24 · 全市场 5221 只已更新",
+    )
+    text = out.read_text(encoding="utf-8")
+    assert '<span class="status">数据日期：2026-09-24 · 全市场 5221 只已更新</span>' in text
+
+
+def test_header_omits_data_status_when_absent(gen):
+    """没传就不显示（离线重算等场景没有同步动作，不能凭空写一个日期）。"""
+    text = gen.generate({"TurtleTradeStrategy": ["600000"]}).read_text(encoding="utf-8")
+    assert 'class="status"' not in text
+
+
+def test_header_escapes_data_status(gen):
+    """数据状态会带 `%` 等字符，且终究来自外部文本 —— 必须走转义。"""
+    out = gen.generate({"TurtleTradeStrategy": ["600000"]}, data_status="<b>x</b> · 1%")
+    text = out.read_text(encoding="utf-8")
+    assert "&lt;b&gt;x&lt;/b&gt;" in text
+    assert "<b>x</b>" not in text
+
+
 # ── 全市场名称/行业表的拉取与缓存 ──
 
 

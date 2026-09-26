@@ -151,6 +151,7 @@ class FeishuNotifier:
         results: dict[str, list[str]],
         filter_desc: str = "",
         scores: Sequence[ScoreDetail] = (),
+        data_status: str = "",
     ) -> dict:
         """把 {策略类名: 代码列表} 渲染成一张飞书交互卡片。
 
@@ -161,6 +162,8 @@ class FeishuNotifier:
                 小节（按评分与胜率的综合分排序，见 `_composite_section`），
                 且各策略小节**内部**改按综合分名次排列（综合分口径唯一，
                 见 `scorer.composite_score`）。
+            data_status: 一行数据状态（由 `main._format_data_status` 生成），
+                说明这份榜单基于哪一天的行情、更新是否完整。空串则不显示。
 
         Returns:
             飞书 `msg_type=interactive` 的请求体。
@@ -174,6 +177,10 @@ class FeishuNotifier:
 
         summary = [f"**日期：** {today}", f"**命中策略：** {hit} / {len(results)}"]
         summary.append(f"**选股数量：** {total}")
+        # 数据状态紧跟「日期」，因为标题里的日期只是**运行日**，而数据可能来自
+        # 更早的交易日（非交易日重跑、数据源未发布当日行情等），必须让读者分得清。
+        if data_status:
+            summary.append(f"**数据日期：** {data_status}")
         if filter_desc:
             summary.append(f"**筛股条件：** {_elide(filter_desc)}")
 
@@ -252,6 +259,7 @@ class FeishuNotifier:
         filter_desc: str = "",
         webhook_key: str = "default",
         scores: Sequence[ScoreDetail] = (),
+        data_status: str = "",
     ) -> None:
         """把所有策略的选股结果汇总成一张卡片推送出去。
 
@@ -260,10 +268,13 @@ class FeishuNotifier:
             filter_desc: 精筛条件描述。
             webhook_key: 用于路由 Webhook；未配置专属地址时回退到默认地址。
             scores: 可选的量化评分（应按得分降序），用于生成高分榜与节内排序。
+            data_status: 一行数据状态（数据日期 + 更新完整性），空串则不显示。
 
         Raises:
             不抛出异常，HTTP 失败时记录 ERROR 日志。
         """
         url = self.settings.get_webhook_url(webhook_key)
-        payload = self._build_report_card(results, filter_desc, scores)
+        payload = self._build_report_card(
+            results, filter_desc, scores=scores, data_status=data_status
+        )
         self._post(url, payload, webhook_key, sum(len(v) for v in results.values()))

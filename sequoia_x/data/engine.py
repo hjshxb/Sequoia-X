@@ -1,6 +1,7 @@
 """数据引擎模块：负责 SQLite 行情数据存储与 baostock 增量同步。"""
 
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
@@ -39,11 +40,59 @@ class BaostockUnavailable(RuntimeError):
     """
 
 
-def _bs_fetch_batch(tasks: list) -> list:
+class SyncIncomplete(RuntimeError):
+    """本次同步没能凑出「当日可用」的数据（未更新占比超阈值，或库为空）。
+
+    与 `BaostockUnavailable` 分开，是因为排障方向不同：前者查网络与风控，
+    这个通常是个别节点异常、上游只发布了一部分，或本地库还没回填过。
+    上层的处理相同 —— 中止本次推送，绝不拿「一半是旧数据」的结果冒充当日选股结果。
+    """
+
+
+@dataclass(frozen=True)
+class SyncStats:
+    """一次增量同步的结果 —— 让上层能判断「这批数据够不够出结果」。
+
+    语义刻意拆成几个数，而不是只回一个「写入行数」：写入行数无法区分
+    「全市场本来就无需更新」（正常）和「发了 5000 只请求却一行没拿到」（故障）。
+    旧实现把两者都表示成 `return 0`，于是数据源当天没发布时，主流程会拿
+    上一交易日的数据照跑策略、并推一张日期写着今天的卡片。
+
+    Attributes:
+        requested: 本次判定**需要更新**的股票数（本地最新日期 < 今天的那些）。
+        updated: 实际拿到新行的股票数。
+        failed: 查询直接报错的股票数（是 `missing` 的一部分，另一部分是
+            「查询成功但当天无行情」，典型是停牌）。
+        rows: 实际写入数据库的**行数**。长休市后一只股票可能补多天，
+            所以行数 ≥ 股票数。
+    """
+
+    requested: int
+    updated: int
+    failed: int
+    rows: int
+
+    @property
+    def missing(self) -> int:
+        """未拿到新行的股票数：既含查询报错的，也含查得到但当天无行的（停牌）。"""
+        return max(0, self.requested - self.updated)
+
+    @property
+    def missing_ratio(self) -> float:
+        """未更新占比；本次无需更新（requested == 0）时为 0。"""
+        return self.missing / self.requested if self.requested else 0.0
+
+
+def _bs_fetch_batch(tasks: list) -> tuple[list, int]:
     """同步 worker：独立 login，批量拉取 baostock 数据。
 
     单进程模式下由 `sync_today_bulk` 直接调用（整份任务一次传入）；
     多进程模式下作为 `Pool.map` 的任务函数，每个分片各起一个进程。
+
+    Returns:
+        `(rows, failed)`：成功取到的行，以及查询直接报错的股票数。
+        把 `failed` 一并回传（而不是就地打个 warning 丢掉），是因为
+        「本次数据完不完整」必须由**全市场**维度判断，而单个分片看不到全局。
 
     Raises:
         BaostockUnavailable: 登录失败，或本批查询**全部**失败。
@@ -87,7 +136,7 @@ def _bs_fetch_batch(tasks: list) -> list:
     if failed:
         logger.warning(f"本批 {len(tasks)} 只中有 {failed} 只查询失败，已跳过")
 
-    return results
+    return results, failed
 
 
 class DataEngine:
@@ -98,6 +147,8 @@ class DataEngine:
         self.start_date: str = settings.start_date
         # 增量同步的并发进程数，默认 1（单进程串行）。见 config.MAX_SYNC_WORKERS 说明。
         self.sync_workers: int = settings.sync_workers
+        # 单次同步允许的「未更新占比」上限，超过即中止本次推送。见 config 里该字段的说明。
+        self.sync_max_fail_ratio: float = settings.sync_max_fail_ratio
         self._init_db()
 
     def _init_db(self) -> None:
@@ -223,12 +274,25 @@ class DataEngine:
 
     # ── 数据同步 ──
 
-    def sync_today_bulk(self) -> int:
+    def sync_today_bulk(self) -> SyncStats:
         """通过 baostock 拉取增量数据（后复权），写入 SQLite。
 
         并发度由 `SYNC_WORKERS` 控制，**默认 1（单进程串行）**。
         历史上 8 进程并发拉全市场曾触发 baostock 风控黑名单（10001011），
         故默认保守；需要提速时再手动调大 `SYNC_WORKERS`。
+
+        三种出口，上层据此决定「这批数据够不够出当日结果」：
+
+        1. **正常返回 `SyncStats`**：本次无需更新（`requested == 0`），
+           或已拿到新数据且未更新占比在阈值内（`sync_max_fail_ratio`）。
+        2. **抛 `BaostockUnavailable`**：登录被拒 / 整批查询全失败 /
+           发了 N 只请求却一行没拿到 —— 数据源没就绪。**未改动数据库。**
+        3. **抛 `SyncIncomplete`**：拿到了一部分，但未更新占比超阈值 ——
+           数据不完整。**未改动数据库。**
+
+        2、3 两种都必须在写库**之前**抛出：绝不能先落一半数据、再让上层
+        基于「一半是旧数据」的库跑策略。库为空（未做过 `--backfill`）同样
+        归入第 3 类 —— 没有任何可用数据时推报告毫无意义。
         """
         from datetime import date, timedelta
 
@@ -241,8 +305,9 @@ class DataEngine:
             ).fetchall()
 
         if not rows:
-            logger.warning("本地无股票数据，请先执行 --backfill")
-            return 0
+            raise SyncIncomplete(
+                "本地行情库为空，无法判断当日数据是否就绪；请先执行 --backfill 完成首次回填"
+            )
 
         for symbol, last_date in rows:
             if last_date and last_date >= today_str:
@@ -254,17 +319,21 @@ class DataEngine:
 
         if not tasks:
             logger.info("所有股票已是最新，无需更新")
-            return 0
+            return SyncStats(requested=0, updated=0, failed=0, rows=0)
 
         # 并发度：配置值 与 待更新股票数 取小，避免创建空分片。
         # 单进程时刻意不进 multiprocessing.Pool —— 省掉 fork 与任务序列化，
         # 且 baostock 的连接与报错都留在主进程，排障时日志是一条完整时间线。
         n_workers = max(1, min(self.sync_workers, len(tasks)))
 
+        # `failed` 必须跨分片累加后再判断：单个分片只看得到自己那几千只，
+        # 「本次数据完不完整」是**全市场**维度的结论（见下面的占比判定）。
+        all_rows: list = []
+        failed = 0
         try:
             if n_workers == 1:
                 logger.info(f"需要更新 {len(tasks)} 只股票，单进程串行拉取...")
-                all_rows = _bs_fetch_batch(tasks)
+                all_rows, failed = _bs_fetch_batch(tasks)
             else:
                 from multiprocessing import Pool
 
@@ -272,7 +341,9 @@ class DataEngine:
                 chunks = [tasks[i::n_workers] for i in range(n_workers)]
                 with Pool(n_workers) as pool:
                     batch_results = pool.map(_bs_fetch_batch, chunks)
-                all_rows = [row for batch in batch_results for row in batch]
+                for batch_rows, batch_failed in batch_results:
+                    all_rows.extend(batch_rows)
+                    failed += batch_failed
         except BaostockUnavailable as exc:
             # 数据源不可用必须显式失败并终止主流程，绝不能返回 0 ——
             # 返回 0 会让上层拿上一交易日的旧数据照跑策略并推送，
@@ -280,9 +351,16 @@ class DataEngine:
             logger.error(f"baostock 不可用，本次增量同步中止（未改动数据库）：{exc}")
             raise
 
+        # 「需要更新 N 只，却一行都没拿到」只可能是数据源当天还没发布（或整体异常），
+        # 绝不等于「今天没有信号」。旧实现这里只 log 一句就 `return 0`，主流程便把
+        # 上一交易日的数据当成今日结果跑了策略并推送 —— 卡片日期还写着今天。
+        # 注意：这与上面 `if not tasks` 是两件事，那个才是真正的「无需更新、正常」。
         if not all_rows:
-            logger.info("所有查询均成功但无新行（非交易日 / 数据源尚未更新）")
-            return 0
+            raise BaostockUnavailable(
+                f"需要更新 {len(tasks)} 只股票，但一条新数据都没取到"
+                "（数据源尚未发布当日行情 / 今天不是交易日 / 整体异常）；"
+                "判定为数据未就绪，本次不生成报告、不推送"
+            )
 
         df = pd.DataFrame(
             all_rows,
@@ -293,7 +371,20 @@ class DataEngine:
         df = df.dropna(subset=["close"])
         df = df[df["volume"] > 0]
 
+        # 用「拿到新行的**股票**数」而不是「查询报错的股票数」来算未更新占比：
+        # 停牌股查询是成功的、只是当天没有行情，同样是「这一只没更新」。
+        # 占比口径只在 `SyncStats` 里写一次，这里的判定与上层的展示同源。
         count = len(df)
+        stats = SyncStats(
+            requested=len(tasks), updated=df["symbol"].nunique(), failed=failed, rows=count
+        )
+        if stats.missing_ratio > self.sync_max_fail_ratio:
+            raise SyncIncomplete(
+                f"{stats.requested} 只待更新，其中 {stats.missing} 只未拿到新数据"
+                f"（{stats.missing_ratio:.1%}，超过上限 {self.sync_max_fail_ratio:.1%}）"
+                f"，判定为数据不完整；未改动数据库，本次不生成报告、不推送"
+            )
+
         with sqlite3.connect(self.db_path) as conn:
             for d in df["date"].unique().tolist():
                 conn.execute("DELETE FROM stock_daily WHERE date = ?", (d,))
@@ -302,8 +393,13 @@ class DataEngine:
             )
             conn.commit()
 
-        logger.info(f"sync_today_bulk: 写入 {count} 条数据")
-        return count
+        if stats.missing:
+            logger.warning(
+                f"本次有 {stats.missing} 只未拿到新数据"
+                f"（{stats.missing_ratio:.1%}），已按上限内继续"
+            )
+        logger.info(f"sync_today_bulk: 写入 {count} 条数据（覆盖 {stats.updated} 只股票）")
+        return stats
 
     def backfill(self, symbols: list[str]) -> None:
         """通过 baostock 批量回填历史日 K 线数据（后复权）。

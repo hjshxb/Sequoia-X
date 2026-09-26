@@ -296,6 +296,44 @@ def test_card_shows_summary_counts() -> None:
     assert "2" in text  # 选股总数
 
 
+# ── 数据状态一行 ──
+# 标题里的日期是**运行日**，数据却可能来自更早的交易日（非交易日重跑、
+# 数据源当天未发布行情等）。卡片必须把这件事写出来，否则读者会把
+# 「今天发的榜」直接等同于「今天的行情」。
+
+
+def test_card_shows_data_status_line() -> None:
+    """传入 data_status ⇒ 摘要里出现「数据日期：…」这一行。"""
+    notifier = FeishuNotifier(make_settings())
+    results = {"MaVolumeStrategy": ["600000"]}
+    card = posted_card(notifier, results, data_status="2026-09-24 · 全市场 5221 只已更新")
+
+    summary = card["card"]["elements"][0]["text"]["content"]
+    assert "**数据日期：** 2026-09-24 · 全市场 5221 只已更新" in summary
+
+
+def test_card_omits_data_status_line_when_absent() -> None:
+    """没传就不显示 —— 不要凭空造一个「数据日期」出来。"""
+    notifier = FeishuNotifier(make_settings())
+    card = posted_card(notifier, {"MaVolumeStrategy": ["600000"]})
+
+    summary = card["card"]["elements"][0]["text"]["content"]
+    assert "数据日期" not in summary
+
+
+def test_send_report_forwards_data_status_to_card() -> None:
+    """`send_report` 必须把 data_status 透传到卡片构建（漏传就是静默少一行）。"""
+    notifier = FeishuNotifier(make_settings())
+    with patch.object(FeishuNotifier, "_build_report_card", return_value={"card": {}}) as build:
+        with patch.object(FeishuNotifier, "_post"):
+            notifier.send_report(
+                {"MaVolumeStrategy": ["600000"]},
+                data_status="2026-09-24 · 无更新",
+            )
+
+    assert build.call_args.kwargs["data_status"] == "2026-09-24 · 无更新"
+
+
 # ── 综合评分榜（评分 + 胜率，单一栏目）──
 # 卡片只推**一个**「🎯 综合评分 Top 10」栏目。过去拆成「量化评分 Top 5」+
 # 「形态匹配 Top 5」两个榜：两个视角的名单经常不一致甚至反向（高分股胜率为 0、

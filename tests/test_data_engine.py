@@ -28,16 +28,26 @@ def make_engine_in(tmp_dir: str, **overrides: object) -> tuple[DataEngine, Setti
     return engine, settings
 
 
-def _seed_stale_rows(engine: DataEngine, symbols: list[str]) -> None:
-    """给每只股票塞一条很久以前的记录，使 sync_today_bulk 认为它们需要更新。"""
+def _seed_stale_rows(engine: DataEngine, symbols: list[str], when: str = "2000-01-01") -> None:
+    """给每只股票塞一条 `when`（默认很久以前）的记录，使它们被判定为需要更新。"""
     with sqlite3.connect(engine.db_path) as conn:
         conn.executemany(
             "INSERT INTO stock_daily "
             "(symbol, date, open, high, low, close, volume, turnover) "
             "VALUES (?,?,?,?,?,?,?,?)",
-            [(s, "2000-01-01", 1.0, 1.0, 1.0, 1.0, 1.0, 1.0) for s in symbols],
+            [(s, when, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0) for s in symbols],
         )
         conn.commit()
+
+
+def _fake_rows(symbols: list[str], when: str = "2026-09-24") -> list:
+    """构造 baostock 形态的行：`[symbol, date, open, high, low, close, volume, amount]`。
+
+    用独立函数而不是就地写 `[[s, ...]]`，是因为 `_bs_fetch_batch` 的替身散落在
+    多个用例里 —— 改字段顺序时只改这里，不必逐个用例对齐（数量：`volume > 0`
+    与 `close` 非空都必须满足，否则行会在落库前被过滤掉，占比判定随之失真）。
+    """
+    return [[s, when, "1", "2", "3", "4", "1000", "2000"] for s in symbols]
 
 
 def _count_rows(engine: DataEngine) -> int:
@@ -104,9 +114,9 @@ def test_sync_today_bulk_single_process_does_not_fork(monkeypatch) -> None:
 
         calls: list[list] = []
 
-        def fake_batch(tasks: list) -> list:
+        def fake_batch(tasks: list) -> tuple[list, int]:
             calls.append(list(tasks))
-            return []
+            return _fake_rows([t[0] for t in tasks]), 0
 
         def boom(*_args: object, **_kwargs: object) -> None:
             raise AssertionError("单进程模式不应创建 multiprocessing.Pool")
@@ -114,7 +124,9 @@ def test_sync_today_bulk_single_process_does_not_fork(monkeypatch) -> None:
         monkeypatch.setattr(engine_module, "_bs_fetch_batch", fake_batch)
         monkeypatch.setattr(multiprocessing, "Pool", boom)
 
-        assert engine.sync_today_bulk() == 0
+        stats = engine.sync_today_bulk()
+        assert stats.updated == 3
+        assert stats.missing == 0
         assert len(calls) == 1, "单进程应只调用一次 worker"
         assert {t[0] for t in calls[0]} == {"600000", "000001", "600519"}
 
@@ -128,9 +140,9 @@ def test_sync_today_bulk_single_process_covers_all_tasks(monkeypatch) -> None:
 
         seen: list[str] = []
 
-        def fake_batch(tasks: list) -> list:
+        def fake_batch(tasks: list) -> tuple[list, int]:
             seen.extend(t[0] for t in tasks)
-            return []
+            return _fake_rows([t[0] for t in tasks]), 0
 
         monkeypatch.setattr(engine_module, "_bs_fetch_batch", fake_batch)
         engine.sync_today_bulk()
@@ -158,7 +170,7 @@ def test_sync_today_bulk_multi_process_splits_into_requested_workers(monkeypatch
 
             def map(self, _fn: object, chunks: list) -> list:
                 observed["chunks"] = [list(c) for c in chunks]
-                return [[] for _ in chunks]
+                return [(_fake_rows([t[0] for t in c]), 0) for c in chunks]
 
         monkeypatch.setattr("multiprocessing.Pool", FakePool)
         engine.sync_today_bulk()
@@ -189,7 +201,7 @@ def test_sync_today_bulk_workers_capped_by_task_count(monkeypatch) -> None:
 
             def map(self, _fn: object, chunks: list) -> list:
                 observed["chunks"] = [list(c) for c in chunks]
-                return [[] for _ in chunks]
+                return [(_fake_rows([t[0] for t in c]), 0) for c in chunks]
 
         monkeypatch.setattr("multiprocessing.Pool", FakePool)
         engine.sync_today_bulk()
@@ -291,17 +303,22 @@ def test_fetch_batch_raises_when_every_query_fails(monkeypatch) -> None:
 
 
 def test_fetch_batch_returns_rows_on_success(monkeypatch) -> None:
-    """正常路径：登录成功 + 查询成功 ⇒ 返回带 symbol 前缀的行。"""
+    """正常路径：登录成功 + 查询成功 ⇒ 返回带 symbol 前缀的行，且 failed 为 0。"""
     fake = _FakeBaoStock(rows=[["2026-09-21", "1", "2", "3", "4", "5", "6"]])
     monkeypatch.setitem(sys.modules, "baostock", fake)
 
-    rows = engine_module._bs_fetch_batch(_TASKS[:1])
+    rows, failed = engine_module._bs_fetch_batch(_TASKS[:1])
     assert rows == [["600000", "2026-09-21", "1", "2", "3", "4", "5", "6"]]
+    assert failed == 0
     assert fake.logout_called is True
 
 
 def test_fetch_batch_tolerates_partial_query_failure(monkeypatch) -> None:
-    """部分查询失败属正常（退市/停牌等），不应整批判死。"""
+    """部分查询失败属正常（退市/停牌等），不应整批判死 —— 但失败数要如实回传。
+
+    `failed` 是判定「本次数据完不完整」的输入（全市场维度，见
+    `sync_today_bulk` 的占比阈值），就地丢一条 warning 就没人知道缺了多少。
+    """
 
     class _Flaky(_FakeBaoStock):
         def query_history_k_data_plus(self, code, *_a, **_kw):
@@ -313,8 +330,9 @@ def test_fetch_batch_tolerates_partial_query_failure(monkeypatch) -> None:
     fake = _Flaky()
     monkeypatch.setitem(sys.modules, "baostock", fake)
 
-    rows = engine_module._bs_fetch_batch(_TASKS)
+    rows, failed = engine_module._bs_fetch_batch(_TASKS)
     assert len(rows) == 2  # 3 只里 2 只成功
+    assert failed == 1
 
 
 def test_sync_today_bulk_propagates_unavailable_and_writes_nothing(monkeypatch) -> None:
@@ -326,7 +344,7 @@ def test_sync_today_bulk_propagates_unavailable_and_writes_nothing(monkeypatch) 
         engine, _ = make_engine_in(tmp_dir, sync_workers=1)
         _seed_stale_rows(engine, ["600000", "000001"])
 
-        def boom(_tasks: list) -> list:
+        def boom(_tasks: list) -> tuple[list, int]:
             raise engine_module.BaostockUnavailable("baostock 登录失败: 10001011 黑名单用户")
 
         monkeypatch.setattr(engine_module, "_bs_fetch_batch", boom)
@@ -337,14 +355,122 @@ def test_sync_today_bulk_propagates_unavailable_and_writes_nothing(monkeypatch) 
         assert _count_rows(engine) == before, "失败时不应改动数据库"
 
 
-def test_sync_today_bulk_returns_zero_only_on_genuine_no_new_data(monkeypatch) -> None:
-    """查询都成功但没有新行（非交易日）才是「无新数据」，此时返回 0。"""
+def test_sync_today_bulk_raises_when_requested_but_no_rows(monkeypatch) -> None:
+    """「发了 N 只请求却一行都没拿到」是失败，不是「今天没有信号」。
+
+    这是最初那个 bug 的正身：旧实现只 log 一句 `return 0`，主流程便拿上一
+    交易日的数据跑策略，还推一张日期写着今天的卡片。
+    """
     with tempfile.TemporaryDirectory() as tmp_dir:
         engine, _ = make_engine_in(tmp_dir, sync_workers=1)
-        _seed_stale_rows(engine, ["600000"])
+        _seed_stale_rows(engine, ["600000", "000001"])
 
-        monkeypatch.setattr(engine_module, "_bs_fetch_batch", lambda _tasks: [])
-        assert engine.sync_today_bulk() == 0
+        monkeypatch.setattr(engine_module, "_bs_fetch_batch", lambda _tasks: ([], 0))
+
+        before = _count_rows(engine)
+        with pytest.raises(engine_module.BaostockUnavailable):
+            engine.sync_today_bulk()
+        assert _count_rows(engine) == before, "数据未就绪时不应改动数据库"
+
+
+def test_sync_today_bulk_raises_when_incomplete_beyond_threshold(monkeypatch) -> None:
+    """拿到了一部分、但未更新占比超阈值 ⇒ SyncIncomplete，且不得写库。
+
+    典型场景：上游只发布了部分行情，或个别节点异常。此时照常推送，榜单就是
+    「一半新数据 + 一半旧数据」的混合体 —— 比不出结果更误导。
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir, sync_workers=1, sync_max_fail_ratio=0.05)
+        symbols = [f"60000{i}" for i in range(4)]
+        _seed_stale_rows(engine, symbols)
+
+        # 4 只里只回 3 只 ⇒ 缺 25%，远超 5% 上限
+        monkeypatch.setattr(
+            engine_module,
+            "_bs_fetch_batch",
+            lambda tasks: (_fake_rows([t[0] for t in tasks[:3]]), 0),
+        )
+
+        before = _count_rows(engine)
+        with pytest.raises(engine_module.SyncIncomplete) as exc_info:
+            engine.sync_today_bulk()
+        assert "25.0%" in str(exc_info.value)
+        assert _count_rows(engine) == before, "数据不完整时不应改动数据库"
+
+
+def test_sync_today_bulk_tolerates_missing_within_threshold(monkeypatch) -> None:
+    """正常停牌股造成的少量缺失必须放行 —— 否则每个交易日都会中止。
+
+    边界写成「**超过**上限才中止」：占比恰好等于阈值算通过，与配置项
+    `sync_max_fail_ratio` 的语义（上限）一致。
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir, sync_workers=1, sync_max_fail_ratio=0.05)
+        symbols = [f"60000{i}" for i in range(20)]
+        _seed_stale_rows(engine, symbols)
+
+        # 20 只里回 19 只 ⇒ 未更新 5%，正好在阈值上
+        monkeypatch.setattr(
+            engine_module,
+            "_bs_fetch_batch",
+            lambda tasks: (_fake_rows([t[0] for t in tasks[:19]]), 0),
+        )
+
+        stats = engine.sync_today_bulk()
+        assert stats.requested == 20
+        assert stats.updated == 19
+        assert stats.missing == 1
+        assert stats.missing_ratio == pytest.approx(0.05)
+        assert stats.rows == 19
+
+
+def test_sync_today_bulk_raises_on_empty_db_without_querying(monkeypatch) -> None:
+    """库为空（没做过 --backfill）同样是「数据没就绪」：中止，且一只都不许查。"""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir, sync_workers=1)
+
+        calls: list = []
+        monkeypatch.setattr(
+            engine_module, "_bs_fetch_batch", lambda tasks: (calls.append(tasks), ([], 0))[1]
+        )
+
+        with pytest.raises(engine_module.SyncIncomplete):
+            engine.sync_today_bulk()
+        assert calls == [], "库为空时不应向数据源发请求"
+
+
+def test_sync_today_bulk_reports_no_update_needed_without_network(monkeypatch) -> None:
+    """所有股票都已是今天的行 ⇒ 零请求、零写入，`requested == 0` 才是「正常无更新」。
+
+    与上面「需要更新却一行没拿到」严格区分：那个是故障，这个是正常态
+    （同一天重复跑、或手工触发）。
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir, sync_workers=1)
+        today = date.today().strftime("%Y-%m-%d")
+        _seed_stale_rows(engine, ["600000", "000001"], when=today)
+
+        def boom(_tasks: list) -> tuple[list, int]:
+            raise AssertionError("无需更新时不应向数据源发请求")
+
+        monkeypatch.setattr(engine_module, "_bs_fetch_batch", boom)
+
+        stats = engine.sync_today_bulk()
+        assert stats.requested == 0
+        assert stats.updated == 0
+        assert stats.rows == 0
+        assert stats.missing_ratio == 0.0
+
+
+def test_sync_stats_missing_and_ratio() -> None:
+    """`missing` / `missing_ratio` 是阈值判定的输入，边界必须准且不能除零。"""
+    partial = engine_module.SyncStats(requested=20, updated=19, failed=0, rows=19)
+    assert partial.missing == 1
+    assert partial.missing_ratio == pytest.approx(0.05)
+    # requested == 0（本次无需更新）时占比定义为 0，不能 ZeroDivisionError
+    idle = engine_module.SyncStats(requested=0, updated=0, failed=0, rows=0)
+    assert idle.missing == 0
+    assert idle.missing_ratio == 0.0
 
 
 # ── 最近两个交易日的行情（供「今日跌幅」维度使用）──

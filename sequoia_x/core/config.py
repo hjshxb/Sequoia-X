@@ -76,6 +76,18 @@ class Settings(BaseSettings):
     # 且建议先用小批量（如 --workers 2）观察是否稳定。
     sync_workers: int = 1
 
+    # 单次增量同步允许的「未更新占比」上限。超过即判定数据源异常、**中止本次推送**。
+    #
+    # 为什么需要一个容忍带，而不是「任何一只失败就中止」：`tasks` 里天然包含一批
+    # 查不到行情的票（长期停牌、已退市、新代码尚未上市），它们不是故障。若一刀切，
+    # 几乎每个交易日都会因为这几只而被判失败、整天没有结果。
+    # 反过来也不能像旧行为那样「只要不是全失败就照常推」—— 单进程时 tasks 有
+    # 5000+ 只，要 5000 只全挂才拦得住，中间地带（比如 2000 只失败）会被静默放过，
+    # 结果是拿一半旧数据算出来的名单冒充当日结果。
+    # 5% 是按「正常停牌股一般几十只」定的：5221 只里约 260 只的余量足够宽容，
+    # 又能挡住任何真正的数据源故障。0 = 任何未更新都不接受。
+    sync_max_fail_ratio: float = 0.05
+
     # ── 股票静态信息缓存（代码 → 名称 / 行业）──
     # 名称与行业几乎不变，但旧实现每次运行都要多一次 baostock login + 一次
     # 全市场请求。现在落盘到行情库的 stock_meta 表（复用 db_path），
@@ -153,6 +165,22 @@ class Settings(BaseSettings):
         """并发进程数必须落在 1~MAX_SYNC_WORKERS：0/负数无意义，过大易触发风控。"""
         if not 1 <= v <= MAX_SYNC_WORKERS:
             raise ValueError(f"sync_workers 必须在 1~{MAX_SYNC_WORKERS} 之间，当前为 {v}")
+        return v
+
+    @field_validator("sync_max_fail_ratio", mode="before")
+    @classmethod
+    def _blank_sync_max_fail_ratio_to_default(cls, v: object) -> object:
+        """`.env` 里 `SYNC_MAX_FAIL_RATIO=` 留空视为未配置，回落默认 0.05。"""
+        if isinstance(v, str) and v.strip() == "":
+            return 0.05
+        return v
+
+    @field_validator("sync_max_fail_ratio", mode="after")
+    @classmethod
+    def _check_sync_max_fail_ratio(cls, v: float) -> float:
+        """占比必须在 0~1：写成 `5`（百分数）是最容易犯的错，直接挡掉。"""
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(f"sync_max_fail_ratio 必须是 0~1 的比例，当前为 {v}（是不是写成了百分数？）")
         return v
 
     @field_validator("ma_window", mode="before")

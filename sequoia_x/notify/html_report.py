@@ -232,6 +232,7 @@ class HtmlReportGenerator:
         metrics: dict[str, StockMetric] | None = None,
         holdings: dict[str, float] | None = None,
         scores: Sequence[ScoreDetail] | None = None,
+        data_status: str = "",
     ) -> Path:
         """生成 HTML 报告并写入磁盘。
 
@@ -248,6 +249,9 @@ class HtmlReportGenerator:
                 名次排列（板块之间的先后顺序不变）。**顺序即传入顺序** ——
                 调用方（`scorer.score_from_settings`）已按综合分排好，
                 渲染层不再自己重排，避免两处口径漂移。
+            data_status: 「数据日期 + 更新情况」的值（由
+                `main._format_data_status` 生成）。标题里的日期只是运行日，
+                数据可能来自更早的交易日，故单独占一个标签。空串则不显示。
 
         Returns:
             实际写入的报告文件路径。
@@ -266,7 +270,9 @@ class HtmlReportGenerator:
         if missing:
             logger.warning(f"HTML 报告：{missing} 条记录缺少名称/行业，将显示为「—」")
 
-        content = self._render(results, meta, filter_desc, metrics, holdings, score_list)
+        content = self._render(
+            results, meta, filter_desc, metrics, holdings, score_list, data_status
+        )
 
         path = Path(output_path) if output_path else self.default_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -283,6 +289,7 @@ class HtmlReportGenerator:
         metrics: dict[str, StockMetric],
         holdings: dict[str, float] | None = None,
         scores: Sequence[ScoreDetail] = (),
+        data_status: str = "",
     ) -> str:
         today = date.today().strftime("%Y-%m-%d")
         total = sum(len(v) for v in results.values())
@@ -358,6 +365,13 @@ class HtmlReportGenerator:
         filter_line = (
             f'<span class="filter">{html.escape(filter_desc)}</span>' if filter_desc else ""
         )
+        # 「数据日期」单独一个标签：标题里的日期是**运行日**，数据可能来自更早的
+        # 交易日（非交易日重跑等），两者分开展示才不会被读成同一件事。
+        status_line = (
+            f'<span class="status">数据日期：{html.escape(data_status)}</span>'
+            if data_status
+            else ""
+        )
         ranking_html = self._render_ranking(scores, meta)
 
         return f"""<!DOCTYPE html>
@@ -404,6 +418,15 @@ class HtmlReportGenerator:
     border-radius: 4px;
     padding: 1px 8px;
     font-size: 12px;
+  }}
+  /* 数据状态用中性描边而不是强调色：它是要看清的事实，不是要吸引注意力的条件 */
+  .status {{
+    display: inline-block;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 8px;
+    font-size: 12px;
+    color: var(--text);
   }}
   .toolbar {{ margin: 18px 0 20px; }}
   #q {{
@@ -501,6 +524,7 @@ class HtmlReportGenerator:
       <span>日期：{today}</span>
       <span>策略命中：{hit_strategies} / {len(results)}</span>
       <span>合计选出：{total} 只</span>
+      {status_line}
       {filter_line}
     </div>
   </header>
