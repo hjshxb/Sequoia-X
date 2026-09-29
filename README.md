@@ -58,8 +58,8 @@ python main.py --backfill     # 回填模式：全市场历史K线一次性灌�
 | `MIN_PB` / `MAX_PB` | 市净率区间 | 倍 |
 
 ```bash
-# 只看 100 亿以上流通盘，且排除亏损股
-MIN_MARKET_CAP=100
+# 只看 50 亿以上流通盘，且排除亏损股
+MIN_MARKET_CAP=50
 MIN_PE=0
 ```
 
