@@ -42,7 +42,7 @@ def test_strategy_run_returns_list_of_str(symbols: list[str]) -> None:
     assert all(isinstance(s, str) and len(s) > 0 for s in result)
 
 
-# ── RPS 是横截面指标：精筛池对它必须完全无效（连最后一步交集也不做）──
+# ── RPS 是横截面指标：计算必须全市场，但结果照常过精筛 ──
 
 _RPS_ROWS = 130
 _RPS_BASE = 10.0
@@ -95,23 +95,25 @@ def make_rps_settings(db_path: str) -> Settings:
 
 
 class TestRpsUniverseInteraction:
-    """精筛池对 RPS 必须完全无效（全系统只有 RPS 是横截面指标）。
+    """RPS 的两段口径：**计算走全市场，结果过精筛**（全系统只有它一个横截面指标）。
 
-    其余策略都是逐股纵向指标，先精筛再算与「全市场算完再精筛」必然等价，
-    前置精筛对它们只是省算力。RPS 不一样：排名基数一旦缩到池内，每只票的
-    百分位会重排，语义就变了；而且「全市场强势股 ∩ 精筛池」会把池外的真·强势股
-    整批漏掉（2026-09-22 实测 71 只 → 25 只，且是前者的真子集）。
-    所以 `applies_universe_filter = False` —— 候选范围与最终结果都走全市场。
-    这两条测试把该语义钉住。
+    其余策略都是逐股纵向指标，先精筛再算与「全市场算完再精筛」必然等价，前置精筛
+    对它们只是省算力。RPS 不一样：它必须先在**全市场**排名算百分位（基数一缩到
+    池内，每只票的 RPS 就重排了），但算完之后与其他策略完全一样，要过
+    `apply_universe_filter()` 这道精筛 —— 当日强势不等于符合选股条件。
+
+    这几条测试把两个方向都钉住：池**不能**改变排名基数，但**必须**裁剪结果。
     """
 
-    def test_pool_does_not_change_rps_result(self, tmp_path) -> None:
-        """★ 核心回归：注入精筛池不得改变 RPS 的结果。
+    def test_pool_trims_result_without_changing_ranking(self, tmp_path) -> None:
+        """★ 核心回归：池只裁剪结果，绝不参与排名。
 
-        技巧：先把**全市场**当池子注入，`apply_universe_filter` 若真生效会退化为
-        恒真，于是拿到的是策略自己算出的纯全市场候选集（无需在测试里重写策略逻辑，
-        否则测的就只是「我的复刻对不对」）。再拿一个真子集当池子跑一次，
-        两次结果必须逐元素相同 —— 不同就说明池子又在「预选筛出」了。
+        技巧：先把**全市场**当池子注入，`apply_universe_filter` 退化为恒真，于是拿到
+        策略自己算出的纯全市场候选集（无需在测试里复刻策略逻辑，否则测的只是「我的
+        复刻对不对」）。再拿一个真子集当池子跑一次，结果必须恰好等于「候选 ∩ 池」。
+
+        两个方向都会变红：退化成池内排名 ⇒ 池内的 000003 会因「池内第一」而入选；
+        结果不套精筛 ⇒ 池外的 000027/000029 会留在结果里。
         """
         engine = make_rps_engine(tmp_path)
         settings = make_rps_settings(engine.db_path)
@@ -126,7 +128,22 @@ class TestRpsUniverseInteraction:
         pooled = RpsBreakoutStrategy(engine=engine, settings=settings)
         pooled.set_universe(pool)
 
-        assert pooled.run() == candidates
+        assert pooled.run() == [s for s in candidates if s in set(pool)]
+
+    def test_full_market_strong_but_outside_pool_is_excluded(self, tmp_path) -> None:
+        """池外的全市场强势股不进最终榜单 —— 「结果过精筛」的最直接断言。
+
+        池里只放一只中等涨幅股（000010，全市场 RPS 约 36.7%），它够不到 90 的门槛，
+        所以候选为空；而全市场算出的 000026~000029 四只全都不在池内，被精筛剔掉。
+        「结果不套精筛」的实现会返回那 4 只 ⇒ 本测试失败。
+        """
+        engine = make_rps_engine(tmp_path)
+        strategy = RpsBreakoutStrategy(
+            engine=engine, settings=make_rps_settings(engine.db_path)
+        )
+        strategy.set_universe([_rps_symbol(10)])
+
+        assert strategy.run() == []
 
     def test_pool_member_without_full_market_strength_is_not_selected(
         self, tmp_path

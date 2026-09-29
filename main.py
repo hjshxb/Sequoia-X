@@ -191,8 +191,9 @@ def main() -> None:
         ]
         for strategy in strategies:
             # 注入的是「候选范围」：各策略用 candidate_symbols() 取池以省算力。
-            # 个别策略可声明 `applies_universe_filter = False` 完全豁免精筛
-            # （目前只有 RPS —— 横截面指标，排名基数与结果都必须是全市场）。
+            # ⚠️ RPS 刻意不读这个池（横截面指标必须先在全市场排名），但它的**结果**
+            # 照样走 apply_universe_filter() 与池取交集。两段口径见 RpsBreakoutStrategy
+            # 的类文档，别把「它没用池子算」误读成「它不受精筛约束」。
             strategy.set_universe(universe_pool)
 
         notifier = FeishuNotifier(settings)
