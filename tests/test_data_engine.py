@@ -66,9 +66,14 @@ def test_unique_symbol_date_constraint(symbol: str, trade_date: date) -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         engine, _ = make_engine_in(tmp_dir)
         row = {
-            "symbol": symbol, "date": str(trade_date),
-            "open": 10.0, "high": 11.0, "low": 9.0, "close": 10.5,
-            "volume": 1000.0, "turnover": 10500.0,
+            "symbol": symbol,
+            "date": str(trade_date),
+            "open": 10.0,
+            "high": 11.0,
+            "low": 9.0,
+            "close": 10.5,
+            "volume": 1000.0,
+            "turnover": 10500.0,
         }
         df = pd.DataFrame([row])
         with sqlite3.connect(engine.db_path) as conn:
@@ -245,11 +250,17 @@ class _FakeBaoStock:
         login_msg: str = "success",
         query_code: str = "0",
         rows: list | None = None,
+        calendar_rows: list | None = None,
+        calendar_code: str = "0",
     ) -> None:
         self.login_code = login_code
         self.login_msg = login_msg
         self.query_code = query_code
         self.rows = rows or []
+        # 交易日历（`query_trade_dates`）单独一套返回值：它与行情查询是两条互不相干的
+        # 接口，共用 `rows` 会让「日历失败」的用例顺手把行情也弄坏，测的东西就不纯了。
+        self.calendar_rows = calendar_rows or []
+        self.calendar_code = calendar_code
         self.query_calls: list[str] = []
         self.logout_called = False
 
@@ -262,6 +273,12 @@ class _FakeBaoStock:
     def query_history_k_data_plus(self, code: str, *_a: object, **_kw: object) -> _FakeResultSet:
         self.query_calls.append(code)
         return _FakeResultSet(self.rows, self.query_code, "查询失败")
+
+    def query_trade_dates(self, start_date: str, end_date: str) -> _FakeResultSet:
+        # 前缀与股票代码区分开：既有的 `query_calls == []` 断言（登录失败不许空发请求）
+        # 在日历接口存在后依然成立。
+        self.query_calls.append(f"trade_dates:{start_date}~{end_date}")
+        return _FakeResultSet(self.calendar_rows, self.calendar_code, "日历查询失败")
 
 
 _TASKS = [(f"60000{i}", f"sh.60000{i}", "2026-09-19", "2026-09-21") for i in range(3)]
@@ -424,6 +441,41 @@ def test_sync_today_bulk_tolerates_missing_within_threshold(monkeypatch) -> None
         assert stats.rows == 19
 
 
+def test_missing_ratio_is_measured_against_the_whole_universe(monkeypatch) -> None:
+    """★ 核心回归：未更新占比的分母必须是**全市场股票数**，不是「本次待更新的那几只」。
+
+    场景 = 同一天重跑。绝大多数股票已经是最新的 ⇒ `requested` 会塌缩成少数几只
+    长期停牌股；若拿它当分母，这几只停牌股就会算出 100%，把一次完全正常的重跑
+    判成「数据不完整」并中止主流程。
+
+    实测（2026-09-29）：18:30 首次跑 12/5221 = 0.2% 通过；20:36 回补后重跑
+    12/12 = 100% 被拦，报告出不来。
+
+    构造：1000 只已是今天的行（本次不参与拉取）+ 12 只陈旧，其中 6 只拿不到新行。
+    正确口径 6/1012 ≈ 0.6% ⇒ 放行；错误口径 6/12 = 50% ⇒ 抛 SyncIncomplete。
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir, sync_workers=1, sync_max_fail_ratio=0.05)
+        today = date.today().strftime("%Y-%m-%d")
+        _seed_stale_rows(engine, [f"0000{i:02d}" for i in range(1000)], when=today)
+        _seed_stale_rows(engine, [f"60000{i}" for i in range(12)])
+
+        # 12 只陈旧股里只回 6 只（其余当天无行情，典型停牌）
+        monkeypatch.setattr(
+            engine_module,
+            "_bs_fetch_batch",
+            lambda tasks: (_fake_rows([t[0] for t in tasks[:6]]), 0),
+        )
+
+        stats = engine.sync_today_bulk()
+
+        assert stats.requested == 12
+        assert stats.updated == 6
+        assert stats.missing == 6
+        assert stats.universe == 1012
+        assert stats.missing_ratio == pytest.approx(6 / 1012)
+
+
 def test_sync_today_bulk_raises_on_empty_db_without_querying(monkeypatch) -> None:
     """库为空（没做过 --backfill）同样是「数据没就绪」：中止，且一只都不许查。"""
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -545,3 +597,382 @@ def test_get_recent_rows_empty_input_returns_empty() -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         engine, _ = make_engine_in(tmp_dir)
         assert engine.get_recent_rows([], rows=2) == {}
+
+
+# ── 写库粒度：只能删「本批要写的 (symbol, date)」──
+
+
+def _rows_on(engine: DataEngine, when: str) -> set[str]:
+    """返回某个日期在库里的股票代码集合。"""
+    with sqlite3.connect(engine.db_path) as conn:
+        return {
+            row[0] for row in conn.execute("SELECT symbol FROM stock_daily WHERE date = ?", (when,))
+        }
+
+
+def test_sync_today_bulk_scopes_delete_to_fetched_pairs(monkeypatch) -> None:
+    """★ 回归：写库前只能删「本批真要写的 (symbol, date)」，不能按日期全表删。
+
+    个股同步窗口是 [本地最后日期 + 1, 今天]（`sync_today_bulk` 的 tasks 构造），
+    本地数据陈旧的股票会把窗口拉长、一次带回好几天前的行情。旧实现对窗口里每个
+    日期执行 `DELETE FROM stock_daily WHERE date = ?` —— **不限 symbol**，于是那几天
+    的**全市场行**被删掉，而本批只会 append 回这一只。
+
+    2026-09-29 事故：2 只 last_date 停在 9/23 的股票（300211/300532）把 9/24 从
+    1195 行削到 2 行、9/28 从 5208 行削到 1 行，全市场「上一交易日」前移到 9/23，
+    当日涨跌幅全部变成 2 日口径（000513 在主板写出 +16.23%）。
+
+    这里断言的核心是：**别的股票在这些日期上的行必须原样保留**。
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir, sync_workers=1)
+        stale, peers = "600001", ["600002", "600003"]
+        _seed_daily(
+            engine,
+            [(stale, "2026-09-23", 10.0)]
+            + [(s, d, 10.0) for s in peers for d in ("2026-09-24", "2026-09-28")],
+        )
+
+        def fake(tasks: list) -> tuple[list, int]:
+            """陈旧股的窗口是 9/24~今天，因此一次带回 9/24、9/28 两天的历史行。"""
+            rows: list = []
+            for symbol, *_ in tasks:
+                if symbol == stale:
+                    rows += _fake_rows([symbol], when="2026-09-24")
+                    rows += _fake_rows([symbol], when="2026-09-28")
+                rows += _fake_rows([symbol], when="2026-09-29")
+            return rows, 0
+
+        monkeypatch.setattr(engine_module, "_bs_fetch_batch", fake)
+        engine.sync_today_bulk()
+
+        assert stale in _rows_on(engine, "2026-09-24"), "陈旧股自己带回的 9/24 行应当写入"
+        assert set(peers) <= _rows_on(engine, "2026-09-24"), "9/24 上其它股票的历史行不得被误删"
+        assert set(peers) <= _rows_on(engine, "2026-09-28"), "9/28 上其它股票的历史行不得被误删"
+        assert stale in _rows_on(engine, "2026-09-29")
+
+
+# ── 唯一的幂等写库入口（增量同步与「按日期补洞」共用）──
+
+
+def _daily_frame(rows: list[tuple[str, str, float]]) -> pd.DataFrame:
+    """构造 `write_daily_rows` 需要的合法表：8 列齐全，其余字段用 close 占位。"""
+    return pd.DataFrame(
+        [(s, d, c, c, c, c, 1.0, 1.0) for s, d, c in rows],
+        columns=["symbol", "date", "open", "high", "low", "close", "volume", "turnover"],
+    )
+
+
+def test_write_daily_rows_overwrites_same_symbol_date() -> None:
+    """★ 补洞依赖的幂等性：同一 (symbol, date) 只留一行，且值被新数据覆盖。
+
+    `scripts/backfill_dates.py` 会对「只缺一部分日期」的股票再补一次，必须能覆盖
+    已有行而不是抛 UNIQUE 冲突。同时钉住删除范围是**本批的 (symbol, date) 对**，
+    不是整列 —— 同一天其它股票的历史不能被牵连（2026-09-29 事故的反面）。
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        _seed_daily(
+            engine,
+            [("600000", "2026-09-24", 10.0), ("600001", "2026-09-24", 10.0)],
+        )
+        assert engine.write_daily_rows(_daily_frame([("600000", "2026-09-24", 99.0)])) == 1
+        with sqlite3.connect(engine.db_path) as conn:
+            closes = dict(
+                conn.execute("SELECT symbol, close FROM stock_daily WHERE date = '2026-09-24'")
+            )
+        assert closes == {"600000": 99.0, "600001": 10.0}, "只得改动本批那只股票"
+
+
+def test_write_daily_rows_empty_frame_writes_nothing() -> None:
+    """空表直接返回 0：补洞时「这一批都没查到」不该报错，也不该动库。"""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        _seed_daily(engine, [("600000", "2026-09-24", 10.0)])
+        assert engine.write_daily_rows(pd.DataFrame()) == 0
+        assert _count_rows(engine) == 1
+
+
+# ── 库内最近交易日的完整性校验（按日行数）──
+
+
+def test_get_recent_date_counts_returns_descending_with_counts() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        _seed_daily(
+            engine,
+            [
+                ("600000", "2026-09-24", 10.0),
+                ("600000", "2026-09-28", 10.0),
+                ("000001", "2026-09-28", 10.0),
+                ("600000", "2026-09-29", 10.0),
+            ],
+        )
+        assert engine.get_recent_date_counts(2) == [("2026-09-29", 1), ("2026-09-28", 2)]
+        assert engine.get_recent_date_counts(0) == []
+
+
+def test_assert_recent_dates_complete_passes_on_healthy_history() -> None:
+    """正常的交易日之间行数只差几只，不该被误判成「有洞」。
+
+    顺带钉住边界：占比**恰好等于** `min_ratio` 算通过（与
+    `sync_max_fail_ratio` 的「超过才中止」语义一致）。
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        _seed_daily(
+            engine,
+            [(f"6000{i:02d}", "2026-09-29", 10.0) for i in range(10)]
+            + [(f"6000{i:02d}", "2026-09-28", 10.0) for i in range(9)],
+        )
+        engine.assert_recent_dates_complete()  # 不抛异常即通过
+
+
+def test_assert_recent_dates_complete_raises_when_recent_day_is_wiped() -> None:
+    """★ 核心回归：9/28 只剩 1 行而 9/29 有 2 行 ⇒ 判定有洞，必须中止。
+
+    这正是 2026-09-29 的库状态（9/29 有 5209 行、9/28 只剩 1 行）。
+    旧流程完全不查这个，于是拿 9/23 当「上一交易日」出了一份口径错乱的报告。
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        _seed_daily(
+            engine,
+            [("600000", "2026-09-28", 10.0)]
+            + [("600000", "2026-09-29", 10.0), ("600001", "2026-09-29", 10.0)],
+        )
+        with pytest.raises(engine_module.MarketHistoryIncomplete) as exc_info:
+            engine.assert_recent_dates_complete()
+        assert "2026-09-28" in str(exc_info.value)
+
+
+def test_assert_recent_dates_complete_only_looks_at_recent_window() -> None:
+    """窗口之外的旧洞不阻断当日播报，但 `days` 调大后能看见。"""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        _seed_daily(
+            engine,
+            [("600000", "2026-09-24", 10.0)]  # 更早的一天：只有 1 行
+            + [("600000", "2026-09-28", 10.0), ("600001", "2026-09-28", 10.0)]
+            + [("600000", "2026-09-29", 10.0), ("600001", "2026-09-29", 10.0)],
+        )
+        engine.assert_recent_dates_complete(days=2)
+        with pytest.raises(engine_module.MarketHistoryIncomplete):
+            engine.assert_recent_dates_complete(days=3)
+
+
+def test_assert_default_window_covers_holes_older_than_two_days() -> None:
+    """★ 核心回归：默认窗口必须覆盖「最长回看链」，而不是只看最近两天。
+
+    场景照抄 2026-09-29 的真实库况：9/24 只剩 1 行、9/28 只剩 2 行。
+    旧默认（days=2）只盯「今收 vs 昨收」，会**放行** 9/24 这个洞；但 9/24 是
+    250 日回撤 / MA120 / RPS120 都要横跨的交易日，洞在那里 ⇒ 所有这些滚动窗口
+    整体错位一天，而它们正是榜单上展示的列。所以默认窗口必须看得到它。
+
+    若把 `assert_recent_dates_complete` 的默认改回 2，本用例失败。
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        _seed_daily(
+            engine,
+            [("600000", "2026-09-24", 10.0)]
+            + [("600000", "2026-09-28", 10.0), ("600001", "2026-09-28", 10.0)]
+            + [("600000", "2026-09-29", 10.0), ("600001", "2026-09-29", 10.0)],
+        )
+        engine.assert_recent_dates_complete(days=2)  # 旧口径：放行（这就是缺陷）
+        with pytest.raises(engine_module.MarketHistoryIncomplete) as exc_info:
+            engine.assert_recent_dates_complete()
+        assert "2026-09-24" in str(exc_info.value)
+
+
+def test_required_history_days_covers_every_consumer() -> None:
+    """★ 防漂移：闸门窗口 >= 所有消费者的回看长度，且随 ma_window 自动放大。
+
+    窗口是个跨模块的约定，写死在 engine 里必然漂移。这条用例把「谁需要多长的
+    历史」钉成可执行的断言：任何一处上调窗口（评分 250 日特征、RPS 120、
+    精筛 MA_WINDOW）而忘了动 `REQUIRED_HISTORY_DAYS`，这里立刻红。
+    """
+    from sequoia_x.analysis.scorer import LOOKBACK
+    from sequoia_x.core.config import MAX_MA_WINDOW, REQUIRED_HISTORY_DAYS
+    from sequoia_x.strategy.rps_breakout import RpsBreakoutStrategy
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        window = engine.required_history_days()
+        assert window > LOOKBACK, "评分器的量价特征窗口比闸门窗口还长"
+        # RPS 既 shift(rps_period) 又 rolling(rps_period)，实际要吃约两倍
+        assert window > 2 * RpsBreakoutStrategy.rps_period, "RPS 的 120+120 没被覆盖"
+
+        widened, _ = make_engine_in(tmp_dir, ma_window=MAX_MA_WINDOW)
+        assert widened.required_history_days() > MAX_MA_WINDOW, "精筛 MA_WINDOW 可配到 500"
+
+        assert REQUIRED_HISTORY_DAYS > 2, "闸门窗口不能退化成「只看最近两天」"
+
+
+def test_assert_recent_dates_complete_skips_when_less_than_two_dates() -> None:
+    """库内不足两个交易日（首次回填中 / 空库）时不报错 —— 那是另一个出口管的事。"""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        engine.assert_recent_dates_complete()  # 空库
+        _seed_daily(engine, [("600000", "2026-09-29", 10.0)])
+        engine.assert_recent_dates_complete()  # 只有一个交易日
+
+
+# ── 行数判据的盲区：某交易日若是 0 行，`GROUP BY date` 根本不返回它 ──
+
+
+def _stub_calendar(engine: DataEngine, monkeypatch, calendar: list[str]) -> list[tuple[str, str]]:
+    """把 `fetch_trade_dates` 换成固定日历（测试不联网），返回它收到的查询区间。"""
+    calls: list[tuple[str, str]] = []
+
+    def fake(start: str, end: str) -> list[str]:
+        calls.append((start, end))
+        return [d for d in calendar if start <= d <= end]
+
+    monkeypatch.setattr(engine, "fetch_trade_dates", fake)
+    return calls
+
+
+def _seed_three_dates(engine: DataEngine) -> None:
+    """库内三个交易日：09-29 / 09-28 / 09-23（每日常规两只）。"""
+    _seed_daily(
+        engine,
+        [("600000", d, 10.0) for d in ("2026-09-29", "2026-09-28", "2026-09-23")]
+        + [("600001", d, 10.0) for d in ("2026-09-29", "2026-09-28", "2026-09-23")],
+    )
+
+
+def test_assert_no_missing_trading_days_flags_wholly_absent_day(monkeypatch) -> None:
+    """★ 核心回归：整日缺失必须被拦 —— 行数判据对它是完全瞎的。
+
+    库里有 09-29 / 09-28 / 09-23，而交易日历显示 09-24 也是交易日 ⇒ 09-24 整日没了。
+    因为它是 0 行，`get_recent_date_counts()` 里压根不会出现这一天，
+    所以 `assert_recent_dates_complete()` 会放行（三天行数一样多，看起来「很健康」）。
+    但涨跌幅、量比、MA 全都会跨过这一天，正是要防的那类错。
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        _seed_three_dates(engine)
+
+        # 先行数闸门：三天行数一致，它看不出问题
+        engine.assert_recent_dates_complete()
+
+        _stub_calendar(
+            engine, monkeypatch, ["2026-09-29", "2026-09-28", "2026-09-24", "2026-09-23"]
+        )
+        with pytest.raises(engine_module.MarketHistoryIncomplete) as exc:
+            engine.assert_no_missing_trading_days()
+        assert "2026-09-24" in str(exc.value)
+
+
+def test_assert_no_missing_trading_days_passes_and_scopes_query_to_window(
+    monkeypatch,
+) -> None:
+    """窗口内交易日齐全 ⇒ 放行；且日历只按窗口区间查，不请求全历史。"""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        _seed_three_dates(engine)
+        calls = _stub_calendar(engine, monkeypatch, ["2026-09-29", "2026-09-28", "2026-09-23"])
+
+        engine.assert_no_missing_trading_days()
+
+        assert calls == [("2026-09-23", "2026-09-29")], (
+            "查询区间必须恰好是「窗口最早日 ~ 库内最新日」"
+        )
+
+
+def test_assert_no_missing_trading_days_ignores_days_before_the_window(
+    monkeypatch,
+) -> None:
+    """窗口之外的旧缺失不阻断当日播报 —— 否则闸门会退化成「全库必须完整」。
+
+    库内历史只到 2024-01-02，若把日历里的每一天都要求存在，
+    更早的交易日会全部被判为「缺失」，闸门将永远无法放行。
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        _seed_three_dates(engine)
+        _stub_calendar(
+            engine,
+            monkeypatch,
+            ["2026-09-29", "2026-09-28", "2026-09-23", "2026-01-05"],
+        )
+
+        engine.assert_no_missing_trading_days()
+
+
+def test_assert_no_missing_trading_days_degrades_when_calendar_unavailable(
+    monkeypatch,
+) -> None:
+    """日历查不到时降级放行，但必须留下告警 —— 不能静默当作「核对通过」。
+
+    与「行数判据」的取舍不同：行数偏差是我们自己库里的硬故障，必须拦；
+    日历查不到只是数据源的临时问题，不该因此否定一次已经通过行数校验的同步。
+    代价是这个盲区在当天没有被覆盖 —— 所以告警必须明确写出来。
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        _seed_three_dates(engine)
+
+        def boom(_start: str, _end: str) -> list[str]:
+            raise engine_module.BaostockUnavailable("baostock 登录失败: 10001011 黑名单用户")
+
+        monkeypatch.setattr(engine, "fetch_trade_dates", boom)
+        warnings: list[str] = []
+        monkeypatch.setattr(engine_module.logger, "warning", warnings.append)
+
+        engine.assert_no_missing_trading_days()  # 不抛
+
+        assert len(warnings) == 1
+        assert "10001011" in warnings[0]
+
+
+def test_fetch_trade_dates_returns_only_open_days(monkeypatch) -> None:
+    """日历接口返回的是「每一天 + 是否交易日」，只留标志位为 1 的。"""
+    fake = _FakeBaoStock(
+        calendar_rows=[
+            ["2026-09-24", "1"],
+            ["2026-09-25", "0"],  # 休市
+            ["2026-09-28", "1"],
+        ]
+    )
+    monkeypatch.setitem(sys.modules, "baostock", fake)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        assert engine.fetch_trade_dates("2026-09-24", "2026-09-28") == [
+            "2026-09-24",
+            "2026-09-28",
+        ]
+
+
+def test_fetch_trade_dates_raises_on_login_failure_without_querying(monkeypatch) -> None:
+    """登录被拒时抛 `BaostockUnavailable`，且一个请求都不发。
+
+    与 `_bs_fetch_batch` 同一条纪律：登录失败而照发请求，会把一次故障放大成
+    「全市场重试风暴」，最终换来 10001011 黑名单。
+    """
+    fake = _FakeBaoStock(login_code="10001011", login_msg="黑名单用户，请与管理员联系")
+    monkeypatch.setitem(sys.modules, "baostock", fake)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        with pytest.raises(engine_module.BaostockUnavailable):
+            engine.fetch_trade_dates("2026-09-24", "2026-09-28")
+
+    assert fake.query_calls == [], "登录失败后不应再发日历请求"
+
+
+def test_fetch_trade_dates_raises_when_query_fails(monkeypatch) -> None:
+    """日历查询本身报错也抛异常。
+
+    不能返回空列表「假装没有休市日」—— 空列表会让上层把「数据源故障」
+    读成「核对不出问题」，正好是这条闸门要防的静默失效。
+    """
+    fake = _FakeBaoStock(calendar_code="10002007", calendar_rows=[])
+    monkeypatch.setitem(sys.modules, "baostock", fake)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        with pytest.raises(engine_module.BaostockUnavailable):
+            engine.fetch_trade_dates("2026-09-24", "2026-09-28")

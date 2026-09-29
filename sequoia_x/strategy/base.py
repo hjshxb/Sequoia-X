@@ -31,9 +31,14 @@ class BaseStrategy(ABC):
         webhook_key: 策略对应的飞书 webhook 标识，用于路由到不同机器人。
             默认为 'default'，将使用 Settings.feishu_webhook_url。
             子类可覆盖此属性以路由到专属机器人，例如 'ma_volume'。
+        applies_universe_filter: 是否把精筛池套在本策略的结果上。默认 True。
+            **只有 RPS 例外**：它是横截面（全市场百分位）指标，候选范围与排名基数
+            都必须是全市场，套上池子等于用「池内视角」覆盖「全市场结论」
+            （2026-09-22 实测：全市场 71 只，池内只剩 25 只，且是真子集 ⇒ 会静默漏股）。
     """
 
     webhook_key: str = "default"
+    applies_universe_filter: bool = True
 
     def __init__(self, engine: DataEngine, settings: Settings) -> None:
         """
@@ -81,12 +86,19 @@ class BaseStrategy(ABC):
         因为池子本身就是精筛结果，无需重复联网；对候选来自外部的策略
         （如定增公告，候选并非取自本地库）而言则等价于「只保留池内股票」。
 
+        例外：`applies_universe_filter is False` 的策略（目前只有 RPS）直接原样
+        返回。它必须保留全市场结果，否则「全市场强势股 ∩ 精筛池」会静默漏掉
+        池外的真·强势股（见类文档）。判据写在类属性上、而不是让子类少调一次
+        本方法，是为了让「哪些策略受精筛约束」在一个地方一眼可见。
+
         Args:
             symbols: 策略初步选出的股票代码列表。
 
         Returns:
-            过滤后的代码列表。未配置过滤条件时原样返回。
+            过滤后的代码列表。未配置过滤条件、或策略声明豁免精筛时原样返回。
         """
+        if not self.applies_universe_filter:
+            return list(symbols)
         if self._universe_set is not None:
             return [s for s in symbols if s in self._universe_set]
         return self.universe_filter.apply(symbols)

@@ -42,7 +42,7 @@ def test_strategy_run_returns_list_of_str(symbols: list[str]) -> None:
     assert all(isinstance(s, str) and len(s) > 0 for s in result)
 
 
-# ── RPS 是横截面指标：预筛池只能做最后一步的交集，绝不能改变排名基数 ──
+# ── RPS 是横截面指标：精筛池对它必须完全无效（连最后一步交集也不做）──
 
 _RPS_ROWS = 130
 _RPS_BASE = 10.0
@@ -95,41 +95,23 @@ def make_rps_settings(db_path: str) -> Settings:
 
 
 class TestRpsUniverseInteraction:
-    """精筛池与 RPS 的关系（全系统只有 RPS 是横截面指标）。
+    """精筛池对 RPS 必须完全无效（全系统只有 RPS 是横截面指标）。
 
     其余策略都是逐股纵向指标，先精筛再算与「全市场算完再精筛」必然等价，
     前置精筛对它们只是省算力。RPS 不一样：排名基数一旦缩到池内，每只票的
-    百分位会重排，语义就变了 —— 这两条测试把该语义钉住。
+    百分位会重排，语义就变了；而且「全市场强势股 ∩ 精筛池」会把池外的真·强势股
+    整批漏掉（2026-09-22 实测 71 只 → 25 只，且是前者的真子集）。
+    所以 `applies_universe_filter = False` —— 候选范围与最终结果都走全市场。
+    这两条测试把该语义钉住。
     """
 
-    def test_pool_member_without_full_market_strength_is_not_selected(
-        self, tmp_path
-    ) -> None:
-        """★ 核心回归：池内排名会选出「全市场根本不算强势」的股票。
+    def test_pool_does_not_change_rps_result(self, tmp_path) -> None:
+        """★ 核心回归：注入精筛池不得改变 RPS 的结果。
 
-        30 只股票涨幅 0%~29% ⇒ 全市场 RPS >= 90 只对应涨幅最高的 4 只
-        （000026~000029）。池里只放两只中等涨幅股：000005 涨 5%、000010 涨 10%，
-        它们在全市场的 RPS 分别只有约 20% 和 36.7%，都够不到 90。
-
-        正确实现：全市场候选 ∩ 池 = 空。
-        若改成池内排名：000010 在池内排第一（RPS = 100）会被选出 ⇒ 本测试失败。
-        """
-        engine = make_rps_engine(tmp_path)
-        strategy = RpsBreakoutStrategy(
-            engine=engine, settings=make_rps_settings(engine.db_path)
-        )
-        strategy.set_universe([_rps_symbol(5), _rps_symbol(10)])
-
-        assert strategy.run() == []
-
-    def test_result_equals_full_market_candidates_intersected_with_pool(
-        self, tmp_path
-    ) -> None:
-        """等价性：注入池后的结果 == 全市场 RPS 候选 ∩ 池。
-
-        技巧：把**全市场**当池子注入，`apply_universe_filter` 就退化为恒真，
-        于是拿到的是策略自己算出的纯全市场候选集，无需在测试里重写一遍策略逻辑
-        —— 否则测的就只是「我的复刻对不对」，而不是策略本身。
+        技巧：先把**全市场**当池子注入，`apply_universe_filter` 若真生效会退化为
+        恒真，于是拿到的是策略自己算出的纯全市场候选集（无需在测试里重写策略逻辑，
+        否则测的就只是「我的复刻对不对」）。再拿一个真子集当池子跑一次，
+        两次结果必须逐元素相同 —— 不同就说明池子又在「预选筛出」了。
         """
         engine = make_rps_engine(tmp_path)
         settings = make_rps_settings(engine.db_path)
@@ -144,4 +126,24 @@ class TestRpsUniverseInteraction:
         pooled = RpsBreakoutStrategy(engine=engine, settings=settings)
         pooled.set_universe(pool)
 
-        assert pooled.run() == [s for s in candidates if s in set(pool)]
+        assert pooled.run() == candidates
+
+    def test_pool_member_without_full_market_strength_is_not_selected(
+        self, tmp_path
+    ) -> None:
+        """池内的「全市场根本不算强势」的股票不得入选。
+
+        30 只股票涨幅 0%~29% ⇒ 全市场 RPS >= 90 只对应涨幅最高的 4 只
+        （000026~000029）。池里只放两只中等涨幅股：000005 涨 5%、000010 涨 10%，
+        它们在全市场的 RPS 分别只有约 20% 和 36.7%，都够不到 90。
+        若实现退化成池内排名，000010 会在池内排第一（RPS = 100）被选出。
+        """
+        engine = make_rps_engine(tmp_path)
+        strategy = RpsBreakoutStrategy(
+            engine=engine, settings=make_rps_settings(engine.db_path)
+        )
+        strategy.set_universe([_rps_symbol(5), _rps_symbol(10)])
+
+        selected = strategy.run()
+        assert _rps_symbol(5) not in selected
+        assert _rps_symbol(10) not in selected

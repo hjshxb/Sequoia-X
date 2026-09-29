@@ -1,12 +1,14 @@
 """数据引擎模块：负责 SQLite 行情数据存储与 baostock 增量同步。"""
 
+import contextlib
+import io
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
 
-from sequoia_x.core.config import Settings
+from sequoia_x.core.config import REQUIRED_HISTORY_DAYS, Settings
 from sequoia_x.core.logger import get_logger
 
 logger = get_logger(__name__)
@@ -49,6 +51,20 @@ class SyncIncomplete(RuntimeError):
     """
 
 
+class MarketHistoryIncomplete(SyncIncomplete):
+    """本地库里**最近的交易日**不完整（某天只有个位数行），数据本身有洞。
+
+    与 `SyncIncomplete` 分开是因为**判据完全不同**：那个看「本次同步拿到多少」，
+    这个看「库里已存的最近几天全不全」，而且后者**发生在写库之后**（所以不适用
+    「未改动数据库」那句话）。继承 `SyncIncomplete` 是为了让上层沿用同一个出口。
+
+    为什么必须单独查：写库是按日期组织的，某一天被整列清空后 `MAX(date)` 依然正常、
+    「数据日期」也照常显示今天，**只有按日行数能看出问题**。而「上一交易日」会因此
+    悄悄前移（2026-09-29 事故：9/28 只剩 1 行 ⇒ 全市场当日涨跌幅变成 2 日口径，
+    000513 在主板写出 +16.23%）。宁可当天不出结果，也不播报口径错误的数据。
+    """
+
+
 @dataclass(frozen=True)
 class SyncStats:
     """一次增量同步的结果 —— 让上层能判断「这批数据够不够出结果」。
@@ -65,12 +81,15 @@ class SyncStats:
             「查询成功但当天无行情」，典型是停牌）。
         rows: 实际写入数据库的**行数**。长休市后一只股票可能补多天，
             所以行数 ≥ 股票数。
+        universe: 库内全市场股票数 —— 未更新占比的**分母**，见 `missing_ratio`。
+            由调用方（`sync_today_bulk`）给出；手写构造时不传则退回 `requested`。
     """
 
     requested: int
     updated: int
     failed: int
     rows: int
+    universe: int = 0
 
     @property
     def missing(self) -> int:
@@ -79,8 +98,22 @@ class SyncStats:
 
     @property
     def missing_ratio(self) -> float:
-        """未更新占比；本次无需更新（requested == 0）时为 0。"""
-        return self.missing / self.requested if self.requested else 0.0
+        """未更新占比 = 未拿到新数据的股票数 ÷ 本次**应覆盖的全市场股票数**。
+
+        分母取 `max(requested, universe)`，**刻意不能就用 `requested`**：
+        `requested` 只是「本地最新日期 < 今天」的那部分股票，同一天重跑时会塌缩成
+        少数几只长期停牌股。拿它当分母，这几只停牌股就会算出 100%，
+        把一次完全正常的重跑判成「数据不完整」并中止主流程。
+        实测（2026-09-29）：18:30 首次跑 12/5221 = 0.2% 通过；
+        20:36 回补后重跑 12/12 = 100% 被拦，报告出不来。
+        `universe` 是库内全市场股票数，两次跑的分母一致，占比才可比。
+        回归测试：tests/test_data_engine.py（measured_against_the_whole_universe）。
+
+        `universe` 未提供（`0`，仅手写构造的调用点）时退回 `requested`，
+        与旧行为一致 —— 真实同步路径一定带上它。
+        """
+        denominator = max(self.requested, self.universe)
+        return self.missing / denominator if denominator else 0.0
 
 
 def _bs_fetch_batch(tasks: list) -> tuple[list, int]:
@@ -149,6 +182,10 @@ class DataEngine:
         self.sync_workers: int = settings.sync_workers
         # 单次同步允许的「未更新占比」上限，超过即中止本次推送。见 config 里该字段的说明。
         self.sync_max_fail_ratio: float = settings.sync_max_fail_ratio
+        # 精筛的均线窗口（交易日数）。引擎自己不筛股，但要靠它算「库内完整性闸门」
+        # 该查多长的历史 —— MA120 的窗口也是每日同步不会回补的那一段（见
+        # required_history_days）。同 sync_* 字段，这里按值拷贝一份。
+        self.ma_window: int = settings.ma_window
         self._init_db()
 
     def _init_db(self) -> None:
@@ -230,6 +267,147 @@ class DataEngine:
             row = conn.execute("SELECT MAX(date) FROM stock_daily").fetchone()
         return row[0] if row and row[0] else None
 
+    def get_recent_date_counts(self, days: int = 10) -> list[tuple[str, int]]:
+        """取库内最近 `days` 个**有数据的交易日**各自的行情行数。
+
+        一次 `GROUP BY date` 走完，用于回答「库里的历史是不是有洞」——
+        逐股看 `MAX(date)` 是看不出来的：写库按日期组织，某一天被整列清空后，
+        每只股票的最后一个日期照样正常，只有「按日行数」会掉到个位数。
+
+        Args:
+            days: 往回取几个交易日（按日期降序，跳过无数据的日期）。
+
+        Returns:
+            `[("2026-09-29", 5209), ("2026-09-28", 5208), ...]`，日期降序；
+            库为空或 `days < 1` 时返回 []。
+        """
+        if days < 1:
+            return []
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT date, COUNT(*) FROM stock_daily GROUP BY date ORDER BY date DESC LIMIT ?",
+                (days,),
+            ).fetchall()
+        return [(row[0], row[1]) for row in rows]
+
+    def required_history_days(self) -> int:
+        """本次运行真正会读到的最大交易日跨度 —— 完整性闸门的检查窗口。
+
+        窗口不按「今天 + 昨天」这种局部需求取，而按**全系统消费者里最长的那条
+        回看链**取（来源清单见 `REQUIRED_HISTORY_DAYS`）。理由：写库按日期组织，
+        某一天被整列清空后，所有横跨该日的滚动窗口都整体错位一天 —— 250 日回撤、
+        MA120、RPS120（shift(120) + rolling(120)）全都受影响，而它们正是榜单上
+        展示的列。只查最近两天的话，中段的洞会被放行。
+
+        `+1`：最老的样本还需它自己的前值参与 shift/rolling，窗口首日落在边界上，
+        多留一天做余量。
+
+        另注意每日同步的任务窗口是「本地最后日期 + 1 天起」，更老的历史不会被自动
+        修补 —— 洞留在那里，就是要靠这条检查挡住。
+
+        Returns:
+            检查窗口的交易日数：`max(REQUIRED_HISTORY_DAYS, self.ma_window) + 1`。
+        """
+        return max(REQUIRED_HISTORY_DAYS, self.ma_window) + 1
+
+    def assert_recent_dates_complete(self, days: int | None = None, min_ratio: float = 0.9) -> None:
+        """校验库内最近 `days` 个交易日的行数「全市场级」完整，否则抛异常。
+
+        `sync_today_bulk()` 的成功只证明**本次拉取**没问题，不证明**库里**完整，
+        所以这道检查必须在写库之后单独跑。判据：以窗口内最多的一天为基准，
+        任何一天的行数低于 `min_ratio` × 基准即判定有洞 —— 真实的交易日之间
+        行数只会差几只（退市/停牌），不会差一个数量级，所以 0.9 的余量很宽。
+
+        Args:
+            days: 检查最近几个交易日。`None`（默认）取 `required_history_days()`，
+                即「全系统最长回看链 + 1」；只有测试才需要显式传值。
+                刻意不是「2」：只看最近两天的话，中段的洞（2026-09-29 的 9/24）
+                会被放行，而横跨它的 250 日回撤 / MA120 / RPS120 已经错位一天。
+            min_ratio: 允许的最少行数占比（相对窗口内最多的一天）。
+
+        Raises:
+            MarketHistoryIncomplete: 有交易日行数明显偏少（典型是被误清空）。
+        """
+        if days is None:
+            days = self.required_history_days()
+        counts = self.get_recent_date_counts(days)
+        if len(counts) < 2:
+            # 库内不足两个交易日（首次回填中 / 空库）：无从比较，
+            # 「库为空」已由 sync_today_bulk 的第 3 类出口兜住，这里不重复报错。
+            return
+
+        reference = max(count for _, count in counts)
+        thin = [(d, count) for d, count in counts if count < reference * min_ratio]
+        if not thin:
+            return
+
+        detail = "、".join(f"{d} 仅 {count} 行" for d, count in thin)
+        raise MarketHistoryIncomplete(
+            f"最近 {len(counts)} 个交易日中有 {len(thin)} 天数据不完整"
+            f"（{detail}，正常应在 {reference} 行左右）——"
+            "库内存在被清空的交易日：横跨该日的滚动窗口会整体错位一天"
+            "（250 日回撤 / MA120 / RPS120 等榜单展示的口径全部失真），"
+            "「上一交易日」也可能因此前移。"
+            "本次不生成报告、不推送飞书；请先回补这些缺失的交易日再重跑"
+        )
+
+    def assert_no_missing_trading_days(self, expected: list[str] | None = None) -> None:
+        """校验「最近窗口那一段里每个交易日都在库内」—— 补上行数判据的盲区。
+
+        行数判据（`assert_recent_dates_complete`）只能看见**已经存在的日期**行数是否偏少；
+        某交易日若被清成 0 行，它根本不出现 `GROUP BY date` 的结果里，判据对它完全瞎。
+        而「整个交易日消失」同样会让涨跌幅 / 量比 / 均线跨过那一天 —— 是要防的那类错。
+
+        判定区间 = `[窗口内最早日期, 库内最新日期]`，与行数判据**共用同一个窗口**，
+        刻意不扫全历史：库内历史只到 2024-01-02，若要求交易日历里的每一天都存在，
+        更早的交易日会全部被判「缺失」，闸门将永远无法放行（退化成「全库必须完整」）。
+        更早的洞由 `scripts/backfill_dates.py --use-calendar` 按需扫。
+
+        日历查不到时**降级放行并告警**，与行数判据的取舍不同：行数偏差是我们自己库里的
+        硬故障，必须拦；日历查不到只是数据源的临时问题，不该因此否定一次已经通过行数
+        校验的同步。代价是当天这个盲区没被覆盖，所以告警必须写清楚。
+
+        Args:
+            expected: 判定区间内的交易日清单。`None`（默认）时自己查 baostock；
+                测试传固定清单即可完全离线。
+
+        Raises:
+            MarketHistoryIncomplete: 区间内有交易日整日缺失（一行都没有）。
+        """
+        counts = self.get_recent_date_counts(self.required_history_days())
+        if len(counts) < 2:
+            # 库内不足两个交易日（首次回填中 / 空库）：划不出有意义的区间，
+            # 「库为空」已由 sync_today_bulk 的第 3 类出口兜住。
+            return
+        oldest, newest = counts[-1][0], counts[0][0]
+        present = {d for d, _ in counts}
+
+        if expected is None:
+            try:
+                expected = self.fetch_trade_dates(oldest, newest)
+            except BaostockUnavailable as exc:
+                logger.warning(
+                    f"交易日历不可用，本次跳过「整日缺失」核对"
+                    f"（{oldest}~{newest}）—— 行数判据已通过，但 0 行的日期查不出来：{exc}"
+                )
+                return
+        if not expected:
+            logger.warning(f"交易日历在 {oldest}~{newest} 区间内为空，跳过「整日缺失」核对")
+            return
+
+        missing = sorted(d for d in expected if d not in present)
+        if not missing:
+            return
+
+        detail = "、".join(missing)
+        raise MarketHistoryIncomplete(
+            f"{oldest}~{newest} 区间内有 {len(missing)} 个交易日整日缺失（{detail}）——"
+            "这些日期一行都没有，按日行数的判据看不见它们，"
+            "但横跨它们的涨跌幅 / 量比 / 均线全部会变成多日口径。"
+            "本次不生成报告、不推送飞书；"
+            "请先跑 scripts/backfill_dates.py --use-calendar 回补后再重跑"
+        )
+
     def get_recent_rows(self, symbols: list[str], rows: int = 2) -> dict[str, list[dict]]:
         """批量取每只股票**最近 N 个交易日**的收盘行情。
 
@@ -273,6 +451,101 @@ class DataEngine:
         return f"{prefix}.{symbol}"
 
     # ── 数据同步 ──
+
+    def write_daily_rows(self, df: pd.DataFrame) -> int:
+        """把行情 DataFrame **幂等**写入 `stock_daily`，返回写入行数。
+
+        **唯一的写库入口**：增量同步（`sync_today_bulk`）与按日期补洞
+        （`scripts/backfill_dates.py`）都走它。两份「幂等写入」各写一遍必然漂移，
+        而 2026-09-29 的整列清空事故正是出在这段逻辑的旧版本上。
+
+        幂等保证：先删「本批真实出现的 (symbol, date) 对」，再 append。
+        绝不能写成 `DELETE FROM stock_daily WHERE date = ?`（不限 symbol）——
+        个股同步窗口是「本地最后日期 + 1 起」，一只陈旧股票就能把窗口拉长，
+        于是删掉的是**那几天的全市场行**，却只 append 回它自己。
+        `(symbol, date)` 上有 UNIQUE 约束与 `idx_symbol_date` 索引，逐对删是索引查找。
+
+        Args:
+            df: 需含 `symbol/date/open/high/low/close/volume/turnover` 列。
+
+        Returns:
+            实际写入的行数（空表返回 0）。
+        """
+        if df.empty:
+            return 0
+        pairs = df[["symbol", "date"]].drop_duplicates().itertuples(index=False, name=None)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.executemany("DELETE FROM stock_daily WHERE symbol = ? AND date = ?", list(pairs))
+            df.to_sql(
+                "stock_daily", conn, if_exists="append", index=False, method="multi", chunksize=500
+            )
+            conn.commit()
+        return len(df)
+
+    def fetch_trade_dates(self, start_date: str, end_date: str) -> list[str]:
+        """取 `[start_date, end_date]` 区间内的交易日清单（升序，含首尾）。
+
+        供完整性闸门做「整日缺失」核对：行数判据看不见 0 行的日期，
+        只有拿交易日历当「应有清单」才能发现某个交易日整个不见了。
+
+        与 `_bs_fetch_batch` 同一条纪律：登录失败立即抛、不发任何请求；
+        日历查询本身报错也**抛**而不是返回空列表 —— 空列表会被上层读成
+        「核对不出问题」，正是这条闸门最怕的静默失效。
+
+        Args:
+            start_date: 起始日 `YYYY-MM-DD`（含）。
+            end_date: 结束日 `YYYY-MM-DD`（含）。
+
+        Returns:
+            交易日日期列表，如 `["2026-09-24", "2026-09-28"]`（休市日不在其中）。
+
+        Raises:
+            BaostockUnavailable: 登录失败，或日历查询报错。
+        """
+        import baostock as bs
+
+        with contextlib.redirect_stdout(io.StringIO()):  # login()/logout() 会自己 print
+            try:
+                lg = bs.login()
+                if lg.error_code != "0":
+                    raise BaostockUnavailable(
+                        f"baostock 登录失败: {lg.error_code} {lg.error_msg}（交易日历未查询）"
+                    )
+                rs = bs.query_trade_dates(start_date=start_date, end_date=end_date)
+                if rs.error_code != "0":
+                    raise BaostockUnavailable(f"交易日历查询失败: {rs.error_code} {rs.error_msg}")
+                rows = []
+                while rs.next():
+                    rows.append(rs.get_row_data())
+            finally:
+                # 登录本身失败时 logout 也可能报错；不能让它盖掉上面的异常
+                with contextlib.suppress(Exception):
+                    bs.logout()
+
+        # baostock 的每行是 [日期, 是否交易日]，只有标志位为 "1" 才是交易日
+        return sorted(row[0] for row in rows if row[1] == "1")
+
+    def fetch_daily_range(self, symbols: list[str], start: str, end: str) -> tuple[list, int]:
+        """批量拉取这批股票在 `[start, end]` 区间内的日线（后复权）。
+
+        对 `_bs_fetch_batch` 的公开封装，给 `scripts/` 下的工具一个**稳定入口**，
+        不必伸手进私有函数；登录校验、整批失败即抛、单只失败计数等语义全部沿用
+        增量同步那一套（同一份实现，不另起一套口径）。
+
+        Args:
+            symbols: 纯数字股票代码。
+            start: 起始日 `YYYY-MM-DD`（含）。
+            end: 结束日 `YYYY-MM-DD`（含）。区间内的周末/节假日不会有 K 线。
+
+        Returns:
+            `(rows, failed)`：`rows` 元素为
+            `[symbol, date, open, high, low, close, volume, amount]`。
+
+        Raises:
+            BaostockUnavailable: 登录失败或本批全部查询失败。
+        """
+        tasks = [(s, self._to_baostock_code(s), start, end) for s in symbols]
+        return _bs_fetch_batch(tasks)
 
     def sync_today_bulk(self) -> SyncStats:
         """通过 baostock 拉取增量数据（后复权），写入 SQLite。
@@ -319,7 +592,7 @@ class DataEngine:
 
         if not tasks:
             logger.info("所有股票已是最新，无需更新")
-            return SyncStats(requested=0, updated=0, failed=0, rows=0)
+            return SyncStats(requested=0, updated=0, failed=0, rows=0, universe=len(rows))
 
         # 并发度：配置值 与 待更新股票数 取小，避免创建空分片。
         # 单进程时刻意不进 multiprocessing.Pool —— 省掉 fork 与任务序列化，
@@ -374,24 +647,33 @@ class DataEngine:
         # 用「拿到新行的**股票**数」而不是「查询报错的股票数」来算未更新占比：
         # 停牌股查询是成功的、只是当天没有行情，同样是「这一只没更新」。
         # 占比口径只在 `SyncStats` 里写一次，这里的判定与上层的展示同源。
+        # `universe` 必须传：分母要的是**全市场股票数**（`rows` = 库里每只股票一行），
+        # 不是本次待更新的那几只 —— 同一天重跑时 `requested` 会塌缩成少数停牌股。
         count = len(df)
         stats = SyncStats(
-            requested=len(tasks), updated=df["symbol"].nunique(), failed=failed, rows=count
+            requested=len(tasks),
+            updated=df["symbol"].nunique(),
+            failed=failed,
+            rows=count,
+            universe=len(rows),
         )
         if stats.missing_ratio > self.sync_max_fail_ratio:
             raise SyncIncomplete(
-                f"{stats.requested} 只待更新，其中 {stats.missing} 只未拿到新数据"
-                f"（{stats.missing_ratio:.1%}，超过上限 {self.sync_max_fail_ratio:.1%}）"
-                f"，判定为数据不完整；未改动数据库，本次不生成报告、不推送"
+                f"需要更新 {stats.requested} 只，其中 {stats.missing} 只未拿到新数据；"
+                f"相对全市场 {stats.universe} 只的未更新占比 {stats.missing_ratio:.1%}，"
+                f"超过上限 {self.sync_max_fail_ratio:.1%}"
+                "，判定为数据不完整；未改动数据库，本次不生成报告、不推送"
             )
 
-        with sqlite3.connect(self.db_path) as conn:
-            for d in df["date"].unique().tolist():
-                conn.execute("DELETE FROM stock_daily WHERE date = ?", (d,))
-            df.to_sql(
-                "stock_daily", conn, if_exists="append", index=False, method="multi", chunksize=500
-            )
-            conn.commit()
+        # 幂等写入（按 (symbol, date) 精确删除 + append）—— 走唯一的写库入口，
+        # 与按日期补洞（scripts/backfill_dates.py）共用同一份实现。
+        # 旧版本在**这里**按日期全表删（`DELETE ... WHERE date = ?`，不限 symbol）：
+        # 个别 last_date 陈旧的股票会把窗口拉长，于是清掉的是整列全市场历史 ——
+        # 2026-09-29 事故：300211 / 300532 两只停在 9/23 的股票把 9/24 从 1195 行
+        # 削到 2 行、9/28 从 5208 行削到 1 行，全市场「上一交易日」前移到 9/23，
+        # 当日涨跌幅 / 量比全变成 2 日口径（主板 000513 写出 +16.23%）。
+        # 回归测试：tests/test_data_engine.py（scopes_delete_to_fetched_pairs）。
+        self.write_daily_rows(df)
 
         if stats.missing:
             logger.warning(

@@ -12,6 +12,21 @@ MAX_SYNC_WORKERS = 32
 MIN_MA_WINDOW = 2
 MAX_MA_WINDOW = 500
 
+# 库内完整性闸门（`DataEngine.assert_recent_dates_complete`）的检查窗口：
+# 全系统消费者**真正会读到的最大交易日跨度**。窗口必须覆盖最长的那条回看链，
+# 因为写库是按日期组织的 —— 某一天被整列清空后，所有横跨该日的滚动窗口都会
+# 整体错位一天，而不是只有「当日涨跌幅」出错。
+#
+# 来源清单（改任何一处窗口，都要回来把这里跟着上调，否则闸门会放行错位数据）：
+#   analysis/scorer.py        LOOKBACK = 250  （量价特征、近 250 日回撤/区间高点）
+#   strategy/rps_breakout.py  rps_period = 120（shift(120) + rolling(120) ≈ 240 行）
+#   data/universe_filter.py   MA_WINDOW ≤ 500（即 settings.ma_window，默认 120）
+#   其余策略最长 60 日（uptrend_limit_down 的 MA60）
+# 刻意**不**纳入 scorer.ENHANCE_LOOKBACK(750)：那是可降级增强层（路径没配 / 样本
+# 不足一律降级 WARNING），且 750 已超库内可用历史长度（约 665 个交易日），
+# 纳入等于要求「全库完整」，会随着新股上市把阈值抬过 2024 年的行数而误报。
+REQUIRED_HISTORY_DAYS = 250
+
 
 class Settings(BaseSettings):
     db_path: str = "data/sequoia_v2.db"

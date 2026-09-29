@@ -11,6 +11,8 @@
 
 当日增量数据未就绪时（登录被拒 / 整批查询失败 / 一行没拿到 / 未更新占比超
 SYNC_MAX_FAIL_RATIO），主流程直接以退出码 1 终止：不生成报告、不推送飞书。
+库内最近的交易日有洞（按日行数远少于邻近日，典型是被误清空）同样终止 ——
+「上一交易日」前移会让当日涨跌幅 / 量比全部变成多日口径。
 宁可当天不出结果，也不用上一交易日的旧数据冒充当日选股结果。
 """
 
@@ -138,10 +140,23 @@ def main() -> None:
         logger.info("开始拉取最新快照...")
         try:
             stats = engine.sync_today_bulk()
+            # 「本次同步成功」不等于「库里的交易日是完整的」：写库按日期组织，
+            # 某一天被整列清空后 MAX(date) 依然正常、数据状态行也照常显示今天，
+            # 但横跨该日的滚动窗口已整体错位（250 日回撤 / MA120 / RPS120）。
+            # 所以写库之后必须再按日行数独立校验一次，失败同样中止本次推送。
+            # 窗口由 DataEngine.required_history_days() 定 = 全系统最长回看链 + 1，
+            # 不是「最近两天」—— 中段的洞会静默改变 250 日口径。
+            logger.info(f"校验库内最近 {engine.required_history_days()} 个交易日的完整性...")
+            engine.assert_recent_dates_complete()
+            # 行数判据看不见「0 行」的日期：某交易日若被清空到一行不剩，它根本
+            # 不出现在 GROUP BY date 的结果里。再拿交易日历当应有清单核一遍，
+            # 日期范围同样限定在闸门窗口内（防「全库必须完整」式误报）。
+            engine.assert_no_missing_trading_days()
         except (BaostockUnavailable, SyncIncomplete) as exc:
-            # 数据源不可用（登录被拒 / 整批失败 / 一行没拿到），或拿到的数据不完整
-            # （未更新占比超阈值）⇒ 一律终止。绝不拿上一交易日的旧数据照跑策略并推送：
-            # 那等于用陈旧数据冒充当日选股结果，比不出结果更糟。
+            # 数据源不可用（登录被拒 / 整批失败 / 一行没拿到）、拿到的数据不完整
+            # （未更新占比超阈值），或库内最近交易日有洞 ⇒ 一律终止。绝不拿上一
+            # 交易日（或口径错乱的）旧数据照跑策略并推送：那等于用陈旧数据冒充
+            # 当日选股结果，比不出结果更糟。
             logger.error(f"当日数据未就绪，本次不生成报告、不推送飞书：{exc}")
             sys.exit(1)
 
@@ -175,6 +190,9 @@ def main() -> None:
             PrivatePlacementStrategy(engine=engine, settings=settings),
         ]
         for strategy in strategies:
+            # 注入的是「候选范围」：各策略用 candidate_symbols() 取池以省算力。
+            # 个别策略可声明 `applies_universe_filter = False` 完全豁免精筛
+            # （目前只有 RPS —— 横截面指标，排名基数与结果都必须是全市场）。
             strategy.set_universe(universe_pool)
 
         notifier = FeishuNotifier(settings)

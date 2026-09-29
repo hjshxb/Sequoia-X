@@ -196,8 +196,10 @@ def test_main_forwards_data_status_to_card_and_report(monkeypatch, tmp_path) -> 
     标题里的日期只是**运行日**，数据可能来自更早的交易日（非交易日重跑等）——
     这一行是读者判断榜单「能不能信」的唯一依据，不能只在报告里有、卡片里没有。
     """
-    from sequoia_x.core.config import Settings
+    from sequoia_x.core.config import REQUIRED_HISTORY_DAYS, Settings
     from sequoia_x.data.engine import SyncStats
+
+    gate_calls: list[str] = []
 
     class _HealthyEngine:
         def __init__(self, settings: object) -> None:
@@ -209,6 +211,21 @@ def test_main_forwards_data_status_to_card_and_report(monkeypatch, tmp_path) -> 
 
         def get_market_latest_date(self) -> str:
             return "2026-09-24"
+
+        def required_history_days(self) -> int:
+            # 主流程会把它打进日志（让人一眼看到闸门查了多长的窗口）。
+            # 真引擎的算法见 DataEngine.required_history_days；这里给等价的值即可。
+            return REQUIRED_HISTORY_DAYS + 1
+
+        def assert_recent_dates_complete(self, *args: object, **kwargs: object) -> None:
+            # 「同步成功且未更新占比在上限内」在本替身里就代表库也完整，放行即可。
+            # 库内完整性校验本身有 tests/test_data_engine.py 的专门用例。
+            gate_calls.append("recent_dates")
+
+        def assert_no_missing_trading_days(self, *args: object, **kwargs: object) -> None:
+            # 同上：整日缺失的核对也有 test_data_engine.py 的专门用例。
+            # 但**调用顺序有语义** —— 先按日行数、再对交易日历，两道都要在。
+            gate_calls.append("no_missing_trading_days")
 
     pushes: list[dict] = []
     reports: list[dict] = []
@@ -252,3 +269,6 @@ def test_main_forwards_data_status_to_card_and_report(monkeypatch, tmp_path) -> 
     assert reports, "应生成本地报告"
     assert pushes[0]["data_status"] == expected
     assert reports[0]["data_status"] == expected
+    assert gate_calls == ["recent_dates", "no_missing_trading_days"], (
+        "两道完整性闸门都必须在写库之后、跑策略之前被调用"
+    )
