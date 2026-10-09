@@ -108,6 +108,44 @@ def test_sync_max_fail_ratio_rejects_percent_style_input(bad: float) -> None:
         )
 
 
+# ── 板块 / 概念分布 ──
+
+
+def test_concept_defaults_are_on_with_one_day_ttl() -> None:
+    """默认开启、目录与筹码缓存同源、TTL 1 天。
+
+    题材归属（谁属于「固态电池」）比名称/行业变得快得多，而逐股接口
+    一次只要 ~0.3s、几十只摊到 8 线程也就一秒级 —— 值得每天重新拉一次。
+    """
+    from sequoia_x.core.config import Settings
+
+    s = Settings(_env_file=None, feishu_webhook_url="https://example.com/hook")
+    assert s.concept_enabled is True
+    assert s.concept_cache_dir == "data/cache"
+    assert s.concept_ttl_days == 1
+
+
+def test_concept_ttl_blank_falls_back_and_rejects_negative() -> None:
+    """留空视为未配置（回落 1 天）；0 合法（每次都刷新），负数必须在启动时报错。"""
+    from sequoia_x.core.config import Settings
+
+    base = {"_env_file": None, "feishu_webhook_url": "https://example.com/hook"}
+    assert Settings(**base, concept_ttl_days="").concept_ttl_days == 1
+    assert Settings(**base, concept_ttl_days=0).concept_ttl_days == 0
+    with pytest.raises(ValidationError):
+        Settings(**base, concept_ttl_days=-1)
+
+
+def test_concept_enabled_blank_falls_back_to_true() -> None:
+    """开关留空（`CONCEPT_ENABLED=`）视为未配置，默认开启。"""
+    from sequoia_x.core.config import Settings
+
+    s = Settings(
+        _env_file=None, feishu_webhook_url="https://example.com/hook", concept_enabled=""
+    )
+    assert s.concept_enabled is True
+
+
 def test_ma_window_defaults_to_120() -> None:
     """均线窗口默认 120 个交易日。"""
     from sequoia_x.core.config import Settings

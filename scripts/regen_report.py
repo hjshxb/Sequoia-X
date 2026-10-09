@@ -27,7 +27,7 @@ from pathlib import Path
 
 from sequoia_x.analysis.scorer import ScoreDetail, composite_score, score_from_settings
 from sequoia_x.core.config import Settings
-from sequoia_x.data import stock_meta
+from sequoia_x.data import board_concept, stock_meta
 from sequoia_x.data.engine import DataEngine
 from sequoia_x.data.universe_filter import UniverseFilter
 from sequoia_x.notify.html_report import HtmlReportGenerator, build_symbol_marks
@@ -118,6 +118,25 @@ if ranking:
         f"（{ranking[0].symbol}，评分 {ranking[0].score:.1f}）"
     )
 
+# 板块 / 概念分布：与 main.py 同构（同样带缓存、同样失败只降级）。
+# 注意必须**在生成报告之前**取，否则重算出来的报告会比生产少一节 ——
+# 这个脚本的全部价值就在于「非交易日也能拿到与生产同构的报告」。
+board_summary = None
+if settings.concept_enabled and union:
+    try:
+        boards = board_concept.load_board_concepts(
+            union,
+            cache_dir=settings.concept_cache_dir,
+            ttl_days=settings.concept_ttl_days,
+        )
+        board_summary = board_concept.summarize(boards, union)
+        print(
+            f"板块/概念：{board_summary.covered}/{board_summary.total} 只，"
+            f"{len(board_summary.concepts)} 个概念"
+        )
+    except Exception as exc:
+        print(f"板块/概念取数失败（本次报告不含该小节）：{exc}")
+
 path = HtmlReportGenerator(settings).generate(
     results,
     filter_desc=universe.describe(),
@@ -129,6 +148,7 @@ path = HtmlReportGenerator(settings).generate(
     # 报告页首的日期是**运行日**，而这里的数据来自历史候选快照，必须写明，
     # 否则一份重算出来的旧报告看起来就像「今天跑了盘」。
     data_status=f"{DATE} · 候选快照重算（未联网增量同步）",
+    board_summary=board_summary,
 )
 print()
 print(f"候选快照：{SRC}")

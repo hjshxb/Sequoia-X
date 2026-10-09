@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from sequoia_x.analysis.scorer import ScoreDetail, composite_score, score_from_settings
 from sequoia_x.core.config import get_settings
 from sequoia_x.core.logger import get_logger
+from sequoia_x.data import board_concept
 from sequoia_x.data.engine import DataEngine
 from sequoia_x.data.universe_filter import UniverseFilter
 from sequoia_x.notify.feishu import FeishuNotifier
@@ -108,7 +109,24 @@ def main() -> None:
         except Exception as exc:
             logger.error(f"量化评分失败，本次报告与推送不含评分：{exc}")
 
-    # 5. 汇总成一张卡片推送
+    # 5. 板块 / 概念分布（与 main.py 同构；失败降级为 None，不阻断推送）
+    board_summary = None
+    if settings.concept_enabled and displayed:
+        try:
+            boards = board_concept.load_board_concepts(
+                displayed,
+                cache_dir=settings.concept_cache_dir,
+                ttl_days=settings.concept_ttl_days,
+            )
+            board_summary = board_concept.summarize(boards, displayed)
+            logger.info(
+                f"[测试模式] 板块/概念：{board_summary.covered}/{board_summary.total} 只，"
+                f"{len(board_summary.concepts)} 个概念"
+            )
+        except Exception as exc:
+            logger.warning(f"[测试模式] 板块/概念取数失败，降级为空继续推送：{exc}")
+
+    # 6. 汇总成一张卡片推送
     # 数据状态：生产里由 main._format_data_status 生成；这里没有同步步骤，
     # 就照同样的「日期 · 详情」形状如实写明是本地库现有数据 —— 卡片多这一行，
     # 是为了让预览/测试也覆盖到它，而不是在测试模式下悄悄少一行。
@@ -124,12 +142,13 @@ def main() -> None:
                 filter_desc=universe.describe(brief=True).removeprefix("精筛："),
                 scores=ranking,
                 data_status=data_status,
+                board_summary=board_summary,
             )
             logger.info("飞书汇总卡片推送完成")
         except Exception as exc:
             logger.error(f"飞书推送异常：{exc}")
 
-    # 6. 本地 HTML 报告
+    # 7. 本地 HTML 报告
     path = HtmlReportGenerator(settings).generate(
         results,
         filter_desc=universe.describe(),
@@ -137,6 +156,7 @@ def main() -> None:
         holdings=holdings,
         scores=ranking,
         data_status=data_status,
+        board_summary=board_summary,
     )
     logger.info(f"HTML 报告：{path.resolve()}")
     logger.info(f"数据状态：{data_status}")

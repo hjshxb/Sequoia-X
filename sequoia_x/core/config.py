@@ -110,6 +110,18 @@ class Settings(BaseSettings):
     # 缓存有效期（天）：超过则联网刷新；0 = 每次都刷新。
     stock_meta_ttl_days: int = 7
 
+    # ── 选股结果的「所属板块 / 概念」汇总 ──
+    # 从东财 F10 核心题材逐股取数（约 0.3s/只，只查当日选出的几十只，
+    # 并发 8 线程实测 19 只 0.6s），聚合成「概念 / 申万行业 / 地域」分布，
+    # 随 HTML 报告与飞书卡片一起展示。失败一律降级（少一节），不中断主流程。
+    concept_enabled: bool = True
+    # 缓存目录（与筹码缓存同目录即可，已在 .gitignore 内）
+    concept_cache_dir: str = "data/cache"
+    # 缓存有效期（天）。默认 **1 天**：题材归属（谁属于「固态电池」）比名称/行业
+    # 变得快得多，而几百次请求摊到 8 线程也就几秒；复核当天多次运行仍命中缓存，
+    # 不会重复联网。0 = 每次都刷新。
+    concept_ttl_days: int = 1
+
     # ── 本地 HTML 报告 ──
     # 跑完策略后生成一份本地单文件 HTML 报告（按策略分块展示选股结果）
     report_enabled: bool = True
@@ -232,6 +244,22 @@ class Settings(BaseSettings):
             raise ValueError(f"stock_meta_ttl_days 不能为负，当前为 {v}")
         return v
 
+    @field_validator("concept_ttl_days", mode="before")
+    @classmethod
+    def _blank_concept_ttl_to_default(cls, v: object) -> object:
+        """`CONCEPT_TTL_DAYS=` 留空视为未配置，回落默认 1 天。"""
+        if isinstance(v, str) and v.strip() == "":
+            return 1
+        return v
+
+    @field_validator("concept_ttl_days", mode="after")
+    @classmethod
+    def _check_concept_ttl(cls, v: int) -> int:
+        """TTL 允许为 0（每次都刷新），但不接受负数。"""
+        if v < 0:
+            raise ValueError(f"concept_ttl_days 不能为负，当前为 {v}")
+        return v
+
     @field_validator("score_top_n", mode="before")
     @classmethod
     def _blank_score_top_n_to_default(cls, v: object) -> object:
@@ -248,7 +276,7 @@ class Settings(BaseSettings):
             raise ValueError(f"score_top_n 不能为负（0 表示不限制），当前为 {v}")
         return v
 
-    @field_validator("score_enabled", "score_enhance", mode="before")
+    @field_validator("score_enabled", "score_enhance", "concept_enabled", mode="before")
     @classmethod
     def _blank_switch_to_default(cls, v: object) -> object:
         """布尔开关留空视为「未配置」，回落 True（默认开启）。"""

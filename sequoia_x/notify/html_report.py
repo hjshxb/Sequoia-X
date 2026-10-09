@@ -8,14 +8,18 @@
       传入 `metrics` 时额外展示「市值 / 换手率 / PE(TTM)」三列。
     - 股票名称与行业由数据层 `sequoia_x.data.stock_meta` 提供（一次请求 + 进程内缓存），
       与「行业过滤」共用同一份数据，不重复请求；板块由代码前缀本地判定，零开销。
+    - 传入 `board_summary` 时页首多一块「板块 / 概念分布」（概念 / 申万行业 / 地域
+      的命中只数），回答策略表答不了的「这批票扎堆在什么方向」。
     - 报告生成失败不影响主流程（调用方自行兜底），也不依赖飞书是否配置。
 """
 
 from __future__ import annotations
 
 import html
+import json
 import math
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
@@ -28,6 +32,7 @@ from sequoia_x.analysis.scorer import (
 from sequoia_x.core.config import Settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data import stock_meta as stock_meta_module
+from sequoia_x.data.board_concept import BoardSummary
 from sequoia_x.data.stock_meta import BOARD_ORDER, StockMeta, board_of, board_rank
 from sequoia_x.data.universe_filter import StockMetric
 
@@ -73,6 +78,100 @@ STRATEGY_MARKS: dict[str, str] = {
 def strategy_label(strategy_name: str) -> str:
     """取策略的中文展示名；未收录时回退为类名本身。"""
     return STRATEGY_LABELS.get(strategy_name, strategy_name)
+
+
+# 「板块 / 概念分布」这一节的展示规则（**报告与飞书卡片共用**，见
+# `board_chip_groups`）：命中 >= 2 只的才展示 —— 一次几十只的名单能带出
+# 一两百个「只命中 1 只」的概念，全列出来等于没有筛选。
+_CHIP_MIN_COUNT = 2
+# 报告里的展示上限（比卡片宽：报告可换行、可悬停看完整名单）
+REPORT_CHIP_LIMITS: dict[str, int] = {"concept": 18, "industry": 12, "region": 10}
+# 卡片里的展示上限（飞书卡片对总长度敏感，收敛得更紧）。
+# 公开名字：飞书渲染层要从这里取，两处共用同一份常量，别各写一套数字。
+CARD_CHIP_LIMITS: dict[str, int] = {"concept": 8, "industry": 6, "region": 5}
+
+# 类别的展示顺序与中文名。顺序即「读者最关心 → 次之」：
+# 概念是题材聚合的主线，行业说明它落在哪个大板块，地域只在区域炒作时才看。
+BOARD_KINDS: tuple[tuple[str, str], ...] = (
+    ("concept", "概念"),
+    ("industry", "申万行业"),
+    ("region", "地域"),
+)
+
+
+def _shorten(text: str, limit: int = 160) -> str:
+    """截断超长文本并加省略号（用于 title 提示，不参与可见排版）。"""
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+@dataclass(frozen=True)
+class ChipGroup:
+    """一类板块的展示结果。
+
+    Attributes:
+        kind: `concept` / `industry` / `region`。
+        label: 中文名（概念 / 申万行业 / 地域）。
+        shown: 要展示的 [(名称, 只数)]。
+        omitted: 被压掉的名称（含所有「只命中 1 只」的）—— 报告用它填 `title`，
+            卡片只看个数（`len(omitted)`）。
+    """
+
+    kind: str
+    label: str
+    shown: tuple[tuple[str, int], ...]
+    omitted: tuple[str, ...]
+
+    @property
+    def omitted_count(self) -> int:
+        """被压掉的条目数。"""
+        return len(self.omitted)
+
+
+def board_chip_groups(
+    summary: BoardSummary | None,
+    limits: Mapping[str, int],
+) -> list[ChipGroup]:
+    """把聚合结果切成「每类要展示的条目 + 被压掉的个数」。
+
+    **这是展示层的公共口径**：报告与飞书卡片都调它，只是传不同的 `limits`。
+    门槛（命中 >= 2 只）与排序（只数降序 → 名称升序）都只在这里定义一次 ——
+    两处各写一遍，迟早会出现「预览里 8 个、真实卡片里 10 个」这种漂移，
+    而这正是「拿预览当验证」最坑的地方。
+
+    Args:
+        summary: 聚合结果；None 或全空时返回空列表（渲染层据此整块略过）。
+        limits: {kind: 展示上限}。缺失的类别按 0 处理（即全部压掉）。
+
+    Returns:
+        按 `BOARD_KINDS` 顺序排列的分组；某类一个条目都没有时**不出现**，
+        避免出现一行只有标签没有内容的空壳。
+    """
+    if summary is None:
+        return []
+
+    groups: list[ChipGroup] = []
+    for kind, label in BOARD_KINDS:
+        if kind == "concept":
+            items = summary.concepts
+        elif kind == "industry":
+            items = summary.industries
+        else:
+            items = summary.regions
+        repeated = tuple(item for item in items if item[1] >= _CHIP_MIN_COUNT)
+        shown = repeated[: max(0, limits.get(kind, 0))]
+        if not shown:
+            # 整类都是「只命中 1 只」时不留空壳：一行只剩标签和「另 N 个」，
+            # 既没有信息量、又占掉本来就紧张的卡片高度。
+            continue
+        groups.append(
+            ChipGroup(
+                kind=kind,
+                label=label,
+                shown=shown,
+                omitted=tuple(name for name, _ in items[len(shown) :]),
+            )
+        )
+    return groups
 
 
 def build_symbol_marks(results: Mapping[str, list[str]]) -> dict[str, str]:
@@ -233,6 +332,7 @@ class HtmlReportGenerator:
         holdings: dict[str, float] | None = None,
         scores: Sequence[ScoreDetail] | None = None,
         data_status: str = "",
+        board_summary: BoardSummary | None = None,
     ) -> Path:
         """生成 HTML 报告并写入磁盘。
 
@@ -252,6 +352,10 @@ class HtmlReportGenerator:
             data_status: 「数据日期 + 更新情况」的值（由
                 `main._format_data_status` 生成）。标题里的日期只是运行日，
                 数据可能来自更早的交易日，故单独占一个标签。空串则不显示。
+            board_summary: 可选的「板块 / 概念分布」聚合结果（由
+                `data.board_concept.summarize` 生成）。传入后页首多一张
+                汇总卡 —— 策略表回答「哪几只」，它回答「这批票扎堆在什么方向」。
+                取数失败/未启用时传 None，整块不渲染（不影响其余内容）。
 
         Returns:
             实际写入的报告文件路径。
@@ -271,7 +375,14 @@ class HtmlReportGenerator:
             logger.warning(f"HTML 报告：{missing} 条记录缺少名称/行业，将显示为「—」")
 
         content = self._render(
-            results, meta, filter_desc, metrics, holdings, score_list, data_status
+            results,
+            meta,
+            filter_desc,
+            metrics,
+            holdings,
+            score_list,
+            data_status,
+            board_summary,
         )
 
         path = Path(output_path) if output_path else self.default_path()
@@ -290,6 +401,7 @@ class HtmlReportGenerator:
         holdings: dict[str, float] | None = None,
         scores: Sequence[ScoreDetail] = (),
         data_status: str = "",
+        board_summary: BoardSummary | None = None,
     ) -> str:
         today = date.today().strftime("%Y-%m-%d")
         total = sum(len(v) for v in results.values())
@@ -348,14 +460,17 @@ class HtmlReportGenerator:
                 table = '<p class="empty">该策略本次无选股结果</p>'
 
             badges = " · ".join(f"{b} {len(g)}" for b, g in group_by_board(symbols))
-            board_summary = f'<span class="boards">{html.escape(badges)}</span>' if badges else ""
+            # 注意：这是**单个策略**内的上市板块分布（主板 3 · 创业板 1），
+            # 与页首那个跨策略的「板块 / 概念分布」块（`board_summary`）是两回事，
+            # 变量名必须分开，否则会把参数覆盖成一段 HTML。
+            board_badges = f'<span class="boards">{html.escape(badges)}</span>' if badges else ""
 
             sections.append(
                 f"""<section class="card" data-count="{len(symbols)}">
       <div class="card-head">
         <h2>{html.escape(label)}</h2>
         <span class="badge">{len(symbols)}</span>
-        {board_summary}
+        {board_badges}
       </div>
       {table}
     </section>"""
@@ -373,6 +488,7 @@ class HtmlReportGenerator:
             else ""
         )
         ranking_html = self._render_ranking(scores, meta)
+        boards_html = self._render_boards(board_summary)
 
         return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -504,6 +620,42 @@ class HtmlReportGenerator:
   .empty {{ color: var(--muted); font-size: 13px; margin: 4px 0 16px; }}
   .card.ranking {{ border-color: #efd2d2; }}
   .card.ranking h2::before {{ content: "▍"; color: var(--accent); margin-right: 4px; }}
+  /* 「板块 / 概念分布」用 .panel 而不是 .card：页内搜索只遍历 .card，
+     这块是**全页的汇总**（搜「半导体」时它应当留在页面上，而不是被藏掉）。
+     视觉上与卡片同源，仍是同一张白底描边框。 */
+  .panel {{
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px 18px;
+    margin-bottom: 16px;
+  }}
+  .panel h2::before {{ content: "▍"; color: var(--accent); margin-right: 4px; }}
+  .chip-rows {{ display: flex; flex-direction: column; gap: 10px; }}
+  .chip-row {{ display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }}
+  .chip-label {{
+    flex: 0 0 auto;
+    min-width: 62px;
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 600;
+  }}
+  .chip {{
+    display: inline-flex;
+    align-items: baseline;
+    gap: 4px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    border-radius: 4px;
+    padding: 1px 8px;
+    font-size: 12px;
+    white-space: nowrap;
+  }}
+  .chip b {{ font-variant-numeric: tabular-nums; font-weight: 700; }}
+  /* 行业与地域用中性色：一眼区分「题材」（红）与「归类」（灰） */
+  .chip-row[data-kind="industry"] .chip,
+  .chip-row[data-kind="region"] .chip {{ background: #f1f2f4; color: var(--muted); }}
+  .chip.more {{ background: none; border: 1px dashed var(--border); color: var(--muted); }}
   td.rank {{ color: var(--muted); font-variant-numeric: tabular-nums; width: 34px; }}
   td.score {{ font-weight: 700; color: var(--accent); cursor: help; }}
   td.marks {{ color: var(--muted); font-size: 12px; letter-spacing: 0.04em; }}
@@ -537,6 +689,7 @@ class HtmlReportGenerator:
   <main id="report">
 {empty_hint}
 {ranking_html}
+{boards_html}
 {chr(10).join(sections)}
   </main>
 
@@ -599,6 +752,83 @@ class HtmlReportGenerator:
 </body>
 </html>
 """
+
+    @staticmethod
+    def _render_boards(summary: BoardSummary | None) -> str:
+        """渲染页首的「板块 / 概念分布」汇总块（排在评分排行之后）。
+
+        回答的是策略表与排行表都答不了的问题：**这批票是不是扎堆在同一条线上**。
+        20 只票里有 7 只落在「病原体防治」、5 只在「创新药」，那是一次板块性
+        行情；散在 20 个不同概念里则是零散个股机会。这个判断靠逐行看列不出来。
+
+        只展示「命中 >= 2 只」的条目，其余压成一个 `另 N 个` 的计数 chip
+        （完整名单在 `title` 里，悬停可见）—— 一次运行几十只票能带出上百个
+        「只命中 1 只」的概念，全列出来反而看不出重点。
+        门槛与截断规则由 `board_chip_groups` 定义，与飞书卡片**同源**。
+
+        末尾嵌一段 `<script type="application/json">`：`scripts/card_preview.py`
+        靠它把这份聚合结果**原样**还原出来喂给卡片渲染，从而保证「离线预览」
+        与真实推送同构（少一次还原，预览就会比真实卡片少一节）。
+
+        刻意用 `.panel` 而不是 `.card`：页内搜索只遍历 `.card`（内含可搜索的
+        表格行），这块是**全页的汇总**，搜索时应当保持可见。
+        """
+        if summary is None or summary.is_empty:
+            return ""
+
+        groups = board_chip_groups(summary, REPORT_CHIP_LIMITS)
+        if not groups:
+            return ""
+
+        rows: list[str] = []
+        for group in groups:
+            chips = [
+                f'<span class="chip" data-count="{count}">'
+                f"{html.escape(name)}<b>{count}</b></span>"
+                for name, count in group.shown
+            ]
+            if group.omitted:
+                title = _shorten("、".join(group.omitted))
+                chips.append(
+                    f'<span class="chip more" title="{html.escape(title)}">'
+                    f"另 {group.omitted_count} 个</span>"
+                )
+            rows.append(
+                f'        <div class="chip-row" data-kind="{group.kind}">'
+                f'<span class="chip-label">{group.label}</span>{"".join(chips)}</div>'
+            )
+
+        top_name, top_count = summary.concepts[0] if summary.concepts else ("", 0)
+        if top_count >= _CHIP_MIN_COUNT:
+            hint = f"最集中：{top_name} {top_count}/{summary.total} 只"
+        else:
+            hint = "未出现明显的题材聚集"
+        hint += " · 仅列命中 ≥2 只的"
+        if summary.covered < summary.total:
+            hint += f" · {summary.total - summary.covered} 只未取到板块数据"
+
+        payload = json.dumps(
+            {
+                "total": summary.total,
+                "covered": summary.covered,
+                "concepts": summary.concepts,
+                "industries": summary.industries,
+                "regions": summary.regions,
+            },
+            ensure_ascii=False,
+        ).replace("<", "\\u003c")
+
+        return f"""<section class="panel boards" data-count="{summary.total}">
+      <div class="card-head">
+        <h2>板块 / 概念分布</h2>
+        <span class="badge">{summary.covered}</span>
+        <span class="boards">{html.escape(hint)}</span>
+      </div>
+      <div class="chip-rows">
+{chr(10).join(rows)}
+      </div>
+      <script type="application/json" id="board-summary">{payload}</script>
+    </section>"""
 
     def _render_ranking(self, scores: Sequence[ScoreDetail], meta: dict[str, StockMeta]) -> str:
         """渲染页首的「综合评分排行」卡片（已按综合分降序）。

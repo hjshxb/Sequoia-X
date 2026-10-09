@@ -21,6 +21,7 @@ from hypothesis import strategies as st
 
 import sequoia_x.notify.feishu as feishu_module
 from sequoia_x.core.config import Settings
+from sequoia_x.data.board_concept import BoardSummary
 from sequoia_x.data.stock_meta import BOARD_CHINEXT, BOARD_MAIN, BOARD_STAR, StockMeta
 from sequoia_x.notify.feishu import FeishuNotifier
 from tests._score_factory import make_score
@@ -332,6 +333,92 @@ def test_send_report_forwards_data_status_to_card() -> None:
             )
 
     assert build.call_args.kwargs["data_status"] == "2026-09-24 · 无更新"
+
+
+# ── 板块 / 概念分布 ──
+# 卡片在综合评分榜之后多一节：说明这批票**扎堆在什么方向**。
+# 门槛与截断口径和 HTML 报告同源（`html_report.board_chip_groups`），
+# 只是上限更紧 —— 两处各写一套，离线预览就会与真实推送不一致。
+
+_FAKE_SUMMARY = BoardSummary(
+    total=10,
+    covered=9,
+    concepts=(
+        ("病原体防治", 7),
+        ("创新药", 5),
+        ("CRO", 4),
+        ("医疗器械概念", 4),
+        ("流感", 4),
+        ("单抗概念", 3),
+        ("生物疫苗", 3),
+        ("幽门螺杆菌概念", 3),
+        ("冷门概念", 2),
+        ("只中一只", 1),
+    ),
+    industries=(("医药生物", 6), ("基础化工", 2)),
+    regions=(("山东板块", 3),),
+)
+
+
+def test_card_shows_board_section() -> None:
+    notifier = FeishuNotifier(make_settings())
+    card = posted_card(notifier, {"MaVolumeStrategy": ["600000"]}, board_summary=_FAKE_SUMMARY)
+    text = card_text(card)
+
+    assert "🧩 板块 / 概念分布" in text
+    assert "概念：病原体防治 7、创新药 5" in text
+    assert "申万行业：医药生物 6、基础化工 2" in text
+    assert "地域：山东板块 3" in text
+    assert "（10 只中 9 只取到板块数据）" in text
+
+
+def test_card_board_section_truncates_without_losing_the_count() -> None:
+    """卡片上限比报告紧：被截掉的条目要收成「另 N 个」，不能凭空消失。"""
+    notifier = FeishuNotifier(make_settings())
+    card = posted_card(notifier, {"MaVolumeStrategy": ["600000"]}, board_summary=_FAKE_SUMMARY)
+    concept_line = next(
+        el["text"]["content"].split("\n")[1]
+        for el in card["card"]["elements"]
+        if "板块 / 概念分布" in el.get("text", {}).get("content", "")
+    )
+
+    assert "冷门概念" not in concept_line, "超出上限的条目不进卡片"
+    assert "只中一只" not in concept_line, "只命中 1 只的不进卡片"
+    assert concept_line.endswith("另 2 个")  # 冷门概念 + 只中一只
+
+
+def test_card_omits_board_section_when_absent_or_empty() -> None:
+    notifier = FeishuNotifier(make_settings())
+    for kwargs in ({}, {"board_summary": None}, {"board_summary": BoardSummary(total=3)}):
+        card = posted_card(notifier, {"MaVolumeStrategy": ["600000"]}, **kwargs)
+        assert "板块 / 概念分布" not in card_text(card)
+
+
+def test_card_board_section_sits_between_ranking_and_strategies() -> None:
+    """顺序：综合评分榜（先看谁）→ 板块/概念（再看扎堆在什么方向）→ 策略小节。"""
+    notifier = FeishuNotifier(make_settings())
+    card = posted_card(
+        notifier,
+        {"MaVolumeStrategy": ["600000"]},
+        scores=[make_score("600000")],
+        board_summary=_FAKE_SUMMARY,
+    )
+    contents = [el["text"]["content"] for el in card["card"]["elements"] if el["tag"] == "div"]
+    order = [
+        next(i for i, c in enumerate(contents) if key in c)
+        for key in ("综合评分 Top", "板块 / 概念分布", "**均线放量**")
+    ]
+    assert order == sorted(order)
+
+
+def test_send_report_forwards_board_summary_to_card() -> None:
+    """`send_report` 必须把 board_summary 透传（漏传 = 静默少一节）。"""
+    notifier = FeishuNotifier(make_settings())
+    with patch.object(FeishuNotifier, "_build_report_card", return_value={"card": {}}) as build:
+        with patch.object(FeishuNotifier, "_post"):
+            notifier.send_report({"MaVolumeStrategy": ["600000"]}, board_summary=_FAKE_SUMMARY)
+
+    assert build.call_args.kwargs["board_summary"] is _FAKE_SUMMARY
 
 
 # ── 综合评分榜（评分 + 胜率，单一栏目）──

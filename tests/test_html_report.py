@@ -11,12 +11,15 @@
     - 输出路径与目录自动创建
 """
 
+import json
+import re
 import sys
 
 import pytest
 
 from sequoia_x.core.config import Settings
 from sequoia_x.data import stock_meta as stock_meta_module
+from sequoia_x.data.board_concept import BoardSummary
 from sequoia_x.data.stock_meta import (
     BOARD_BSE,
     BOARD_CHINEXT,
@@ -31,6 +34,7 @@ from sequoia_x.data.stock_meta import (
 from sequoia_x.data.universe_filter import StockMetric
 from sequoia_x.notify.html_report import (
     HtmlReportGenerator,
+    board_chip_groups,
     build_symbol_marks,
     group_by_board,
     to_xueqiu_code,
@@ -235,6 +239,144 @@ def test_header_escapes_data_status(gen):
     text = out.read_text(encoding="utf-8")
     assert "&lt;b&gt;x&lt;/b&gt;" in text
     assert "<b>x</b>" not in text
+
+
+# ── 板块 / 概念分布 ──
+# 这一块回答的是策略表答不了的问题：**这批票扎堆在什么方向**。
+# 两条容易退化的口径各有一条测试钉住：
+#   1) 只展示「命中 >= 2 只」的条目（几十只票能带出上百个只中 1 只的概念）；
+#   2) 末尾那段 JSON 必须能原样还原聚合结果 —— `scripts/card_preview.py`
+#      靠它保证「离线预览」与真实推送同构。
+
+_FAKE_SUMMARY = BoardSummary(
+    total=10,
+    covered=9,
+    concepts=(("病原体防治", 7), ("创新药", 5), ("CRO", 2), ("冷门概念", 1)),
+    industries=(("医药生物", 6), ("基础化工", 2)),
+    regions=(("山东板块", 3),),
+)
+
+
+def test_board_panel_renders_chips(gen):
+    text = gen.generate(
+        {"TurtleTradeStrategy": ["600000"]}, board_summary=_FAKE_SUMMARY
+    ).read_text(encoding="utf-8")
+
+    assert '<section class="panel boards"' in text
+    assert "<h2>板块 / 概念分布</h2>" in text
+    assert '<span class="chip" data-count="7">病原体防治<b>7</b></span>' in text
+    assert '<div class="chip-row" data-kind="industry">' in text
+    assert '<div class="chip-row" data-kind="region">' in text
+    assert "最集中：病原体防治 7/10 只" in text
+    # 覆盖不完整必须如实写出来，否则「只列了 3 个概念」会被读成「其余票没题材」
+    assert "1 只未取到板块数据" in text
+
+
+def test_board_panel_hides_singletons_and_counts_the_rest(gen):
+    """只命中 1 只的概念不进 chip（但个数与名称要能查到）。"""
+    text = gen.generate(
+        {"TurtleTradeStrategy": ["600000"]}, board_summary=_FAKE_SUMMARY
+    ).read_text(encoding="utf-8")
+
+    concept_row = text.split('data-kind="concept"')[1].split("</div>")[0]
+    assert ">冷门概念<b>" not in concept_row, "只命中 1 只的不该有自己的 chip"
+    assert 'title="冷门概念"' in concept_row  # 悬停可查完整名单
+    assert '<span class="chip more" title="冷门概念">另 1 个</span>' in concept_row
+
+
+def test_board_panel_embeds_recoverable_summary_json(gen):
+    """末尾的 JSON 必须能还原出聚合结果 —— 卡片预览端就靠这一份。"""
+    text = gen.generate(
+        {"TurtleTradeStrategy": ["600000"]}, board_summary=_FAKE_SUMMARY
+    ).read_text(encoding="utf-8")
+    raw = json.loads(
+        re.search(
+            r'<script type="application/json" id="board-summary">(.*?)</script>',
+            text,
+            re.S,
+        ).group(1)
+    )
+
+    assert raw["total"] == 10 and raw["covered"] == 9
+    assert raw["concepts"][0] == ["病原体防治", 7]
+    assert raw["industries"] == [["医药生物", 6], ["基础化工", 2]]
+    assert raw["regions"] == [["山东板块", 3]]
+
+
+def test_board_panel_is_not_a_searchable_card(gen):
+    """分布块是**全页汇总**，刻意不用 `.card`：
+
+    页内搜索只遍历 `.card`（内含表格行），用 `.panel` 才能让它在搜索时保持可见；
+    同时 `scripts/card_preview.py` / `regen_report.py` 都以 `'<section class="card"'`
+    为锚点切分策略小节 —— 锚点一旦被它命中，就会被当成一个「零只股票的策略」。
+    """
+    text = gen.generate(
+        {"TurtleTradeStrategy": ["600000"], "MaVolumeStrategy": []},
+        board_summary=_FAKE_SUMMARY,
+    ).read_text(encoding="utf-8")
+
+    assert '<section class="panel boards"' in text
+    assert text.count('<section class="card"') == 2, "锚点只应命中两个策略小节"
+
+
+def test_board_panel_absent_without_summary(gen):
+    """没传聚合结果（未启用 / 取数失败 / 旧调用方）时整块不渲染。"""
+    for kwargs in ({}, {"board_summary": None}):
+        text = gen.generate({"TurtleTradeStrategy": ["600000"]}, **kwargs).read_text(
+            encoding="utf-8"
+        )
+        assert 'class="panel boards"' not in text
+        assert "board-summary" not in text
+
+
+def test_board_panel_skipped_when_summary_is_empty(gen):
+    """三类都为空（例如全部取数失败）时不留一个只剩标题的空壳。"""
+    text = gen.generate(
+        {"TurtleTradeStrategy": ["600000"]},
+        board_summary=BoardSummary(total=3, covered=0),
+    ).read_text(encoding="utf-8")
+
+    assert 'class="panel boards"' not in text
+
+
+def test_board_panel_escapes_names(gen):
+    """概念名来自外部接口，必须转义后才进 HTML。"""
+    text = gen.generate(
+        {"TurtleTradeStrategy": ["600000"]},
+        board_summary=BoardSummary(
+            total=2, covered=2, concepts=(("<img src=x>概念", 2),)
+        ),
+    ).read_text(encoding="utf-8")
+
+    assert "&lt;img src=x&gt;概念" in text
+    assert "<img src=x>" not in text
+
+
+# ── board_chip_groups：报告与卡片共用的截断口径 ──
+
+
+def test_chip_groups_respect_limits_and_report_omitted_names():
+    groups = board_chip_groups(
+        _FAKE_SUMMARY, {"concept": 2, "industry": 5, "region": 5}
+    )
+    by_kind = {g.kind: g for g in groups}
+
+    assert [name for name, _ in by_kind["concept"].shown] == ["病原体防治", "创新药"]
+    assert by_kind["concept"].omitted == ("CRO", "冷门概念")
+    assert by_kind["concept"].omitted_count == 2
+    assert by_kind["industry"].omitted == ()
+    assert [g.kind for g in groups] == ["concept", "industry", "region"]
+
+
+def test_chip_groups_skips_category_without_repeated_items():
+    """整类都只命中 1 只时不出现（避免一行只剩标签和「另 N 个」）。"""
+    summary = BoardSummary(
+        total=2, covered=2, concepts=(("A", 1), ("B", 1)), industries=(("电子", 2),)
+    )
+    groups = board_chip_groups(summary, {"concept": 18, "industry": 12, "region": 10})
+
+    assert [g.kind for g in groups] == ["industry"]
+    assert board_chip_groups(None, {"concept": 5}) == []
 
 
 # ── 全市场名称/行业表的拉取与缓存 ──

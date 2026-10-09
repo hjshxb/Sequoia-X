@@ -22,8 +22,11 @@ from sequoia_x.analysis.scorer import ScoreDetail, composite_score, rank_by_comp
 from sequoia_x.core.config import Settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data import stock_meta as stock_meta_module
+from sequoia_x.data.board_concept import BoardSummary
 from sequoia_x.data.stock_meta import StockMeta
 from sequoia_x.notify.html_report import (
+    CARD_CHIP_LIMITS,
+    board_chip_groups,
     group_by_board,
     strategy_label,
     to_xueqiu_code,
@@ -146,12 +149,45 @@ class FeishuNotifier:
             lines.append(" · ".join(parts) + mark)
         return "\n".join(lines)
 
+    @classmethod
+    def _board_section(cls, summary: BoardSummary) -> str:
+        """渲染「🧩 板块 / 概念分布」小节：这批票扎堆在什么方向。
+
+        策略小节答的是「哪几只」，本小节答的是「它们是不是同一条线上的」——
+        20 只里 7 只在「病原体防治」，那是一次板块性行情；散在 20 个概念里
+        则是零散个股机会。这个判断靠逐行读策略小节是做不出来的。
+
+        **门槛与截断规则与 HTML 报告同源**（`html_report.board_chip_groups`），
+        只传更紧的上限（飞书卡片对总长度敏感）。两处各写一套的话，离线预览
+        （`scripts/card_preview.py`）与真实推送就会出现长度不一致 —— 那正是
+        「拿预览当验证」最坑的地方。
+
+        只展示命中 >= 2 只的条目，其余压成一句「另 N 个」：
+        一次几十只的名单能带出上百个「只命中 1 只」的概念，全列出来等于没筛选。
+
+        取数不完整时**如实标注**（「19 只中 16 只取到板块数据」）——
+        否则一个只列了 5 个概念的分布块会被读成「其余票没有任何题材」。
+        """
+        groups = board_chip_groups(summary, CARD_CHIP_LIMITS)
+        if not groups:
+            return ""
+        lines = ["**🧩 板块 / 概念分布**（按命中股票数，仅列 ≥2 只的）"]
+        for group in groups:
+            items = "、".join(f"{name} {count}" for name, count in group.shown)
+            if group.omitted_count:
+                items += f"、另 {group.omitted_count} 个"
+            lines.append(f"{group.label}：{items}")
+        if summary.covered < summary.total:
+            lines.append(f"（{summary.total} 只中 {summary.covered} 只取到板块数据）")
+        return "\n".join(lines)
+
     def _build_report_card(
         self,
         results: dict[str, list[str]],
         filter_desc: str = "",
         scores: Sequence[ScoreDetail] = (),
         data_status: str = "",
+        board_summary: BoardSummary | None = None,
     ) -> dict:
         """把 {策略类名: 代码列表} 渲染成一张飞书交互卡片。
 
@@ -164,6 +200,9 @@ class FeishuNotifier:
                 见 `scorer.composite_score`）。
             data_status: 一行数据状态（由 `main._format_data_status` 生成），
                 说明这份榜单基于哪一天的行情、更新是否完整。空串则不显示。
+            board_summary: 可选的「板块 / 概念分布」聚合（由
+                `data.board_concept.summarize` 生成）。传入后卡片在综合评分榜
+                之后多一节，说明这批票扎堆在什么概念 / 行业上。None 则不显示。
 
         Returns:
             飞书 `msg_type=interactive` 的请求体。
@@ -194,6 +233,13 @@ class FeishuNotifier:
 
         if score_list:
             add_markdown(self._composite_section(score_list, meta))
+
+        # 板块/概念分布排在综合评分榜之后、策略小节之前：
+        # 先看「最该看谁」（个股），再看「整体扎堆在什么方向」（题材）。
+        if board_summary is not None:
+            section = self._board_section(board_summary)
+            if section:
+                add_markdown(section)
 
         for strategy_name, symbols in results.items():
             if symbols:
@@ -260,6 +306,7 @@ class FeishuNotifier:
         webhook_key: str = "default",
         scores: Sequence[ScoreDetail] = (),
         data_status: str = "",
+        board_summary: BoardSummary | None = None,
     ) -> None:
         """把所有策略的选股结果汇总成一张卡片推送出去。
 
@@ -269,12 +316,17 @@ class FeishuNotifier:
             webhook_key: 用于路由 Webhook；未配置专属地址时回退到默认地址。
             scores: 可选的量化评分（应按得分降序），用于生成高分榜与节内排序。
             data_status: 一行数据状态（数据日期 + 更新完整性），空串则不显示。
+            board_summary: 可选的「板块 / 概念分布」聚合，None 则卡片少一节。
 
         Raises:
             不抛出异常，HTTP 失败时记录 ERROR 日志。
         """
         url = self.settings.get_webhook_url(webhook_key)
         payload = self._build_report_card(
-            results, filter_desc, scores=scores, data_status=data_status
+            results,
+            filter_desc,
+            scores=scores,
+            data_status=data_status,
+            board_summary=board_summary,
         )
         self._post(url, payload, webhook_key, sum(len(v) for v in results.values()))

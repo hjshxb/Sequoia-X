@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 from sequoia_x.analysis.scorer import ScoreDetail, composite_score, score_from_settings
 from sequoia_x.core.config import MAX_SYNC_WORKERS, get_settings
 from sequoia_x.core.logger import get_logger
-from sequoia_x.data import stock_meta
+from sequoia_x.data import board_concept, stock_meta
 from sequoia_x.data.engine import BaostockUnavailable, DataEngine, SyncIncomplete, SyncStats
 from sequoia_x.data.universe_filter import UniverseFilter
 from sequoia_x.notify.feishu import FeishuNotifier
@@ -240,6 +240,28 @@ def main() -> None:
             except Exception as exc:
                 logger.error(f"量化评分失败，本次报告与推送不含评分：{exc}")
 
+        # 6.6 板块 / 概念聚合：把「哪几只」补成「扎堆在什么方向」。
+        #     只查当日选出的几十只（东财逐股接口，约 0.3s/只、8 线程并发），
+        #     带磁盘缓存；**失败只降级**（少一节），绝不能因此丢掉当天的报告与推送。
+        board_summary = None
+        if not settings.concept_enabled:
+            logger.info("板块/概念分布已关闭（CONCEPT_ENABLED=false）")
+        elif displayed:
+            try:
+                boards = board_concept.load_board_concepts(
+                    displayed,
+                    cache_dir=settings.concept_cache_dir,
+                    ttl_days=settings.concept_ttl_days,
+                )
+                board_summary = board_concept.summarize(boards, displayed)
+                logger.info(
+                    f"板块/概念分布：{board_summary.covered}/{board_summary.total} 只"
+                    f"，{len(board_summary.concepts)} 个概念"
+                    f"（命中 >=2 只的 {sum(1 for _, c in board_summary.concepts if c >= 2)} 个）"
+                )
+            except Exception as exc:
+                logger.error(f"板块/概念取数失败，报告与卡片不含该小节：{exc}")
+
         # 7. 推送：各策略汇总成单张卡片（中文策略名 + 板块分组 + 高分榜）
         if args.no_push:
             logger.info("已指定 --no-push，跳过飞书推送")
@@ -256,6 +278,7 @@ def main() -> None:
                     filter_desc=universe.describe(brief=True).removeprefix("精筛："),
                     scores=ranking,
                     data_status=data_status,
+                    board_summary=board_summary,
                 )
             except Exception as exc:
                 logger.error(f"飞书推送异常，已忽略：{exc}")
@@ -273,6 +296,7 @@ def main() -> None:
                     holdings=holdings,
                     scores=ranking,
                     data_status=data_status,
+                    board_summary=board_summary,
                 )
                 logger.info(f"HTML 报告已生成：{report_path.resolve()}")
             except Exception as exc:

@@ -272,3 +272,105 @@ def test_main_forwards_data_status_to_card_and_report(monkeypatch, tmp_path) -> 
     assert gate_calls == ["recent_dates", "no_missing_trading_days"], (
         "两道完整性闸门都必须在写库之后、跑策略之前被调用"
     )
+
+
+# ── 板块 / 概念分布 ──
+
+
+def _run_offline_main(monkeypatch, tmp_path) -> tuple[list[dict], list[dict]]:
+    """跑一遍离线化的 main()，返回 (推送参数, 报告参数)。
+
+    复用与上面用例相同的替身：引擎不联网、精筛不联网、策略固定返回一只、
+    输出层只记录参数。板块/概念的取数由调用方按需 patch。
+    """
+    from sequoia_x.core.config import Settings
+    from sequoia_x.data.engine import SyncStats
+
+    class _HealthyEngine:
+        def __init__(self, settings: object) -> None:
+            self.settings = settings
+
+        def sync_today_bulk(self) -> SyncStats:
+            return SyncStats(requested=100, updated=100, failed=0, rows=100)
+
+        def get_market_latest_date(self) -> str:
+            return "2026-09-24"
+
+        def required_history_days(self) -> int:
+            return 251
+
+        def assert_recent_dates_complete(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def assert_no_missing_trading_days(self, *args: object, **kwargs: object) -> None:
+            pass
+
+    pushes: list[dict] = []
+    reports: list[dict] = []
+
+    class _Notifier:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def send_report(self, results: object, **kwargs: object) -> None:
+            pushes.append(kwargs)
+
+    class _Report:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def generate(self, results: object, **kwargs: object) -> str:
+            reports.append(kwargs)
+            return str(tmp_path / "report.html")
+
+    monkeypatch.setattr(sys, "argv", ["main.py"])
+    monkeypatch.setattr(
+        main_module,
+        "get_settings",
+        lambda: Settings(
+            _env_file=None,
+            feishu_webhook_url="https://example.com/hook",
+            db_path=str(tmp_path / "t.db"),
+        ),
+    )
+    monkeypatch.setattr(main_module, "DataEngine", _HealthyEngine)
+    monkeypatch.setattr(main_module, "UniverseFilter", _StubUniverse)
+    monkeypatch.setattr(main_module, "FeishuNotifier", _Notifier)
+    monkeypatch.setattr(main_module, "HtmlReportGenerator", _Report)
+    for attr in _STRATEGY_ATTRS:
+        monkeypatch.setattr(main_module, attr, _StubStrategy)
+
+    main_module.main()
+    return pushes, reports
+
+
+def test_main_forwards_board_summary_to_card_and_report(monkeypatch, tmp_path) -> None:
+    """板块/概念聚合要同时进卡片与报告 —— 只给报告，飞书上就看不到题材分布。"""
+    from sequoia_x.data.board_concept import StockBoards
+
+    seen: list[list[str]] = []
+
+    def fake_load(symbols, **_kwargs):
+        seen.append(list(symbols))
+        return {"600000": StockBoards("600000", ("创新药",), "医药生物", "上海板块")}
+
+    monkeypatch.setattr(main_module.board_concept, "load_board_concepts", fake_load)
+    pushes, reports = _run_offline_main(monkeypatch, tmp_path)
+
+    assert seen == [["600000"]], "应只查当日选出的股票，不是全市场"
+    assert pushes[0]["board_summary"].concepts == (("创新药", 1),)
+    assert reports[0]["board_summary"] is pushes[0]["board_summary"]
+
+
+def test_main_survives_board_concept_failure(monkeypatch, tmp_path) -> None:
+    """取数失败只降级（少一节），绝不能因此丢掉当天的报告与推送。"""
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("东财连接被重置")
+
+    monkeypatch.setattr(main_module.board_concept, "load_board_concepts", boom)
+    pushes, reports = _run_offline_main(monkeypatch, tmp_path)
+
+    assert pushes and reports, "板块取数失败不应阻断推送与报告"
+    assert pushes[0]["board_summary"] is None
+    assert reports[0]["board_summary"] is None

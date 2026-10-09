@@ -23,6 +23,12 @@
 再一刀（同步完整性）：卡片摘要多一行「**数据日期：** …」，值来自
 `main._format_data_status`。这里从报告页首的 `<span class="status">` 还原 ——
 报告与卡片是同一份值渲染两次，所以必须传进去，不传预览就少一行。
+
+最后一刀（板块 / 概念分布）：卡片在综合评分榜之后多一节「🧩 板块 / 概念分布」。
+这里从报告末尾的 `<script type="application/json" id="board-summary">` 还原 ——
+那是渲染层**原样**写出的聚合结果，卡片那一节再用同一套
+`html_report.board_chip_groups`（只是上限更紧）排版，因此预览与真实推送必然一致。
+旧报告没有这段 ⇒ `None`，卡片少一节（与当时的真实卡片一致）。
 """
 
 import argparse
@@ -38,6 +44,7 @@ sys.path.insert(0, str(root))
 import sequoia_x.notify.feishu as feishu_module  # noqa: E402
 from sequoia_x.analysis.scorer import ScoreDetail  # noqa: E402
 from sequoia_x.core.config import Settings  # noqa: E402
+from sequoia_x.data.board_concept import BoardSummary  # noqa: E402
 from sequoia_x.data.stock_meta import StockMeta  # noqa: E402
 from sequoia_x.data.universe_filter import UniverseFilter  # noqa: E402
 from sequoia_x.notify.feishu import FeishuNotifier  # noqa: E402
@@ -227,14 +234,42 @@ desc = UniverseFilter(settings=settings, engine=None).describe(brief=True).remov
 status_match = re.search(r'<span class="status">数据日期：([^<]*)</span>', html)
 data_status = html_module.unescape(status_match.group(1)).strip() if status_match else ""
 
+# 板块 / 概念分布：报告末尾那段 JSON 是渲染层原样写出的聚合结果，直接还原。
+# **不要**自己从 chip 里数——报告里的 chip 已经按更宽的上限截断过，
+# 数出来的条数会比生产少，卡片的「另 N 个」也就跟着错。
+board_summary: BoardSummary | None = None
+board_match = re.search(
+    r'<script type="application/json" id="board-summary">(.*?)</script>', html, re.S
+)
+if board_match:
+    raw = json.loads(board_match.group(1))
+
+    def _pairs(key: str) -> tuple[tuple[str, int], ...]:
+        return tuple((str(name), int(count)) for name, count in raw.get(key) or ())
+
+    board_summary = BoardSummary(
+        total=int(raw.get("total") or 0),
+        covered=int(raw.get("covered") or 0),
+        concepts=_pairs("concepts"),
+        industries=_pairs("industries"),
+        regions=_pairs("regions"),
+    )
+
 card = FeishuNotifier(settings)._build_report_card(
-    results, filter_desc=desc, scores=scores, data_status=data_status
+    results, filter_desc=desc, scores=scores, data_status=data_status, board_summary=board_summary
 )
 
 print("# 各策略只数：" + "、".join(f"{k} {len(v)}" for k, v in results.items()))
 print(f"# 命中策略数：{sum(1 for v in results.values() if v)} / {len(results)}")
 print(f"# 选股总数：{sum(len(v) for v in results.values())}")
 print(f"# 数据状态：{data_status or '（报告未记录）'}")
+if board_summary is None:
+    print("# 板块/概念：报告未记录（旧格式），卡片少一节")
+else:
+    print(
+        f"# 板块/概念：{board_summary.covered}/{board_summary.total} 只，"
+        f"{len(board_summary.concepts)} 个概念"
+    )
 print()
 print("=" * 72)
 for el in card["card"]["elements"]:
