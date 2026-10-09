@@ -81,7 +81,7 @@ case "$IS_TRADE" in
   ERR*)
     # 关键：数据源故障 != 休市。以前这里也是 exit 0，于是「baostock 挂了」
     # 被伪装成「今天休市，正常跳过」，定时任务一路绿 —— 故障会被静默很久。
-    # 退出码约定：0=正常（含休市跳过）、1=main.py 失败、3=交易日历不可用。
+    # 退出码约定：0=正常（含休市跳过）、1=main.py 失败或报告未生成/未刷新、3=交易日历不可用。
     echo "ERROR: 交易日历查询失败（${IS_TRADE#ERR:}）"
     echo "       这是数据源故障，不是休市 —— 本次不执行选股，以退出码 3 上报。"
     echo "       排障：$PY scripts/probe_baostock_route.py --login"
@@ -112,18 +112,87 @@ fi
 #   以退出码 1 终止 —— 数据源登录被拒/整批查询失败/一行没拿到，或未更新占比超过
 #   SYNC_MAX_FAIL_RATIO。此时没有报告是**预期**的：宁可当天不出结果，也不拿
 #   上一交易日的旧数据冒充当日榜单。日志里会有「当日数据未就绪」那一行可确认。
+# 测试接缝：DAILY_RUN_PY 可换成桩脚本，让离线测试在**不跑真 main.py、不碰真报告**
+# 的前提下走完第 2/3 步（第 3 步的新鲜度判据只能用「真跑一次」来验）。
+RUN_PY="${DAILY_RUN_PY:-$PY}"
+# 记下「本次运行开始」的 epoch 秒。第 3 步靠它把「本次写出的报告」与
+# 「恰好同名的旧文件」分开 —— 只判文件存在会把后者当成成功（见第 3 步注释）。
+RUN_START=$(date +%s)
 echo "---- 运行 main.py ----"
-"$PY" -u main.py
+"$RUN_PY" -u main.py
 RC=$?
 echo "main.py exit=$RC"
 
-# ---- 3) 校验报告 ----
-REPORT="reports/stock_report_${STAMP}.html"
-if [ -f "$REPORT" ]; then
-  echo "OK 报告已生成: $REPORT ($(wc -c < "$REPORT") bytes)"
-else
-  echo "WARN 未找到 $REPORT；reports/ 最新文件如下："
-  ls -lt reports/ 2>/dev/null | head -6
+# ---- 3) 校验报告：必须「本次新鲜写出」，而不是「同名文件恰好存在」 ----
+# 旧版是 `[ -f "$REPORT" ]` 加自己拼路径 `reports/stock_report_${STAMP}.html`。
+# 有三个洞：
+#   ① 陈旧冒充成功：同名文件可能是**上一次**运行留下的。main.py 里 HTML 报告生成
+#      失败只记一行 ERROR、**不改变退出码**（main.py 第 302-303 行），所以 RC=0
+#      完全可能配一份没被重写的旧报告 —— 定时任务于是显示绿灯，而当天其实没出报告。
+#   ② 路径漂移：`reports/` 写死在脚本里，而报告目录来自配置 `REPORT_DIR`。
+#      改了配置之后此处会一直 WARN 找不到文件，判据本身退化成噪音。
+#   ③ 关闭报告时误报：`REPORT_ENABLED=false` 时本来就不生成，不该判失败。
+# 现在：开关与路径都问**唯一真源**（`Settings.report_enabled` /
+#       `HtmlReportGenerator.default_path()`，同一个 0.4s 的无网络调用），
+#       新鲜度用「报告 mtime 是否晚于本次运行开始时刻」判断。
+# 退出码约定（新增第 2 条，其余不变）：
+#   0 = 正常（含非交易日跳过）
+#   1 = main.py 失败，**或**报告未生成 / 未刷新
+#   3 = 交易日历不可用
+REPORT_CONF=$("$PY" - <<'PYEOF' 2>/dev/null
+from sequoia_x.core.config import Settings
+from sequoia_x.notify.html_report import HtmlReportGenerator
+
+_s = Settings()
+print("enabled=1" if _s.report_enabled else "enabled=0")
+print(f"path={HtmlReportGenerator(_s).default_path()}")
+PYEOF
+) || REPORT_CONF=""
+# 只按前缀摘自己要的两行：万一导入过程往 stdout 多写了什么也不会串行。
+CONF_ENABLED=$(printf '%s\n' "$REPORT_CONF" | sed -n 's/^enabled=//p' | head -1)
+REPORT=$(printf '%s\n' "$REPORT_CONF" | sed -n 's/^path=//p' | head -1)
+if [ -z "$CONF_ENABLED" ]; then
+  CONF_ENABLED=1
+  echo "WARN 读不到 REPORT_ENABLED（探测失败），按默认「开启」处理"
 fi
+if [ -z "$REPORT" ]; then
+  REPORT="reports/stock_report_${STAMP}.html"
+  echo "WARN 问不到报告路径（探测失败），退回约定路径：$REPORT"
+fi
+# 测试接缝：等真值都取好之后再让覆盖生效（供 scripts/test_daily_run.sh 离线断言）
+[ -z "${DAILY_RUN_REPORT:-}" ] || REPORT="$DAILY_RUN_REPORT"
+[ -z "${DAILY_RUN_REPORT_ENABLED:-}" ] || CONF_ENABLED="$DAILY_RUN_REPORT_ENABLED"
+echo "报告校验目标: $REPORT (report_enabled=$CONF_ENABLED)"
+
+if [ "$CONF_ENABLED" != "1" ]; then
+  echo "SKIP 报告已关闭（REPORT_ENABLED=false），本次不做报告校验"
+  echo "==== 结束 $(date '+%F %T') ===="
+  exit $RC
+fi
+
+if [ ! -f "$REPORT" ]; then
+  echo "ERROR 报告未生成：$REPORT 不存在（本次 main.py exit=$RC）"
+  echo "       $(dirname "$REPORT")/ 最新文件如下："
+  ls -lt "$(dirname "$REPORT")/" 2>/dev/null | head -6
+  echo "==== 结束 $(date '+%F %T') ===="
+  [ "$RC" != "0" ] || RC=1
+  exit $RC
+fi
+
+# mtime 读不到（stat 不存在/无权限）时**不**判失败 —— 拿不准就别冤枉一次已经
+# 跑完的主流程，但要把这个「没验成」明说出来，免得又被当成绿灯。
+REPORT_MTIME=$(stat -c %Y -- "$REPORT" 2>/dev/null) || REPORT_MTIME=""
+if [ -z "$REPORT_MTIME" ]; then
+  echo "WARN 读不到 $REPORT 的 mtime（stat 失败），跳过新鲜度判定"
+elif [ "$REPORT_MTIME" -lt "$RUN_START" ]; then
+  echo "ERROR 报告未刷新：$REPORT 是上一次运行留下的旧文件，本次没有重写"
+  echo "      mtime=$(date -d "@$REPORT_MTIME" '+%F %T')，本次运行开始于 $(date -d "@$RUN_START" '+%F %T')"
+  echo "      注意 main.py exit=$RC —— 报告生成失败**不改变**退出码，所以 RC=0 不等于报告是新的。"
+  echo "==== 结束 $(date '+%F %T') ===="
+  [ "$RC" != "0" ] || RC=1
+  exit $RC
+fi
+
+echo "OK 报告已生成: $REPORT ($(wc -c < "$REPORT") bytes)"
 echo "==== 结束 $(date '+%F %T') ===="
 exit $RC

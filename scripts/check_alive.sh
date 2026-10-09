@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# 一次性诊断脚本：判断 main.py 是「在干活」还是「卡死」。
+# 一次性诊断脚本：粗看 main.py 现在「在等什么」（不判活）。
 # 判据（来自项目经验）：
 #   WCHAN=poll_schedule_timeout  -> 正在等网络（baostock 抓取中）
 #   WCHAN=p9_client_rpc          -> 正在向 /mnt/c 写 SQLite
 #   /proc/<pid>/fd 里有 socket:  -> 有活跃连接
 #   /proc/<pid>/fd 里有 *.db-journal -> 正在写库
+#
+# ⚠️ 这些信号只能说明「在等什么」，**不能判断还活不活** —— 等网络回包与连接已死
+#    的 WCHAN 是同一个值。要判断进程还在不在推进，用 scripts/health_check.sh 看
+#    socket 收发字节的**增量**（健康约 +18000 字节/分钟）。
 set -u
 echo "---- $(date '+%F %T') ----"
 

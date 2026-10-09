@@ -347,6 +347,37 @@ python main.py
 15 19 * * 1-5 cd /root/Sequoia-X && .venv/bin/python main.py >> log.txt 2>&1
 ```
 
+### 5. 定时任务入口（`scripts/daily_run.sh`）
+
+仓库自带的生产入口是 `scripts/daily_run.sh`。它把「今天是不是 A 股交易日」的判断放在
+最前面（一次 baostock 请求），非交易日直接跳过 —— 否则 `sync_today_bulk()` 的判据
+「本地最新日期 < 今天」会让全市场 5221 只股票都空跑一轮。
+
+```bash
+bash scripts/daily_run.sh
+```
+
+退出码：
+
+| 退出码 | 含义 |
+| --- | --- |
+| `0` | 正常（含「今天休市，正常跳过」） |
+| `1` | `main.py` 失败，**或** HTML 报告未生成 / 未刷新 |
+| `3` | 交易日历不可用（**数据源故障 ≠ 休市**，不能当成功） |
+
+> **报告校验不只看文件是否存在。** `main.py` 里 HTML 报告生成失败只记一行 ERROR、
+> **不改变退出码**，因此「恰好同名的旧文件」会被误判成当天成功。脚本改为用
+> 「报告 mtime 是否晚于本次运行开始时刻」判断新鲜度，且路径与开关都取自
+> `Settings.report_enabled` / `HtmlReportGenerator.default_path()` 这两处唯一真源，
+> 不在 shell 里重复拼 `reports/stock_report_<日期>.html`（`REPORT_DIR` 改配置后会漂移）。
+> `REPORT_ENABLED=false` 时跳过校验，不会因为没有报告而误报失败。
+
+排障：
+
+- `bash scripts/test_daily_run.sh` —— 离线回归（交易日分支 + 报告新鲜度判据，不联网）
+- `bash scripts/health_check.sh [日期] [采样秒数]` —— 进程是否还在推进，看 **socket
+  字节增量**（健康约 +18000 字节/分钟）。注意 `WCHAN` / `rchar` **不能**判活。
+
 ---
 
 ## 目录结构 | Project Structure
