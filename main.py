@@ -31,6 +31,7 @@ from sequoia_x.data.universe_filter import UniverseFilter
 from sequoia_x.notify.feishu import FeishuNotifier
 from sequoia_x.notify.html_report import HtmlReportGenerator, build_symbol_marks
 from sequoia_x.strategy.base import BaseStrategy
+from sequoia_x.strategy.boll_rsi_reversal import BollRsiReversalStrategy
 from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
 from sequoia_x.strategy.limit_up_shakeout import LimitUpShakeoutStrategy
 from sequoia_x.strategy.ma_volume import MaVolumeStrategy
@@ -188,6 +189,9 @@ def main() -> None:
             UptrendLimitDownStrategy(engine=engine, settings=settings),
             RpsBreakoutStrategy(engine=engine, settings=settings),
             PrivatePlacementStrategy(engine=engine, settings=settings),
+            # 逆势低吸：与精筛的「收盘价 >= MA120」天然互斥，故它不读注入池，
+            # 内部改用 apply_without_ma()（豁免均线维度）自行取全市场候选。
+            BollRsiReversalStrategy(engine=engine, settings=settings),
         ]
         for strategy in strategies:
             # 注入的是「候选范围」：各策略用 candidate_symbols() 取池以省算力。

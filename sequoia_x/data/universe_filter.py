@@ -575,6 +575,37 @@ class UniverseFilter:
         logger.info(f"精筛预筛：{len(stage1)} -> {len(stage2)}（市值/PE/PB/换手率）")
         return stage2
 
+    def apply_without_ma(self, symbols: list[str]) -> list[str]:
+        """应用精筛，但**豁免「均线」维度**（供逆势 / 超跌类策略使用）。
+
+        为什么需要单独一个入口：精筛的「收盘价 >= MA120」要求股票站上中期趋势，
+        而超跌反转策略选的恰恰是「跌破布林下轨 + RSI 极低」的票 —— 二者天然互斥。
+        若这类策略也沿用注入池，信号会被 MA120 一刀清空（实测全市场 2.7 万条信号，
+        加 MA120 后只剩 9%）。
+
+        其余维度照常生效（成交额 / 今日跌幅 / 行业 / 筹码），且**刻意跳过估值与
+        换手率**：那两项要逐股请求 baostock，而这里的候选来自全市场，逐个拉取会把
+        每日任务拖成十分钟级。质量把关交给后续评分层。
+
+        Args:
+            symbols: 待过滤的股票代码列表。
+
+        Returns:
+            通过「除均线以外」全部已配置维度的代码列表；未配置任何维度时原样返回。
+        """
+        if not symbols:
+            return []
+        return self._apply(
+            symbols,
+            valuation=False,
+            liquidity=self._liquidity_enabled,
+            technical=False,
+            today_drop=self._today_drop_enabled,
+            ma=False,
+            industry=self._industry_enabled,
+            holder=self._holder_enabled,
+        )
+
     def _apply(
         self,
         symbols: list[str],

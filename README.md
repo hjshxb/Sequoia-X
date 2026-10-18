@@ -35,13 +35,20 @@ python main.py --backfill     # 回填模式：全市场历史K线一次性灌�
 | **LimitUpShakeout** | 涨停洗盘回踩确认 |
 | **UptrendLimitDown** | 上升趋势中的跌停反包 |
 | **RpsBreakout** | 欧奈尔 RPS 相对强度突破 |
+| **BollRsiReversal** | 布林下轨 + RSI 超跌反转（逆势低吸） |
 | **PrivatePlacement** | 定增公告监控（akshare 数据源） |
+
+> `BollRsiReversal` 是唯一**豁免「均线」维度**的策略：超跌股必然已跌破 MA120，
+> 沿用精筛池会被那一条规则清空（实测全市场信号只剩 9%）。它改走
+> `UniverseFilter.apply_without_ma()` —— 成交额 / 今日跌幅 / 行业 / 筹码照常生效，
+> 仅跳过估值与换手率（两万只候选逐股联网会把每日任务拖成十分钟级）。
 
 ---
 
 ## 股票池精筛 | Universe Filters
 
-所有策略在返回选股结果前，都会统一经过 `UniverseFilter` 精筛。
+所有策略在返回选股结果前，都会统一经过 `UniverseFilter` 精筛
+（唯一例外：`BollRsiReversal` 豁免「均线」维度，见上）。
 共 **7 个维度**，全部可选，在 `.env` 中配置；**留空即表示该维度不参与过滤**。
 七个维度都不配置时，**完全不产生网络请求**。
 
