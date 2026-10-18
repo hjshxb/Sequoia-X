@@ -7,32 +7,37 @@
 2026-09-24 修过一次：原先没传 `scores`，推出去的卡片比生产少「🎯 综合评分 Top 10」小节、
 板块内排序也不同，**用它验证过的链路等于没验证**。
 
+策略清单不再在这里另抄一份，改为调用 `main.build_strategies()` —— 2026-10-19 又踩了一次
+「测试入口只注册了 7 个策略，新加的两个没测到」。现在两边共用同一份清单，不会再漂移。
+
 刻意保留的一处差异：指标/筹码取数失败时降级为 `{}` 并记 WARNING，而不是中断。
 main.py 靠的是「精筛已把指标拉进缓存」，测试模式下缓存可能不全，宁可少两个维度也要把推送发出去。
 """
 
 import socket
+import sys
+from pathlib import Path
+
+# 允许从任意 cwd 运行：main.py 在仓库根目录，不在 scripts/ 下。
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 socket.setdefaulttimeout(10.0)
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv  # noqa: E402
 
-from sequoia_x.analysis.scorer import ScoreDetail, composite_score, score_from_settings
-from sequoia_x.core.config import get_settings
-from sequoia_x.core.logger import get_logger
-from sequoia_x.data import board_concept
-from sequoia_x.data.engine import DataEngine
-from sequoia_x.data.universe_filter import UniverseFilter
-from sequoia_x.notify.feishu import FeishuNotifier
-from sequoia_x.notify.html_report import HtmlReportGenerator, build_symbol_marks
-from sequoia_x.strategy.base import BaseStrategy
-from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
-from sequoia_x.strategy.limit_up_shakeout import LimitUpShakeoutStrategy
-from sequoia_x.strategy.ma_volume import MaVolumeStrategy
-from sequoia_x.strategy.private_placement import PrivatePlacementStrategy
-from sequoia_x.strategy.rps_breakout import RpsBreakoutStrategy
-from sequoia_x.strategy.turtle_trade import TurtleTradeStrategy
-from sequoia_x.strategy.uptrend_limit_down import UptrendLimitDownStrategy
+from main import build_strategies  # noqa: E402
+from sequoia_x.analysis.scorer import (  # noqa: E402
+    ScoreDetail,
+    composite_score,
+    score_from_settings,
+)
+from sequoia_x.core.config import get_settings  # noqa: E402
+from sequoia_x.core.logger import get_logger  # noqa: E402
+from sequoia_x.data import board_concept  # noqa: E402
+from sequoia_x.data.engine import DataEngine  # noqa: E402
+from sequoia_x.data.universe_filter import UniverseFilter  # noqa: E402
+from sequoia_x.notify.feishu import FeishuNotifier  # noqa: E402
+from sequoia_x.notify.html_report import HtmlReportGenerator, build_symbol_marks  # noqa: E402
 
 
 def main() -> None:
@@ -57,16 +62,8 @@ def main() -> None:
     elif universe_pool is not None:
         logger.info(f"预筛完成，合格股票池 {len(universe_pool)} 只")
 
-    # 2. 策略在池内选股
-    strategies: list[BaseStrategy] = [
-        MaVolumeStrategy(engine=engine, settings=settings),
-        TurtleTradeStrategy(engine=engine, settings=settings),
-        HighTightFlagStrategy(engine=engine, settings=settings),
-        LimitUpShakeoutStrategy(engine=engine, settings=settings),
-        UptrendLimitDownStrategy(engine=engine, settings=settings),
-        RpsBreakoutStrategy(engine=engine, settings=settings),
-        PrivatePlacementStrategy(engine=engine, settings=settings),
-    ]
+    # 2. 策略在池内选股（清单与 main.py 共用 build_strategies，杜绝两边漂移）
+    strategies = build_strategies(engine, settings)
     for strategy in strategies:
         strategy.set_universe(universe_pool)
 

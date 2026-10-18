@@ -23,7 +23,7 @@ import sys
 from dotenv import load_dotenv
 
 from sequoia_x.analysis.scorer import ScoreDetail, composite_score, score_from_settings
-from sequoia_x.core.config import MAX_SYNC_WORKERS, get_settings
+from sequoia_x.core.config import MAX_SYNC_WORKERS, Settings, get_settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data import board_concept, stock_meta
 from sequoia_x.data.engine import BaostockUnavailable, DataEngine, SyncIncomplete, SyncStats
@@ -71,6 +71,42 @@ def _format_data_status(stats: SyncStats, latest_date: str | None) -> str:
     else:
         detail = f"全市场 {stats.updated} 只已更新"
     return f"{latest_date or '未知'} · {detail}"
+
+
+def build_strategies(engine: DataEngine, settings: Settings) -> list[BaseStrategy]:
+    """构造全部策略实例（列表顺序即执行顺序）。
+
+    🔴 这里是策略清单的**唯一真源**：`scripts/test_push_run.py`（跳同步的测试入口）
+    也调用本函数，不允许两边各写一份。历史教训出现过两次漂移 ——
+    2026-09-24 是测试入口少传 `scores=`，2026-10-19 是测试入口少注册两个策略，
+    两次都导致「用它验证过的链路等于没验证」。
+
+    ⚠️ 函数体里的策略类名是**运行时**按模块全局名解析的，所以
+    `tests/test_main.py` 用 `monkeypatch.setattr(main_module, "MaVolumeStrategy", ...)`
+    替换依然生效；把清单提成「模块级常量元组」反而会让 monkeypatch 失效。
+
+    Args:
+        engine: 行情引擎（策略从中读本地库）。
+        settings: 全局配置。
+
+    Returns:
+        按固定顺序排列的策略实例列表。
+    """
+    return [
+        MaVolumeStrategy(engine=engine, settings=settings),
+        TurtleTradeStrategy(engine=engine, settings=settings),
+        HighTightFlagStrategy(engine=engine, settings=settings),
+        LimitUpShakeoutStrategy(engine=engine, settings=settings),
+        UptrendLimitDownStrategy(engine=engine, settings=settings),
+        RpsBreakoutStrategy(engine=engine, settings=settings),
+        PrivatePlacementStrategy(engine=engine, settings=settings),
+        # 逆势低吸：与精筛的「收盘价 >= MA120」天然互斥，故它不读注入池，
+        # 内部改用 apply_without_ma()（豁免均线维度）自行取全市场候选。
+        BollRsiReversalStrategy(engine=engine, settings=settings),
+        # 逆势低吸「中等幅度」档：回落 30-45% 但仍在 MA60 上方（精筛的 MA120 只筛掉 9 只，
+        # 故走标准注入池）。定位是「低胜率高赔率」，2026 震荡市已无超额，见模块 docstring。
+        PullbackShrinkStrategy(engine=engine, settings=settings),
+    ]
 
 
 def main() -> None:
@@ -181,22 +217,8 @@ def main() -> None:
             else:
                 logger.info(f"精筛预筛完成，合格股票池 {len(universe_pool)} 只")
 
-        # 5. 策略列表（新增策略在此追加即可）
-        strategies: list[BaseStrategy] = [
-            MaVolumeStrategy(engine=engine, settings=settings),
-            TurtleTradeStrategy(engine=engine, settings=settings),
-            HighTightFlagStrategy(engine=engine, settings=settings),
-            LimitUpShakeoutStrategy(engine=engine, settings=settings),
-            UptrendLimitDownStrategy(engine=engine, settings=settings),
-            RpsBreakoutStrategy(engine=engine, settings=settings),
-            PrivatePlacementStrategy(engine=engine, settings=settings),
-            # 逆势低吸：与精筛的「收盘价 >= MA120」天然互斥，故它不读注入池，
-            # 内部改用 apply_without_ma()（豁免均线维度）自行取全市场候选。
-            BollRsiReversalStrategy(engine=engine, settings=settings),
-            # 逆势低吸「中等幅度」档：回落 30-45% 但仍在 MA60 上方（精筛的 MA120 只筛掉 9 只，
-            # 故走标准注入池）。定位是「低胜率高赔率」，2026 震荡市已无超额，见模块 docstring。
-            PullbackShrinkStrategy(engine=engine, settings=settings),
-        ]
+        # 5. 策略列表（唯一真源在 build_strategies()，测试入口共用同一份）
+        strategies = build_strategies(engine, settings)
         for strategy in strategies:
             # 注入的是「候选范围」：各策略用 candidate_symbols() 取池以省算力。
             # ⚠️ RPS 刻意不读这个池（横截面指标必须先在全市场排名），但它的**结果**
