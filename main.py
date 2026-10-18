@@ -36,6 +36,7 @@ from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
 from sequoia_x.strategy.limit_up_shakeout import LimitUpShakeoutStrategy
 from sequoia_x.strategy.ma_volume import MaVolumeStrategy
 from sequoia_x.strategy.private_placement import PrivatePlacementStrategy
+from sequoia_x.strategy.pullback_shrink import PullbackShrinkStrategy
 from sequoia_x.strategy.rps_breakout import RpsBreakoutStrategy
 from sequoia_x.strategy.turtle_trade import TurtleTradeStrategy
 from sequoia_x.strategy.uptrend_limit_down import UptrendLimitDownStrategy
@@ -192,6 +193,9 @@ def main() -> None:
             # 逆势低吸：与精筛的「收盘价 >= MA120」天然互斥，故它不读注入池，
             # 内部改用 apply_without_ma()（豁免均线维度）自行取全市场候选。
             BollRsiReversalStrategy(engine=engine, settings=settings),
+            # 逆势低吸「中等幅度」档：回落 30-45% 但仍在 MA60 上方（精筛的 MA120 只筛掉 9 只，
+            # 故走标准注入池）。定位是「低胜率高赔率」，2026 震荡市已无超额，见模块 docstring。
+            PullbackShrinkStrategy(engine=engine, settings=settings),
         ]
         for strategy in strategies:
             # 注入的是「候选范围」：各策略用 candidate_symbols() 取池以省算力。

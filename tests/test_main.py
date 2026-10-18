@@ -141,6 +141,8 @@ _STRATEGY_ATTRS = (
     "UptrendLimitDownStrategy",
     "RpsBreakoutStrategy",
     "PrivatePlacementStrategy",
+    "BollRsiReversalStrategy",
+    "PullbackShrinkStrategy",
 )
 
 

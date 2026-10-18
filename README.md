@@ -35,13 +35,19 @@ python main.py --backfill     # 回填模式：全市场历史K线一次性灌�
 | **LimitUpShakeout** | 涨停洗盘回踩确认 |
 | **UptrendLimitDown** | 上升趋势中的跌停反包 |
 | **RpsBreakout** | 欧奈尔 RPS 相对强度突破 |
-| **BollRsiReversal** | 布林下轨 + RSI 超跌反转（逆势低吸） |
+| **BollRsiReversal** | 布林下轨 + RSI 超跌反转（逆势低吸·深跌档） |
+| **PullbackShrink** | 深回调缩量：回落 30~45% 但仍在 MA60 上方 + 缩量（逆势低吸·中档） |
 | **PrivatePlacement** | 定增公告监控（akshare 数据源） |
 
 > `BollRsiReversal` 是唯一**豁免「均线」维度**的策略：超跌股必然已跌破 MA120，
 > 沿用精筛池会被那一条规则清空（实测全市场信号只剩 9%）。它改走
 > `UniverseFilter.apply_without_ma()` —— 成交额 / 今日跌幅 / 行业 / 筹码照常生效，
 > 仅跳过估值与换手率（两万只候选逐股联网会把每日任务拖成十分钟级）。
+>
+> `PullbackShrink` 与它是**互补的两档低吸**：一个买「跌破下轨的深跌」，一个买
+> 「回落 30~45% 但趋势未破的中档回调」。注意 `PullbackShrink` 属**低胜率高赔率**
+> 型（本地库实测胜率仅 41.3%、中位数为负、均值全靠右尾），2026 震荡市已无超额，
+> 且信号极稀疏（全市场每日约 2 只，与精筛交集常为空），定位是候选生成器而非主力策略。
 
 ---
 
