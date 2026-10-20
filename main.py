@@ -105,10 +105,12 @@ def build_strategies(engine: DataEngine, settings: Settings) -> list[BaseStrateg
         # 与精筛的「收盘价 >= MA120」天然互斥（实测 97.6% 的信号都在 MA120 之下），
         # 故它不读注入池，内部改用 apply_without_ma()（豁免均线维度）自行取全市场候选。
         AtrShrinkReversalStrategy(engine=engine, settings=settings),
-        # 逆势低吸「形态档」：60 日低位 + 十字星 + 缩量。与 ATR 超跌几乎不重叠
-        # （Jaccard 0.007），是独立信号族；两者同时命中时超额最高。
+        # 逆势低吸「形态档」：昨日 60 日低位十字星 + 缩量，**今日放量阳线确认**才入选。
+        # 用户口径是「只选票，买不买看后续」，故确认条件属于选票门槛、不是买点择时：
+        # 加确认后 8.3 只/日（原 43.6 只/日），胜率 57.6%→62.9%、日中位 +0.03%→+0.44%。
+        # 与 ATR 超跌几乎不重叠（加了确认后 Jaccard 0.0015，全期仅 10 次同日交集）。
         # 同样 92.9% 的信号在 MA120 下方，故也走 apply_without_ma()。
-        # ⚠️ 刻意不含「次日放量上涨」—— 实测那一条是负贡献，见模块 docstring。
+        # ⚠️ 放量阈值只能 1.2~1.5，往上加收益转负；「未创前5日新高」默认开，见模块 docstring。
         BottomDojiStrategy(engine=engine, settings=settings),
         # 逆势低吸「中等幅度」档：回落 30-45% 但仍在 MA60 上方（精筛的 MA120 只筛掉 9 只，
         # 故走标准注入池）。定位是「低胜率高赔率」，2026 震荡市已无超额，见模块 docstring。
