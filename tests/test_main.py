@@ -142,6 +142,7 @@ _STRATEGY_ATTRS = (
     "RpsBreakoutStrategy",
     "PrivatePlacementStrategy",
     "AtrShrinkReversalStrategy",
+    "BottomDojiStrategy",
     "PullbackShrinkStrategy",
 )
 
