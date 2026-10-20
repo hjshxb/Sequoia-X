@@ -30,8 +30,8 @@ from sequoia_x.data.engine import BaostockUnavailable, DataEngine, SyncIncomplet
 from sequoia_x.data.universe_filter import UniverseFilter
 from sequoia_x.notify.feishu import FeishuNotifier
 from sequoia_x.notify.html_report import HtmlReportGenerator, build_symbol_marks
+from sequoia_x.strategy.atr_shrink_reversal import AtrShrinkReversalStrategy
 from sequoia_x.strategy.base import BaseStrategy
-from sequoia_x.strategy.boll_rsi_reversal import BollRsiReversalStrategy
 from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
 from sequoia_x.strategy.limit_up_shakeout import LimitUpShakeoutStrategy
 from sequoia_x.strategy.ma_volume import MaVolumeStrategy
@@ -100,9 +100,10 @@ def build_strategies(engine: DataEngine, settings: Settings) -> list[BaseStrateg
         UptrendLimitDownStrategy(engine=engine, settings=settings),
         RpsBreakoutStrategy(engine=engine, settings=settings),
         PrivatePlacementStrategy(engine=engine, settings=settings),
-        # 逆势低吸：与精筛的「收盘价 >= MA120」天然互斥，故它不读注入池，
-        # 内部改用 apply_without_ma()（豁免均线维度）自行取全市场候选。
-        BollRsiReversalStrategy(engine=engine, settings=settings),
+        # 逆势低吸：判据是「跌破 MA20 超 4 个 ATR」+ 缩量区间（0.4~0.8），不用布林/RSI。
+        # 与精筛的「收盘价 >= MA120」天然互斥（实测 97.6% 的信号都在 MA120 之下），
+        # 故它不读注入池，内部改用 apply_without_ma()（豁免均线维度）自行取全市场候选。
+        AtrShrinkReversalStrategy(engine=engine, settings=settings),
         # 逆势低吸「中等幅度」档：回落 30-45% 但仍在 MA60 上方（精筛的 MA120 只筛掉 9 只，
         # 故走标准注入池）。定位是「低胜率高赔率」，2026 震荡市已无超额，见模块 docstring。
         PullbackShrinkStrategy(engine=engine, settings=settings),
