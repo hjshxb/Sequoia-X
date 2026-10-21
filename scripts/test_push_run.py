@@ -33,7 +33,7 @@ from sequoia_x.analysis.scorer import (  # noqa: E402
 )
 from sequoia_x.core.config import get_settings  # noqa: E402
 from sequoia_x.core.logger import get_logger  # noqa: E402
-from sequoia_x.data import board_concept  # noqa: E402
+from sequoia_x.data import board_concept, stock_meta  # noqa: E402
 from sequoia_x.data.engine import DataEngine  # noqa: E402
 from sequoia_x.data.universe_filter import UniverseFilter  # noqa: E402
 from sequoia_x.notify.feishu import FeishuNotifier  # noqa: E402
@@ -50,6 +50,10 @@ def main() -> None:
 
     logger.info("=" * 60)
     logger.info("[测试模式] 跳过 sync_today_bulk，直接使用本地库已有数据")
+    # 🔴 必须与 main.py 同构：不调这一行，`stock_meta` 的落盘缓存就是关的，
+    # 于是它会去连 baostock；baostock 一失败，报告与卡片里的名称全部退化成「—」。
+    # 2026-10-21 就是这么踩的 —— 测试跑把带名称的生产报告覆盖成了无名称版本。
+    stock_meta.configure_cache(settings.db_path, settings.stock_meta_ttl_days)
     universe = UniverseFilter(settings=settings, engine=engine)
     logger.info(universe.describe())
     logger.info("=" * 60)

@@ -223,3 +223,22 @@ def test_cache_hit_reuses_db_rows_for_all_symbols(env):
 
     assert meta["300750"].industry == "电气机械和器材制造业"
     assert set(meta) == {"600000", "300750"}
+
+
+# ── 入口一致性：镜像脚本必须与 main.py 配同样的缓存 ──
+# 2026-10-21 踩过：`scripts/test_push_run.py` 少调一行 `configure_cache`，
+# 于是它跳过本地缓存、去连 baostock；baostock 一失败，报告与卡片里的名称
+# 全部退化成「—」，而它生成的报告还覆盖了生产报告。
+# 这类「镜像脚本漏了初始化」的错，行为测试抓不到（脚本要联网、要跑全市场），
+# 只能对源码做结构断言。
+
+
+@pytest.mark.parametrize(
+    "script",
+    ["main.py", "scripts/test_push_run.py", "scripts/regen_report.py"],
+)
+def test_entry_scripts_configure_stock_meta_cache(script: str) -> None:
+    """所有会渲染报告/卡片的入口都必须启用 stock_meta 落盘缓存。"""
+    source = (Path(__file__).resolve().parent.parent / script).read_text(encoding="utf-8")
+
+    assert "stock_meta.configure_cache(" in source, f"{script} 未启用名称/行业落盘缓存"
