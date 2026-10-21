@@ -33,6 +33,7 @@ from sequoia_x.data.stock_meta import (
 )
 from sequoia_x.data.universe_filter import StockMetric
 from sequoia_x.notify.html_report import (
+    STRATEGY_LABELS,
     HtmlReportGenerator,
     board_chip_groups,
     build_symbol_marks,
@@ -845,3 +846,51 @@ def test_score_column_follows_holding_column(gen):
     section = text.split("<h2>海龟突破</h2>", 1)[1]
     header = section.split("<thead><tr>", 1)[1].split("</tr>", 1)[0]
     assert header.index("十大流通") < header.index("评分")
+
+
+# ── 筛股条件的例外说明 ──
+# 页首那行是「全局精筛」的镜像，但有两个策略走 apply_without_ma()、
+# BottomDoji 还放宽了成交额门槛。不标出来，读者会以为卡片写 3 亿而实跑 2 亿，
+# 进而怀疑「配置没更新」（2026-10-21 用户提出）。
+
+
+def test_filter_exception_note_is_empty_without_exception_strategies():
+    from sequoia_x.notify.html_report import filter_exception_note
+
+    assert filter_exception_note({"MaVolumeStrategy": ["600000"]}) == ""
+    # 命中为空也算「没出现」，不该冒出一句例外
+    assert filter_exception_note({"BottomDojiStrategy": []}) == ""
+
+
+def test_filter_exception_note_lists_only_present_exception_strategies():
+    from sequoia_x.notify.html_report import filter_exception_note
+
+    note = filter_exception_note(
+        {"MaVolumeStrategy": ["600000"], "BottomDojiStrategy": ["000001"]}
+    )
+    assert "底部十字星" in note
+    assert "ATR" not in note  # 本次没跑它，就不提
+    assert "见各自小节" in note
+
+
+def test_report_filter_line_carries_the_exception_note(gen):
+    """报告页首的筛股条件必须带上例外说明，否则与实跑门槛相矛盾。"""
+    text = gen.generate(
+        {"BottomDojiStrategy": ["600000"]}, filter_desc="精筛：成交额 >=3亿"
+    ).read_text(encoding="utf-8")
+
+    assert "成交额 &gt;=3亿" in text or "成交额 >=3亿" in text
+    assert "另有例外" in text
+
+
+def test_strategy_labels_match_strategy_constants():
+    """标签里写死的门槛数字必须与策略常量一致 —— 否则改常量不改标签就会撒谎。"""
+    from sequoia_x.strategy.atr_shrink_reversal import AtrShrinkReversalStrategy
+    from sequoia_x.strategy.bottom_doji import BottomDojiStrategy
+
+    doji = STRATEGY_LABELS["BottomDojiStrategy"]
+    atr = STRATEGY_LABELS["AtrShrinkReversalStrategy"]
+
+    assert f"{BottomDojiStrategy.min_turnover_yi:g}亿" in doji
+    # 两个都豁免均线维度：标签必须写明，否则页首的「收盘价>=MA120」会被当成人人适用
+    assert "免均线" in doji and "免均线" in atr

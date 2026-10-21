@@ -27,6 +27,7 @@ from sequoia_x.data.stock_meta import StockMeta
 from sequoia_x.notify.html_report import (
     CARD_CHIP_LIMITS,
     board_chip_groups,
+    filter_exception_note,
     group_by_board,
     strategy_label,
     to_xueqiu_code,
@@ -224,7 +225,12 @@ class FeishuNotifier:
         if data_status:
             summary.append(f"**数据日期：** {data_status}")
         if filter_desc:
-            summary.append(f"**筛股条件：** {_elide(filter_desc)}")
+            # 例外说明与报告同源（`filter_exception_note`）：这行是全局配置，
+            # 不带例外就会与「按策略放宽门槛」的事实相矛盾。截断放在拼完之后，
+            # 否则例外那句会被 120 字上限吃掉 —— 恰恰是最该被看到的部分。
+            summary.append(
+                f"**筛股条件：** {_elide(filter_desc + filter_exception_note(results))}"
+            )
 
         elements: list[dict] = [
             {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(summary)}}

@@ -57,6 +57,15 @@ STRATEGY_LABELS: dict[str, str] = {
     "UptrendLimitDownStrategy": "上升跌停反包",
     "RpsBreakoutStrategy": "RPS 突破",
     "PrivatePlacementStrategy": "定增公告",
+    # 下面三个走 `apply_without_ma()`，与全局精筛的「收盘价 >= MA120」不一致；
+    # `BottomDoji` 还按策略放宽了成交额门槛。**例外必须写在名字里** ——
+    # 卡片页首那行「筛股条件」描述的是全局配置，不反映任何策略的例外，
+    # 不在这里标出来，读的人就会以为卡片的门槛与实跑不符（2026-10-21 用户提出）。
+    # ⚠️ 括号里的数字与策略常量重复，`test_strategy_labels_match_strategy_constants`
+    # 会盯着它们不许漂。
+    "AtrShrinkReversalStrategy": "ATR 超跌（免均线）",
+    "BottomDojiStrategy": "底部十字星（免均线·成交额≥2亿）",
+    "PullbackShrinkStrategy": "深回调缩量",
 }
 
 # 兼容旧引用（原名带下划线，仅供历史代码/测试使用）
@@ -181,6 +190,28 @@ def board_chip_groups(
             )
         )
     return groups
+
+
+def filter_exception_note(results: Mapping[str, list[str]]) -> str:
+    """返回「筛股条件」后面那句例外说明；本次没有例外策略时返回空串。
+
+    页首那行「筛股条件」描述的是**全局**精筛配置（谁都能一眼核对 .env），
+    但有两个策略走 `apply_without_ma()`、`BottomDoji` 还放宽了成交额门槛。
+    不说明这一句，读的人会以为卡片写 3 亿而实跑是 2 亿 —— 于是怀疑「配置没更新」。
+    （2026-10-21 用户就是这么问的。）
+
+    判断依据是**标签里带全角括号**（见 `STRATEGY_LABELS` 的注释）：
+    例外策略在展示名后面挂了「（免均线…）」，没例外的一律不带括号。
+    这样新增例外时只改标签一处，页首、卡片、测试自动跟上。
+    """
+    short = [
+        label.split("（")[0]
+        for name, symbols in results.items()
+        if symbols and "（" in (label := STRATEGY_LABELS.get(name, ""))
+    ]
+    if not short:
+        return ""
+    return f"（{'、'.join(short)} 另有例外，见各自小节）"
 
 
 def build_symbol_marks(results: Mapping[str, list[str]]) -> dict[str, str]:
@@ -486,8 +517,13 @@ class HtmlReportGenerator:
             )
 
         empty_hint = '<p class="empty">本次运行所有策略均无选股结果。</p>' if total == 0 else ""
+        # 例外说明接在全局条件后面：这行本身只是 .env 的镜像，
+        # 不带上例外就会与「按策略放宽了门槛」的事实相矛盾。
         filter_line = (
-            f'<span class="filter">{html.escape(filter_desc)}</span>' if filter_desc else ""
+            f'<span class="filter">{html.escape(filter_desc + filter_exception_note(results))}'
+            f"</span>"
+            if filter_desc
+            else ""
         )
         # 「数据日期」单独一个标签：标题里的日期是**运行日**，数据可能来自更早的
         # 交易日（非交易日重跑等），两者分开展示才不会被读成同一件事。
