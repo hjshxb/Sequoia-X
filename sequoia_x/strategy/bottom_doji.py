@@ -15,6 +15,9 @@
   8. 放量：当日量 / 含当日的 5 日均量 >= 1.2（`confirm_vol_min`）
   9. 未创前 5 日新高（`require_no_breakout`，默认开）
 
+精筛：走 `apply_without_ma()`，且**成交额门槛单独放宽到 1 亿**（全局 3 亿）。
+  理由见下面 ⑥：3 亿这一刀同时砍掉 76% 的信号和三分之一的超额。
+
 为什么必须要有确认（用户口径：我们只选票，买不买看后续）：
   只靠形态选，池子 43.6 只/日，人根本看不过来；加上确认后 8.3 只/日，
   且**胜率与稳健性同时抬升**。实测（本地库 2024-01~2026-10，剔次新，20 日前向）：
@@ -50,6 +53,19 @@
 与 AtrShrinkReversal 的关系：加了确认之后两者几乎不重叠
   （Jaccard 0.0015，全期同日同票仅 10 次交集）⇒ 是真正的独立信号族。
   ⚠️ 旧版（十字星当日入选）曾记录「两者同时命中 +4.03%」，确认版已不适用，勿再引用。
+
+⑥ 🔴 **成交额门槛砍掉的「主要是 alpha」，故本类单独放宽到 1 亿**：
+     全局精筛要求成交额 >=3 亿，而底部缩量形态天然偏小盘（确认版 75.8% 的信号不到 3 亿）。
+       全部信号           8.3 只/日  62.9%  +1.46%  日中位 +0.44%
+       + 成交额 >=0.5亿   7.0 只/日  61.4%  +1.50%  日中位 +0.04%
+       + 成交额 >=1.0亿   5.5 只/日  60.2%  +1.08%  日中位 +0.04%   ← 本类默认
+       + 成交额 >=2.0亿   3.9 只/日  58.2%  +1.03%  日中位 −1.17%
+       + 成交额 >=3.0亿   3.2 只/日  57.8%  +0.92%  日中位 −0.18%   ← 全局门槛
+       + 成交额 >=5.0亿   2.4 只/日  52.3%  +0.48%  日中位 −2.24%
+     门槛越高越差、且几乎单调 ⇒ 3 亿这一刀同时砍掉了 76% 的信号和三分之一的超额。
+     放宽到 1 亿是「保住形态族」与「避免流动性过差」的折中；再往下（0.5 亿）收益更好
+     但可成交性开始成问题，故不到 0.5 亿。
+     ⚠️ 这是**风控取舍**：1 亿的票冲击成本明显高于 3 亿，仓位要相应放小。
 
 ⚠️ 必须走 `apply_without_ma()`：实测 92.9% 的形态落在 MA120 下方，
    沿用注入池会被「收盘价 >= MA120」整条清空。
@@ -104,6 +120,13 @@ class BottomDojiStrategy(BaseStrategy):
     require_no_breakout: bool = True
     breakout_lookback: int = 5
 
+    # ---- 策略级放宽的成交额门槛（亿元）----
+    # 全局精筛是 3 亿，但底部缩量形态天然偏小盘：确认版 75.8% 的信号成交额不到 3 亿，
+    # 而「成交额门槛」砍掉的**主要是 alpha**（详见模块 docstring ⑥）。
+    # 这里放宽到 1 亿以保住形态族，同时避免流动性过差的票。
+    # 只有比全局更松时才生效（见 `_turnover_override`）—— 全局没配成交额维度时不会被打开。
+    min_turnover_yi: float = 1.0
+
     # 最长窗口是 60 日；取 150 个自然日（≈100 个交易日）足够且不至于全表扫
     _HISTORY_DAYS: int = 150
 
@@ -129,6 +152,18 @@ class BottomDojiStrategy(BaseStrategy):
     def _shift(self, df: pd.DataFrame, series: pd.Series, periods: int = 1) -> pd.Series:
         """按股票分组位移，避免跨股票串行（每只票的第一根位移后为 NaN）。"""
         return series.groupby(df["symbol"], sort=False).shift(periods)
+
+    def _turnover_override(self) -> float | None:
+        """返回本次调用要用的成交额下限覆盖值；不需要放宽时返回 None。
+
+        只在「全局配了成交额、且本策略的门槛确实更松」时返回覆盖值 ——
+        `apply_without_ma(min_turnover=...)` 是**覆盖**语义，
+        无条件传值会在全局未启用该维度时把它强行打开，等于凭策略配置改变全局行为。
+        """
+        global_floor = self.settings.min_turnover
+        if global_floor is None or self.min_turnover_yi >= global_floor:
+            return None
+        return self.min_turnover_yi
 
     def run(self) -> list[str]:
         """返回今日「昨日底部十字星 + 今日放量阳线确认」的股票代码列表。"""
@@ -196,7 +231,9 @@ class BottomDojiStrategy(BaseStrategy):
         hit = df[hit_mask]
         # 形态日位置越低越靠前；同值按代码，保证输出稳定
         hit = hit.assign(_pos60=pos60_prev.loc[hit.index]).sort_values(["_pos60", "symbol"])
-        selected = self.universe_filter.apply_without_ma(hit["symbol"].tolist())
+        codes = hit["symbol"].tolist()
+        override = self._turnover_override()
+        selected = self.universe_filter.apply_without_ma(codes, min_turnover=override)
 
         chain = (
             f"昨日十字星 {n_doji} 只 → 今日阳线收红 {n_yang} 只 → 放量 {self.confirm_vol_min}x "
@@ -204,8 +241,13 @@ class BottomDojiStrategy(BaseStrategy):
         )
         if self.require_no_breakout:
             chain += f" → 未创前{self.breakout_lookback}日新高 {len(hit)} 只"
+        turnover_note = (
+            f"，成交额门槛放宽到 {override:g} 亿（全局 {self.settings.min_turnover:g} 亿）"
+            if override is not None
+            else ""
+        )
         logger.info(
             f"BottomDojiStrategy 选出 {len(selected)} 只股票"
-            f"（{chain} → 精筛后 {len(selected)} 只，数据日 {latest_date}）"
+            f"（{chain} → 精筛后 {len(selected)} 只，数据日 {latest_date}{turnover_note}）"
         )
         return selected

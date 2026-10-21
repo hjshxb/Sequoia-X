@@ -358,6 +358,57 @@ def test_apply_without_ma_handles_empty_input(tmp_path) -> None:
     assert universe.apply_without_ma([]) == []
 
 
+def _settings_with_turnover(db_path, min_turnover: float) -> Settings:
+    """打开流动性维度（成交额下限，单位亿元）。"""
+    return Settings(
+        _env_file=None,
+        db_path=str(db_path),
+        start_date="2026-01-01",
+        feishu_webhook_url="https://example.com/hook",
+        min_ma_deviation=0.0,
+        min_turnover=min_turnover,
+    )
+
+
+def test_turnover_override_is_only_applied_when_global_floor_exists(tmp_path) -> None:
+    """全局没配成交额时不该塞覆盖值 —— 覆盖会顺带把该维度打开，属于改变全局行为。"""
+    engine = _make_engine(tmp_path)
+    strategy = BottomDojiStrategy(engine=engine, settings=_settings(engine.db_path))
+
+    assert strategy._turnover_override() is None
+
+
+def test_turnover_override_is_skipped_when_not_looser_than_global(tmp_path) -> None:
+    """本策略门槛并不比全局松时，不必覆盖（保持「全局配置就是事实」）。"""
+    engine = _make_engine(tmp_path)
+    strategy = BottomDojiStrategy(
+        engine=engine, settings=_settings_with_turnover(engine.db_path, 0.5)
+    )
+
+    assert strategy._turnover_override() is None  # 1.0 >= 0.5，不覆盖
+
+
+def test_turnover_override_relaxes_global_floor_to_one_yi(tmp_path, monkeypatch) -> None:
+    """全局 3 亿时，本策略按 1 亿放宽：1.5 亿的票应入选；把放宽值提到 3 亿则应被剔除。
+
+    用 stub 取代本地库成交额，避免测试依赖 fixture 里的 turnover 值。
+    """
+    monkeypatch.setattr(
+        UniverseFilter, "_fetch_turnover", lambda self, symbols: dict.fromkeys(symbols, 1.5e8)
+    )
+    engine = _make_engine(tmp_path)
+    strategy = BottomDojiStrategy(
+        engine=engine, settings=_settings_with_turnover(engine.db_path, 3)
+    )
+
+    assert strategy._turnover_override() == 1.0
+    assert strategy.run() == [_HIT]
+
+    strategy.min_turnover_yi = 3.0  # 不再比全局松 ⇒ 回落到 3 亿，1.5 亿的票被剔
+    assert strategy._turnover_override() is None
+    assert strategy.run() == []
+
+
 def test_empty_database_returns_empty(tmp_path) -> None:
     settings = _settings(tmp_path / "empty.db")
     engine = DataEngine(settings)

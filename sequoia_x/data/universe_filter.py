@@ -129,6 +129,8 @@ class _Context:
     holdings: dict[str, float]
     drops: dict[str, float]
     ma_deviations: dict[str, float]
+    # 本次调用实际生效的成交额下限（亿元）。可能来自策略级放宽，不等于 settings 里的值
+    min_turnover: float | None = None
     reasons: dict[str, int] = field(default_factory=dict)
 
     def drop(self, reason: str) -> None:
@@ -575,7 +577,9 @@ class UniverseFilter:
         logger.info(f"精筛预筛：{len(stage1)} -> {len(stage2)}（市值/PE/PB/换手率）")
         return stage2
 
-    def apply_without_ma(self, symbols: list[str]) -> list[str]:
+    def apply_without_ma(
+        self, symbols: list[str], *, min_turnover: float | None = None
+    ) -> list[str]:
         """应用精筛，但**豁免「均线」维度**（供逆势 / 超跌类策略使用）。
 
         为什么需要单独一个入口：精筛的「收盘价 >= MA120」要求股票站上中期趋势，
@@ -589,21 +593,27 @@ class UniverseFilter:
 
         Args:
             symbols: 待过滤的股票代码列表。
+            min_turnover: 本次调用使用的成交额下限（**亿元**），覆盖
+                `settings.min_turnover`。仅供个别策略按自身形态特征放宽，默认 None
+                = 沿用全局配置。注意它是「覆盖」而不是「取更松的值」，
+                该不该放宽由调用方判断（见 `BottomDojiStrategy._turnover_override`）。
 
         Returns:
             通过「除均线以外」全部已配置维度的代码列表；未配置任何维度时原样返回。
         """
         if not symbols:
             return []
+        floor = self.settings.min_turnover if min_turnover is None else min_turnover
         return self._apply(
             symbols,
             valuation=False,
-            liquidity=self._liquidity_enabled,
+            liquidity=floor is not None,
             technical=False,
             today_drop=self._today_drop_enabled,
             ma=False,
             industry=self._industry_enabled,
             holder=self._holder_enabled,
+            min_turnover=min_turnover,
         )
 
     def _apply(
@@ -617,6 +627,7 @@ class UniverseFilter:
         ma: bool = False,
         industry: bool,
         holder: bool = False,
+        min_turnover: float | None = None,
     ) -> list[str]:
         """按显式指定的维度集合过滤候选股票。
 
@@ -632,6 +643,7 @@ class UniverseFilter:
             ma: 是否启用均线维度（本地库收盘价 vs N 日均线）。
             industry: 是否启用行业维度（白名单/黑名单）。
             holder: 是否启用筹码维度（前十大流通股东合计占比）。
+            min_turnover: 成交额下限覆盖值（亿元）；None 表示用 `settings.min_turnover`。
 
         Returns:
             过滤后的代码列表。指定维度全为 False、或输入为空时原样返回。
@@ -713,6 +725,9 @@ class UniverseFilter:
             holdings=holdings,
             drops=drops,
             ma_deviations=ma_deviations,
+            min_turnover=(
+                self.settings.min_turnover if min_turnover is None else min_turnover
+            ),
         )
 
         kept: list[str] = []
@@ -775,7 +790,8 @@ class UniverseFilter:
             if amount is None:
                 ctx.drop("成交额缺失")
                 return False
-            if amount / YI < s.min_turnover:
+            floor = ctx.min_turnover
+            if floor is not None and amount / YI < floor:
                 ctx.drop("成交额不足")
                 return False
 

@@ -504,6 +504,45 @@ def test_liquidity_does_not_require_baostock(monkeypatch):
     assert calls["n"] == 0
 
 
+def test_apply_without_ma_turnover_override_relaxes_floor(monkeypatch):
+    """策略级放宽：全局 3 亿时，传 min_turnover=1 后 1.5 亿的票应放行。
+
+    这是 `BottomDojiStrategy` 用的通道 —— 底部缩量形态天然偏小盘，
+    3 亿门槛会把 76% 的信号和三分之一的超额一起砍掉。
+    """
+    monkeypatch.setattr(
+        UniverseFilter,
+        "_fetch_turnover",
+        stub_turnover({"000001": 1.5e8}),  # 1.5 亿
+    )
+    f = UniverseFilter(settings=make_settings(min_turnover=3))
+
+    assert f.apply_without_ma(["000001"]) == []  # 全局 3 亿拦住
+    assert f.apply_without_ma(["000001"], min_turnover=1) == ["000001"]  # 放宽后放行
+
+
+def test_apply_without_ma_turnover_override_can_tighten(monkeypatch):
+    """覆盖是「替换」而不是「取更松」—— 传更大的值也必须生效。"""
+    monkeypatch.setattr(UniverseFilter, "_fetch_turnover", stub_turnover({"000001": 1.5e8}))
+    f = UniverseFilter(settings=make_settings(min_turnover=1))
+
+    assert f.apply_without_ma(["000001"]) == ["000001"]
+    assert f.apply_without_ma(["000001"], min_turnover=3) == []
+
+
+def test_apply_without_ma_turnover_override_enables_dimension(monkeypatch):
+    """全局未配成交额时，显式传值应把该维度打开（而不是被当成「沿用全局=None」）。"""
+    monkeypatch.setattr(
+        UniverseFilter,
+        "_fetch_turnover",
+        stub_turnover({"000001": 0.5e8, "000002": 2e8}),
+    )
+    f = UniverseFilter(settings=make_settings())
+
+    assert f.apply_without_ma(["000001", "000002"]) == ["000001", "000002"]
+    assert f.apply_without_ma(["000001", "000002"], min_turnover=1) == ["000002"]
+
+
 # ── 技术面维度 ──
 
 
