@@ -144,6 +144,7 @@ _STRATEGY_ATTRS = (
     "AtrShrinkReversalStrategy",
     "BottomDojiStrategy",
     "PullbackShrinkStrategy",
+    "MaDispersionStrategy",
 )
 
 

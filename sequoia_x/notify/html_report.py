@@ -65,6 +65,7 @@ STRATEGY_LABELS: dict[str, str] = {
     # 会盯着它们不许漂。
     "AtrShrinkReversalStrategy": "ATR 超跌（免均线）",
     "BottomDojiStrategy": "底部十字星（免均线·成交额≥2亿）",
+    "MaDispersionStrategy": "均线收敛发散（免均线·成交额≥2亿）",
     "PullbackShrinkStrategy": "深回调缩量",
 }
 

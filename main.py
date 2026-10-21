@@ -35,6 +35,7 @@ from sequoia_x.strategy.base import BaseStrategy
 from sequoia_x.strategy.bottom_doji import BottomDojiStrategy
 from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
 from sequoia_x.strategy.limit_up_shakeout import LimitUpShakeoutStrategy
+from sequoia_x.strategy.ma_dispersion import MaDispersionStrategy
 from sequoia_x.strategy.ma_volume import MaVolumeStrategy
 from sequoia_x.strategy.private_placement import PrivatePlacementStrategy
 from sequoia_x.strategy.pullback_shrink import PullbackShrinkStrategy
@@ -115,6 +116,11 @@ def build_strategies(engine: DataEngine, settings: Settings) -> list[BaseStrateg
         # 逆势低吸「中等幅度」档：回落 30-45% 但仍在 MA60 上方（精筛的 MA120 只筛掉 9 只，
         # 故走标准注入池）。定位是「低胜率高赔率」，2026 震荡市已无超额，见模块 docstring。
         PullbackShrinkStrategy(engine=engine, settings=settings),
+        # 均线纠缠后方向刚出来：20 日内离散度曾收敛、今日已发散，且 **MA5 上翘 + 缩量 +
+        # 仍在 MA20 下方 3%**（静悄悄启动，不是追高）。16 只/日、胜率 75.6%、同日超额 +1.28%。
+        # ⚠️ 方向必须用 MA5 斜率；换成「多头排列」会与动量头部重叠 82.6%、收益转 −0.94%。
+        # ⚠️ 96.8% 的信号在 MA120 下方，故也走 apply_without_ma()。
+        MaDispersionStrategy(engine=engine, settings=settings),
     ]
 
 
