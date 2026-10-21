@@ -266,22 +266,27 @@ def test_board_panel_renders_chips(gen):
     assert "<h2>板块 / 概念分布</h2>" in text
     assert '<span class="chip" data-count="7">病原体防治<b>7</b></span>' in text
     assert '<div class="chip-row" data-kind="industry">' in text
-    assert '<div class="chip-row" data-kind="region">' in text
+    # 地域板块 2026-10-21 起不展示（`_FAKE_SUMMARY` 里仍带着，证明是主动丢弃）
+    assert '<div class="chip-row" data-kind="region">' not in text
+    assert "山东板块" not in text
     assert "最集中：病原体防治 7/10 只" in text
     # 覆盖不完整必须如实写出来，否则「只列了 3 个概念」会被读成「其余票没题材」
     assert "1 只未取到板块数据" in text
 
 
-def test_board_panel_hides_singletons_and_counts_the_rest(gen):
-    """只命中 1 只的概念不进 chip（但个数与名称要能查到）。"""
+def test_board_panel_hides_singletons_and_does_not_count_them(gen):
+    """只命中 1 只的概念既不起 chip，也不进「另 N 个」—— 它不构成扎堆。
+
+    旧口径把它算进「另 N 个」，于是 73 只票的面板会报「另 201 个」（2026-10-21 修）。
+    """
     text = gen.generate(
         {"TurtleTradeStrategy": ["600000"]}, board_summary=_FAKE_SUMMARY
     ).read_text(encoding="utf-8")
 
     concept_row = text.split('data-kind="concept"')[1].split("</div>")[0]
-    assert ">冷门概念<b>" not in concept_row, "只命中 1 只的不该有自己的 chip"
-    assert 'title="冷门概念"' in concept_row  # 悬停可查完整名单
-    assert '<span class="chip more" title="冷门概念">另 1 个</span>' in concept_row
+    assert "只中一只" not in concept_row, "只命中 1 只的不该出现（chip 与 title 都不该有）"
+    # 命中 >=2 只的共 3 个、报告上限 18 ⇒ 全部展示，没有截断
+    assert "另" not in concept_row
 
 
 def test_board_panel_embeds_recoverable_summary_json(gen):
@@ -300,7 +305,9 @@ def test_board_panel_embeds_recoverable_summary_json(gen):
     assert raw["total"] == 10 and raw["covered"] == 9
     assert raw["concepts"][0] == ["病原体防治", 7]
     assert raw["industries"] == [["医药生物", 6], ["基础化工", 2]]
-    assert raw["regions"] == [["山东板块", 3]]
+    # 地域板块 2026-10-21 起既不展示也不写进 JSON（`_FAKE_SUMMARY.regions` 仍非空，
+    # 用来证明「有数据也不出现」，而不是碰巧没数据）
+    assert "regions" not in raw
 
 
 def test_board_panel_is_not_a_searchable_card(gen):
@@ -356,16 +363,16 @@ def test_board_panel_escapes_names(gen):
 
 
 def test_chip_groups_respect_limits_and_report_omitted_names():
-    groups = board_chip_groups(
-        _FAKE_SUMMARY, {"concept": 2, "industry": 5, "region": 5}
-    )
+    groups = board_chip_groups(_FAKE_SUMMARY, {"concept": 2, "industry": 5})
     by_kind = {g.kind: g for g in groups}
 
     assert [name for name, _ in by_kind["concept"].shown] == ["病原体防治", "创新药"]
-    assert by_kind["concept"].omitted == ("CRO", "冷门概念")
-    assert by_kind["concept"].omitted_count == 2
+    # 只算同样够格（>=2 只）的：CRO 是被上限截掉的，「冷门概念」只中 1 只、不算
+    assert by_kind["concept"].omitted == ("CRO",)
+    assert by_kind["concept"].omitted_count == 1
     assert by_kind["industry"].omitted == ()
-    assert [g.kind for g in groups] == ["concept", "industry", "region"]
+    # 地域不再产出一个分组（`_FAKE_SUMMARY.regions` 非空，证明是展示层主动丢弃）
+    assert [g.kind for g in groups] == ["concept", "industry"]
 
 
 def test_chip_groups_skips_category_without_repeated_items():
@@ -373,7 +380,7 @@ def test_chip_groups_skips_category_without_repeated_items():
     summary = BoardSummary(
         total=2, covered=2, concepts=(("A", 1), ("B", 1)), industries=(("电子", 2),)
     )
-    groups = board_chip_groups(summary, {"concept": 18, "industry": 12, "region": 10})
+    groups = board_chip_groups(summary, {"concept": 18, "industry": 12})
 
     assert [g.kind for g in groups] == ["industry"]
     assert board_chip_groups(None, {"concept": 5}) == []

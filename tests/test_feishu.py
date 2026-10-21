@@ -368,12 +368,17 @@ def test_card_shows_board_section() -> None:
     assert "🧩 板块 / 概念分布" in text
     assert "概念：病原体防治 7、创新药 5" in text
     assert "申万行业：医药生物 6、基础化工 2" in text
-    assert "地域：山东板块 3" in text
+    # 地域板块 2026-10-21 起不再展示：数据里有（`_FAKE_SUMMARY.regions`）也不出现
+    assert "地域" not in text
     assert "（10 只中 9 只取到板块数据）" in text
 
 
 def test_card_board_section_truncates_without_losing_the_count() -> None:
-    """卡片上限比报告紧：被截掉的条目要收成「另 N 个」，不能凭空消失。"""
+    """卡片上限比报告紧：被截掉的**同档次**条目要收成「另 N 个」，不能凭空消失。
+
+    ⚠️ 只命中 1 只的标签不计入「另 N 个」—— 面板口径是「扎堆方向」，
+    把几百个零散标签算进来会得到「另 201 个」这种毫无意义的数字（2026-10-21 修）。
+    """
     notifier = FeishuNotifier(make_settings())
     card = posted_card(notifier, {"MaVolumeStrategy": ["600000"]}, board_summary=_FAKE_SUMMARY)
     concept_line = next(
@@ -384,7 +389,9 @@ def test_card_board_section_truncates_without_losing_the_count() -> None:
 
     assert "冷门概念" not in concept_line, "超出上限的条目不进卡片"
     assert "只中一只" not in concept_line, "只命中 1 只的不进卡片"
-    assert concept_line.endswith("另 2 个")  # 冷门概念 + 只中一只
+    # 命中 >=2 只的共 9 个、卡片上限 8 ⇒ 只压掉 1 个（冷门概念）。
+    # 旧口径会报「另 2 个」（把只中一只也算进去），那正是本次要修的统计错误。
+    assert concept_line.endswith("另 1 个")
 
 
 def test_card_omits_board_section_when_absent_or_empty() -> None:

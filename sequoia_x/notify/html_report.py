@@ -8,8 +8,9 @@
       传入 `metrics` 时额外展示「市值 / 换手率 / PE(TTM)」三列。
     - 股票名称与行业由数据层 `sequoia_x.data.stock_meta` 提供（一次请求 + 进程内缓存），
       与「行业过滤」共用同一份数据，不重复请求；板块由代码前缀本地判定，零开销。
-    - 传入 `board_summary` 时页首多一块「板块 / 概念分布」（概念 / 申万行业 / 地域
-      的命中只数），回答策略表答不了的「这批票扎堆在什么方向」。
+    - 传入 `board_summary` 时页首多一块「板块 / 概念分布」（概念 / 申万行业的
+      命中只数），回答策略表答不了的「这批票扎堆在什么方向」。
+      地域板块**不再展示**（数据仍采集，见 `BOARD_KINDS` 的说明）。
     - 报告生成失败不影响主流程（调用方自行兜底），也不依赖飞书是否配置。
 """
 
@@ -85,17 +86,22 @@ def strategy_label(strategy_name: str) -> str:
 # 一两百个「只命中 1 只」的概念，全列出来等于没有筛选。
 _CHIP_MIN_COUNT = 2
 # 报告里的展示上限（比卡片宽：报告可换行、可悬停看完整名单）
-REPORT_CHIP_LIMITS: dict[str, int] = {"concept": 18, "industry": 12, "region": 10}
+REPORT_CHIP_LIMITS: dict[str, int] = {"concept": 18, "industry": 12}
 # 卡片里的展示上限（飞书卡片对总长度敏感，收敛得更紧）。
 # 公开名字：飞书渲染层要从这里取，两处共用同一份常量，别各写一套数字。
-CARD_CHIP_LIMITS: dict[str, int] = {"concept": 8, "industry": 6, "region": 5}
+CARD_CHIP_LIMITS: dict[str, int] = {"concept": 8, "industry": 6}
 
 # 类别的展示顺序与中文名。顺序即「读者最关心 → 次之」：
-# 概念是题材聚合的主线，行业说明它落在哪个大板块，地域只在区域炒作时才看。
+# 概念是题材聚合的主线，行业说明它落在哪个大板块。
+#
+# 🔴 **地域板块不再展示**（2026-10-21 用户要求）。原因不是取不到数据，而是
+# 「福建板块 / 贵州板块」这类划分对选股的解读价值很低：命中几只同省股票
+# 多半是巧合，凑在屏上还会把概念和行业挤下去。
+# `board_concept` 仍然照常采集 `regions`（同一次请求里就带回来了，不额外花钱），
+# 只是展示层不再读它 —— 将来若要恢复，这里加回一行即可。
 BOARD_KINDS: tuple[tuple[str, str], ...] = (
     ("concept", "概念"),
     ("industry", "申万行业"),
-    ("region", "地域"),
 )
 
 
@@ -109,11 +115,13 @@ class ChipGroup:
     """一类板块的展示结果。
 
     Attributes:
-        kind: `concept` / `industry` / `region`。
+        kind: `concept` / `industry`（地域已下线，见 `BOARD_KINDS`）。
         label: 中文名（概念 / 申万行业 / 地域）。
         shown: 要展示的 [(名称, 只数)]。
-        omitted: 被压掉的名称（含所有「只命中 1 只」的）—— 报告用它填 `title`，
-            卡片只看个数（`len(omitted)`）。
+        omitted: 被压掉的名称 —— **只统计同样够格（命中 >=2 只）的标签**。
+            只命中 1 只的不算「另 N 个」，它们是零散个股、本来就不该进这个面板
+            （面板的口径是「扎堆方向」，一行「另 300 个」说明不了任何事）。
+            报告用它填 `title`，卡片只看个数（`len(omitted)`）。
     """
 
     kind: str
@@ -150,13 +158,9 @@ def board_chip_groups(
         return []
 
     groups: list[ChipGroup] = []
+    sources = {"concept": summary.concepts, "industry": summary.industries}
     for kind, label in BOARD_KINDS:
-        if kind == "concept":
-            items = summary.concepts
-        elif kind == "industry":
-            items = summary.industries
-        else:
-            items = summary.regions
+        items = sources[kind]
         repeated = tuple(item for item in items if item[1] >= _CHIP_MIN_COUNT)
         shown = repeated[: max(0, limits.get(kind, 0))]
         if not shown:
@@ -168,7 +172,12 @@ def board_chip_groups(
                 kind=kind,
                 label=label,
                 shown=shown,
-                omitted=tuple(name for name, _ in items[len(shown) :]),
+                # 🔴 只能从 `repeated` 里切，**不能**从 `items` 里切。
+                # 2026-10-21 修：原先写的是 `items[len(shown):]`，于是「另 N 个」
+                # 把几百个「只命中 1 只」的标签也算进去了 —— 73 只票的面板报
+                # 「另 201 个」，而实际命中 ≥2 只的标签只有 8 个、一个都没被截断。
+                # 面板一边写「仅列命中 >=2 只的」、一边报 201，读者只会以为统计坏了。
+                omitted=tuple(name for name, _ in repeated[len(shown) :]),
             )
         )
     return groups
@@ -652,9 +661,8 @@ class HtmlReportGenerator:
     white-space: nowrap;
   }}
   .chip b {{ font-variant-numeric: tabular-nums; font-weight: 700; }}
-  /* 行业与地域用中性色：一眼区分「题材」（红）与「归类」（灰） */
-  .chip-row[data-kind="industry"] .chip,
-  .chip-row[data-kind="region"] .chip {{ background: #f1f2f4; color: var(--muted); }}
+  /* 行业用中性色：一眼区分「题材」（红）与「归类」（灰） */
+  .chip-row[data-kind="industry"] .chip {{ background: #f1f2f4; color: var(--muted); }}
   .chip.more {{ background: none; border: 1px dashed var(--border); color: var(--muted); }}
   td.rank {{ color: var(--muted); font-variant-numeric: tabular-nums; width: 34px; }}
   td.score {{ font-weight: 700; color: var(--accent); cursor: help; }}
@@ -813,7 +821,6 @@ class HtmlReportGenerator:
                 "covered": summary.covered,
                 "concepts": summary.concepts,
                 "industries": summary.industries,
-                "regions": summary.regions,
             },
             ensure_ascii=False,
         ).replace("<", "\\u003c")

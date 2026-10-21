@@ -136,6 +136,10 @@ def main() -> None:
 
     if not any(results.values()):
         logger.info("所有策略均无选股结果，跳过飞书推送")
+    elif "--no-push" in sys.argv[1:]:
+        # 只重刷本地报告时用：报告与卡片同源，跳过推送不影响报告内容，
+        # 但能避免「为了看一眼版式又往群里推一张卡」。
+        logger.info("--no-push：跳过飞书推送（仅生成本地报告）")
     else:
         try:
             FeishuNotifier(settings).send_report(
