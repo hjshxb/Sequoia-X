@@ -388,23 +388,23 @@ def test_turnover_override_is_skipped_when_not_looser_than_global(tmp_path) -> N
     assert strategy._turnover_override() is None  # 1.0 >= 0.5，不覆盖
 
 
-def test_turnover_override_relaxes_global_floor_to_two_yi(tmp_path, monkeypatch) -> None:
-    """全局 3 亿时，本策略按 2 亿放宽：2.5 亿的票应入选；把放宽值提到 3 亿则应被剔除。
+def test_turnover_override_relaxes_global_floor_to_half_yi(tmp_path, monkeypatch) -> None:
+    """全局 3 亿时，本策略按 0.5 亿放宽：0.8 亿的票应入选；把放宽值提到 3 亿则应被剔除。
 
     用 stub 取代本地库成交额，避免测试依赖 fixture 里的 turnover 值。
     """
     monkeypatch.setattr(
-        UniverseFilter, "_fetch_turnover", lambda self, symbols: dict.fromkeys(symbols, 2.5e8)
+        UniverseFilter, "_fetch_turnover", lambda self, symbols: dict.fromkeys(symbols, 0.8e8)
     )
     engine = _make_engine(tmp_path)
     strategy = BottomDojiStrategy(
         engine=engine, settings=_settings_with_turnover(engine.db_path, 3)
     )
 
-    assert strategy._turnover_override() == 2.0
+    assert strategy._turnover_override() == 0.5
     assert strategy.run() == [_HIT]
 
-    strategy.min_turnover_yi = 3.0  # 不再比全局松 ⇒ 回落到 3 亿，2.5 亿的票被剔
+    strategy.min_turnover_yi = 3.0  # 不再比全局松 ⇒ 回落到 3 亿，0.8 亿的票被剔
     assert strategy._turnover_override() is None
     assert strategy.run() == []
 

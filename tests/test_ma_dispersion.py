@@ -236,13 +236,17 @@ def test_turnover_override_is_applied_only_when_looser(tmp_path) -> None:
     strict = MaDispersionStrategy(
         engine=engine, settings=_settings(engine.db_path, min_turnover=3.0)
     )
-    assert strict._turnover_override() == 2.0
+    assert strict._turnover_override() == 0.3
 
 
-def test_turnover_floor_of_two_yi_keeps_the_hit(tmp_path, monkeypatch) -> None:
-    """全局 3 亿、本策略 2 亿：成交额 2.5 亿的命中样本应放行。"""
+def test_turnover_floor_of_three_fen_yi_keeps_the_hit(tmp_path, monkeypatch) -> None:
+    """全局 3 亿、本策略 0.3 亿：成交额 0.5 亿的命中样本应放行。
+
+    ⚠️ 这条门槛不是随手定的：0.5 亿时超额只剩 +0.26%、1 亿转负、2 亿 −1.14%
+    （见模块 docstring ⑤）。所以这里刻意用 0.5 亿的样本，验证「不会被误杀」。
+    """
     monkeypatch.setattr(
-        UniverseFilter, "_fetch_turnover", lambda self, symbols: dict.fromkeys(symbols, 2.5e8)
+        UniverseFilter, "_fetch_turnover", lambda self, symbols: dict.fromkeys(symbols, 0.5e8)
     )
     engine = _make_engine(tmp_path)
     strategy = MaDispersionStrategy(
