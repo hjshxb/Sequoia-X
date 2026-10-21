@@ -15,9 +15,10 @@
 排行表对应列还原出来，否则预览板块的**顺序**会和真实卡片不一样。
 
 同日更晚一刀：卡片的「量化评分 Top 5」+「形态匹配 Top 5」两个小节**合并**成
-一个「🎯 综合评分 Top 10」（按 `scorer.composite_score` 排序，见
-`feishu._composite_section`）。这里无需改逻辑 —— 综合分由 `feishu` 内部现算，
-本脚本只管把 `prob_up / prob_samples / prob_confidence` 三个字段喂全，
+一个「🎯 综合评分 Top 20」（按 `scorer.composite_score` 排序，见
+`feishu._composite_section`；2026-10-21 由前 10 改为前 20）。
+这里无需改逻辑 —— 综合分由 `feishu` 内部现算，本脚本只管把
+`prob_up / prob_samples / prob_confidence` 三个字段喂全，
 缺一个综合分就会退化（胜率不当权重、预览顺序与真实卡片不符）。
 
 再一刀（同步完整性）：卡片摘要多一行「**数据日期：** …」，值来自

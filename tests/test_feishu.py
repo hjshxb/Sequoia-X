@@ -422,7 +422,7 @@ def test_send_report_forwards_board_summary_to_card() -> None:
 
 
 # ── 综合评分榜（评分 + 胜率，单一栏目）──
-# 卡片只推**一个**「🎯 综合评分 Top 10」栏目。过去拆成「量化评分 Top 5」+
+# 卡片只推**一个**「🎯 综合评分 Top 20」栏目。过去拆成「量化评分 Top 5」+
 # 「形态匹配 Top 5」两个榜：两个视角的名单经常不一致甚至反向（高分股胜率为 0、
 # 低分股胜率很高），摆在一起只会让人问「信哪个」。现在统一按
 # `scorer.composite_score`（评分 ×0.7 + 胜率按可信度收缩后 ×0.3）排序，
@@ -460,15 +460,19 @@ def test_card_shows_composite_section_with_scores() -> None:
     assert "xueqiu.com/S/SZ300750" in text  # 榜内同样是可点链接
 
 
-def test_card_composite_section_is_capped_at_ten() -> None:
-    """卡片元素数有限，综合榜只放前 10 名；完整排行在本地 HTML 报告里。"""
+def test_card_composite_section_is_capped_at_twenty() -> None:
+    """卡片元素数有限，综合榜只放前 20 名；完整排行在本地 HTML 报告里。
+
+    2026-10-21 用户要求由前 10 改为前 20 —— 这个用例盯的是「截断仍然生效」，
+    不是「一定要 20」：改 `_TOP_COMPOSITE` 时同步改这里的数字即可。
+    """
     notifier = FeishuNotifier(make_settings())
-    symbols = [f"{i:06d}" for i in range(12)]
+    symbols = [f"{i:06d}" for i in range(22)]
     scores = [make_score(s, 90.0 - i) for i, s in enumerate(symbols)]
     text = card_text(posted_card(notifier, {"MaVolumeStrategy": symbols}, scores=scores))
 
-    assert "🎯 综合评分 Top 10" in text
-    assert "**11.**" not in composite_section(text)
+    assert "🎯 综合评分 Top 20" in text
+    assert "**21.**" not in composite_section(text)
 
 
 def test_card_composite_blends_winrate_into_score() -> None:
@@ -607,7 +611,7 @@ def test_card_composite_handles_missing_name() -> None:
     assert "**1.** [999999](https://xueqiu.com/S/SZ999999) · **综合 61.0** · 评分 61.0" in text
 
 
-# 旧的「📈 形态匹配 Top 5」单独栏目已并入「🎯 综合评分 Top 10」，
+# 旧的「📈 形态匹配 Top 5」单独栏目已并入「🎯 综合评分 Top 20」，
 # 相关用例（按可信度排序 / k over n / 缺可信度排最后 等）已由上面的
 # 综合榜用例覆盖；胜率的排序语义现在住在 `scorer.composite_score` 里，
 # 由 `tests/test_scorer.py` 覆盖。

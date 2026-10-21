@@ -48,10 +48,13 @@ _MAX_FILTER_CHARS = 120
 # 摆在一起只会让人问「到底信哪个」。改成一个榜、一个明确的排序口径后，
 # 卡片上每一行都是同一个问题的答案：「按评分和胜率的综合排序，我最该先看谁」。
 #
-# 为什么给 10 而不是 5：两个榜各 5 是 10 个位置，合并后保持 10 个位置，
-# 信息量不缩水；且综合分天然把「高分低胜率」和「高胜率低分」都摆在中间地带，
-# 单看前 5 容易只剩高分那一类。
-_TOP_COMPOSITE = 10
+# 为什么给 20 而不是过去的 10：用户 2026-10-21 明确要求「综合排名推送前 20 个」。
+# 卡片上的票数就是「打开手机后要按顺序看几张」—— 20 只在手机上滚动一屏半仍可接受，
+# 而 10 只常常把策略小节里出现的票挡在榜单外，读的人还得自己回去对照。
+# ⚠️ 飞书对卡片元素数与总长度有限制：调大这个值要连带确认卡片没被截断
+# （回归用例 `test_card_composite_section_is_capped_at_twenty` 只盯截断逻辑，
+# 盯不了卡片体积）。
+_TOP_COMPOSITE = 20
 
 
 def _elide(text: str, limit: int = _MAX_FILTER_CHARS) -> str:
@@ -111,7 +114,7 @@ class FeishuNotifier:
 
     @classmethod
     def _composite_section(cls, scores: Sequence[ScoreDetail], meta: dict[str, StockMeta]) -> str:
-        """渲染「综合评分 Top 10」小节：按评分 + 胜率的综合分降序。
+        """渲染「综合评分 Top 20」小节：按评分 + 胜率的综合分降序。
 
         综合分的口径完全交给 `scorer.composite_score()`（唯一真源），本方法
         只负责排版 —— 排序口径散落在展示层迟早会漂移（报告页首、飞书卡片、
@@ -194,7 +197,7 @@ class FeishuNotifier:
         Args:
             results: 各策略的选股结果，顺序即卡片中小节的顺序。
             filter_desc: 精筛条件描述，展示在卡片顶部便于解释结果为何偏少。
-            scores: 可选的量化评分。传入后卡片顶部多一个「🎯 综合评分 Top 10」
+            scores: 可选的量化评分。传入后卡片顶部多一个「🎯 综合评分 Top 20」
                 小节（按评分与胜率的综合分排序，见 `_composite_section`），
                 且各策略小节**内部**改按综合分名次排列（综合分口径唯一，
                 见 `scorer.composite_score`）。
