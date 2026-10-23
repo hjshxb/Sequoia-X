@@ -22,6 +22,7 @@ import sys
 
 from dotenv import load_dotenv
 
+from sequoia_x.analysis.ma20_filter import Ma20DeviationFilter
 from sequoia_x.analysis.scorer import ScoreDetail, composite_score, score_from_settings
 from sequoia_x.core.config import MAX_SYNC_WORKERS, Settings, get_settings
 from sequoia_x.core.logger import get_logger
@@ -255,11 +256,36 @@ def main() -> None:
             results[strategy_name] = selected
             logger.info(f"{strategy_name} 选出 {len(selected)} 只股票")
 
+        # 6.4 距 MA20 偏离度硬剔除：突破类策略天然选「离均线很远」的票，
+        #     而偏离度是可测的风险量。分低波/非低波两档设阈值（实测非低波 9~12%
+        #     就转负、低波 15% 之后才衰减）。放在评分**之前**，省掉被剔票的增强开销。
+        #     ⚠️ 取不到 K 线的票按降级保留（不把数据问题变成选股结论）。
+        ma20_dropped = ""
+        # 页首/卡片上只放一个短标记（完整原因太长，卡片那行还有 120 字上限，
+        # 塞长了会把「策略例外说明」挤掉）。明细只进日志。
+        ma20_suffix = ""
+        displayed = sorted({s for symbols in results.values() for s in symbols})
+        if displayed:
+            try:
+                fr = Ma20DeviationFilter(settings).apply(results)
+                results = fr.results
+                ma20_dropped = fr.summary()
+                if fr.dropped:
+                    ma20_suffix = f"；距MA20剔 {len(fr.dropped)} 只"
+                    logger.info(
+                        f"{ma20_dropped}；明细："
+                        + "、".join(
+                            f"{d.symbol}({d.dev:+.1f}%/波动{d.vol:.0f}%)" for d in fr.dropped
+                        )
+                    )
+                displayed = sorted({s for symbols in results.values() for s in symbols})
+            except Exception as exc:
+                logger.error(f"距MA20过滤失败（本次不剔除）：{exc}")
+
         # 6.5 量化评分：把「入选 / 未入选」的布尔结果变成可排序的分数。
         #     全部数据取自本地行情库，零网络开销；精筛已拉取的指标直接复用。
         #     评分失败**不能**阻断主流程 —— 报告和推送仍要照常产出，
         #     少一个评分列远好过当天什么都收不到。
-        displayed = sorted({s for symbols in results.values() for s in symbols})
         metrics = universe.fetch_metrics(displayed) if displayed else {}
         holdings = universe.cached_holder_ratios()
 
@@ -322,7 +348,7 @@ def main() -> None:
                     # describe() 自带「精筛：」前缀，卡片里那行已有标签，去掉避免重复。
                     # 必须用 brief=True：完整版里 40+ 个行业关键词会把后面的条款挤出
                     # 卡片可视长度（实测「前十大流通股东」曾被截掉）。
-                    filter_desc=universe.describe(brief=True).removeprefix("精筛："),
+                    filter_desc=universe.describe(brief=True).removeprefix("精筛：") + ma20_suffix,
                     scores=ranking,
                     data_status=data_status,
                     board_summary=board_summary,
@@ -338,7 +364,7 @@ def main() -> None:
                 # 只有精筛完全未配置时才会新拉一次。
                 report_path = HtmlReportGenerator(settings).generate(
                     results,
-                    filter_desc=universe.describe(),
+                    filter_desc=universe.describe() + ma20_suffix,
                     metrics=metrics,
                     holdings=holdings,
                     scores=ranking,

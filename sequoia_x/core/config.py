@@ -147,6 +147,19 @@ class Settings(BaseSettings):
     # 例：QUANT_SKILL_PATH=/mnt/c/Users/hxb/.workbuddy/skills/aistockresearcher__skillhub
     quant_skill_path: str = ""
 
+    # ── 距 MA20 偏离度硬剔除（策略选完之后、评分之前）──
+    # 为什么要有这一层：突破类策略天然选「离均线很远」的票，而偏离度是可测的风险量 ——
+    # 实测 20 日中位收益在低波股 15% 之后、非低波股 9% 之后转负（见 README）。
+    # 分两档是因为同样的偏离对高低波动股含义完全不同。
+    # 只剔除策略选出来的几十只，不参与全市场精筛（那里没有价格序列，也不该那么重）。
+    ma20_filter_enabled: bool = True
+    # 低波股（年化波动 < `ma20_low_vol_cut`）的偏离上限（%）
+    ma20_dev_limit_low_vol: float = 20.0
+    # 其余股票的偏离上限（%）
+    ma20_dev_limit_others: float = 30.0
+    # 低波 / 非低波的分界：20 日年化波动率（%），取上涨趋势票的三分位下沿附近
+    ma20_low_vol_cut: float = 33.0
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

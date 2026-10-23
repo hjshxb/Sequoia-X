@@ -25,6 +25,7 @@ load_dotenv()
 
 from pathlib import Path
 
+from sequoia_x.analysis.ma20_filter import Ma20DeviationFilter
 from sequoia_x.analysis.scorer import ScoreDetail, composite_score, score_from_settings
 from sequoia_x.core.config import Settings
 from sequoia_x.data import board_concept, stock_meta
@@ -78,6 +79,18 @@ for name, codes in raw.items():
     kept = universe.apply(codes) if codes else []
     results[name] = kept
     print(f"{name:<16}{len(codes):>6}{len(kept):>8}")
+
+# 距 MA20 偏离剔除（与 main.py 的 6.4 步同构；不然重算出来的报告会比生产宽）
+ma20_suffix = ""
+try:
+    _fr = Ma20DeviationFilter(settings).apply(results)
+    results = _fr.results
+    if _fr.dropped:
+        ma20_suffix = f"；距MA20剔 {len(_fr.dropped)} 只"
+        print(f"距MA20剔除 {len(_fr.dropped)} 只：" +
+              "、".join(f"{d.symbol}({d.dev:+.1f}%)" for d in _fr.dropped))
+except Exception as exc:
+    print(f"距MA20过滤失败（本次不剔除）：{exc}")
 
 union = sorted({code for codes in results.values() for code in codes})
 print("-" * 32)
@@ -139,7 +152,7 @@ if settings.concept_enabled and union:
 
 path = HtmlReportGenerator(settings).generate(
     results,
-    filter_desc=universe.describe(),
+    filter_desc=universe.describe() + ma20_suffix,
     output_path=OUT,
     metrics=metrics,
     # 与 main.py 保持一致：仅在配置了筹码维度时展示该列，复用已加载的快照

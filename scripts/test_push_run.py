@@ -26,7 +26,8 @@ socket.setdefaulttimeout(10.0)
 from dotenv import load_dotenv  # noqa: E402
 
 from main import build_strategies  # noqa: E402
-from sequoia_x.analysis.scorer import (  # noqa: E402
+from sequoia_x.analysis.ma20_filter import Ma20DeviationFilter  # noqa: E402
+from sequoia_x.analysis.scorer import (  # noqa: E402  # noqa: E402
     ScoreDetail,
     composite_score,
     score_from_settings,
@@ -77,6 +78,20 @@ def main() -> None:
         selected = strategy.run()
         results[name] = selected
         logger.info(f"{name} 选出 {len(selected)} 只")
+
+    # 2.5 距 MA20 偏离度硬剔除（与 main.py 的 6.4 步同构）
+    ma20_suffix = ""
+    try:
+        fr = Ma20DeviationFilter(settings).apply(results)
+        results = fr.results
+        if fr.dropped:
+            ma20_suffix = f"；距MA20剔 {len(fr.dropped)} 只"
+            logger.info(
+                f"{fr.summary()}；明细："
+                + "、".join(f"{d.symbol}({d.dev:+.1f}%)" for d in fr.dropped)
+            )
+    except Exception as exc:
+        logger.error(f"距MA20过滤失败（本次不剔除）：{exc}")
 
     # 3. 指标 + 筹码（与 main.py 同步步骤一致；失败降级为空，不阻断推送）
     displayed = sorted({s for codes in results.values() for s in codes})
@@ -144,7 +159,7 @@ def main() -> None:
         try:
             FeishuNotifier(settings).send_report(
                 results,
-                filter_desc=universe.describe(brief=True).removeprefix("精筛："),
+                filter_desc=universe.describe(brief=True).removeprefix("精筛：") + ma20_suffix,
                 scores=ranking,
                 data_status=data_status,
                 board_summary=board_summary,
@@ -156,7 +171,7 @@ def main() -> None:
     # 7. 本地 HTML 报告
     path = HtmlReportGenerator(settings).generate(
         results,
-        filter_desc=universe.describe(),
+        filter_desc=universe.describe() + ma20_suffix,
         metrics=metrics,
         holdings=holdings,
         scores=ranking,
