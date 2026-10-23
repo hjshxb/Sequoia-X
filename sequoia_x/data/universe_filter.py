@@ -44,7 +44,7 @@ from datetime import date, timedelta
 
 from sequoia_x.core.config import Settings
 from sequoia_x.core.logger import get_logger
-from sequoia_x.data import holder_concentration
+from sequoia_x.data import holder_concentration, valuation_cache
 from sequoia_x.data import stock_meta as stock_meta_module
 
 logger = get_logger(__name__)
@@ -53,6 +53,10 @@ YI = 1e8  # 1 亿元
 
 # 回看窗口天数：覆盖周末与连续假期，取窗口内最后一个有数据的交易日
 _LOOKBACK_DAYS = 15
+
+# 估值批量取数的缺失率超过这个比例就告警：正常年份个别退市/停牌票缺失在个位数，
+# 超过 20% 只可能是数据源抖动（实测某次 82/200 = 41%，池子被砍掉一半）。
+_MISSING_WARN_RATIO = 0.20
 
 # `describe(brief=True)` 时关键词表最多列出的项数，超出则折叠成「等 N 项」
 _BRIEF_KEYWORD_HEAD = 3
@@ -283,7 +287,16 @@ class UniverseFilter:
         return f"{prefix}.{symbol}"
 
     def fetch_metrics(self, symbols: list[str]) -> dict[str, StockMetric]:
-        """批量拉取候选股的估值与技术面指标（含进程内缓存）。"""
+        """批量拉取候选股的估值与技术面指标。
+
+        三级来源，优先级从高到低：
+        1. **进程内缓存** `_METRIC_CACHE`（同一次运行里重复调用）；
+        2. **本地库** `stock_valuation`（同一天内重跑报告/改阈值重跑，见 `valuation_cache`）；
+        3. baostock 网络。
+        取到的结果写回本地库，所以「同一天第二次跑」不再走网络 —— 2026-10-23 那晚
+        连跑 5 次、其中一次 82/200 取数失败（池子 106→60、选股 44→24），
+        落库之后这类抖动最多影响第一次。
+        """
         result: dict[str, StockMetric] = {}
         todo: list[str] = []
 
@@ -297,10 +310,76 @@ class UniverseFilter:
         if not todo:
             return result
 
+        on_date = self._metrics_date_key()
+        stored = valuation_cache.load(self._db_path(), on_date, todo) if on_date else {}
+        for symbol, values in stored.items():
+            result[symbol] = StockMetric(
+                symbol=symbol,
+                circ_market_cap=values["circ_market_cap"],
+                pe_ttm=values["pe_ttm"],
+                pb=values["pb"],
+                turn=values["turn"],
+            )
+            _METRIC_CACHE[symbol] = result[symbol]
+        todo = [s for s in todo if s not in stored]
+
+        if not todo:
+            logger.info(f"精筛：{len(result)} 只估值全部命中本地缓存（{on_date}）")
+            return result
+
         fetched = self._fetch_from_baostock(todo)
         _METRIC_CACHE.update(fetched)
         result.update(fetched)
+
+        # 把拿到的写回库，下次同一天重跑就不必再取。
+        if on_date and fetched:
+            valuation_cache.save(
+                self._db_path(),
+                on_date,
+                {
+                    symbol: {
+                        "pe_ttm": m.pe_ttm,
+                        "pb": m.pb,
+                        "turn": m.turn,
+                        "circ_market_cap": m.circ_market_cap,
+                    }
+                    for symbol, m in fetched.items()
+                },
+            )
+
+        missing = len(todo) - len(fetched)
+        if todo and missing / len(todo) > _MISSING_WARN_RATIO:
+            # 缺失率高只可能是数据源抖动，而不是「这些票真的没估值」。
+            # 这里只告警、不改剔除策略：精筛仍是 fail-closed（宁可少选），
+            # 但必须把这件事喊出来 —— 否则报告只会「莫名少了一半票」。
+            logger.warning(
+                f"精筛：估值批量取数失败 {missing}/{len(todo)}"
+                f"（{missing / len(todo) * 100:.0f}%），这些票会按「估值缺失」被剔除，"
+                f"本次选股数会明显偏少"
+            )
         return result
+
+    def _db_path(self) -> str:
+        """估值缓存挂在**注入的 engine** 上；没有 engine 就返回空串（= 不缓存）。
+
+        为什么不回退到 `settings.db_path`：测试里 `make_settings` 用的是
+        `db_path="unused.db"` 这类占位路径，回退会让缓存写进仓库根目录，
+        然后被**下一个测试**读到并命中 —— 表现为「没调网络却拿到了估值」。
+        生产三个入口（main / test_push_run / regen_report）都显式传了 engine，
+        所以这里收窄不影响实际链路。
+        """
+        if self.engine is None:
+            return ""
+        db_path = getattr(self.engine, "db_path", None)
+        return str(db_path) if db_path else ""
+
+    def _metrics_date_key(self) -> str:
+        """估值缓存按**交易日**分桶：优先全市场最新交易日，退回今天。"""
+        try:
+            latest = self.engine.get_market_latest_date()  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - 缓存 key 取不到就用今天
+            latest = None
+        return str(latest or date.today().isoformat())
 
     def _fetch_from_baostock(self, symbols: list[str]) -> dict[str, StockMetric]:
         """通过 baostock 批量拉取指标。整批共用一个登录会话。"""
