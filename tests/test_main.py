@@ -140,7 +140,8 @@ _STRATEGY_ATTRS = (
     "LimitUpShakeoutStrategy",
     "UptrendLimitDownStrategy",
     "RpsBreakoutStrategy",
-    "PrivatePlacementStrategy",
+    # `PrivatePlacementStrategy` 2026-10-23 起关闭，不再注册
+    # （见 `test_private_placement_is_closed`）。
     "AtrShrinkReversalStrategy",
     "BottomDojiStrategy",
     "PullbackShrinkStrategy",
@@ -393,3 +394,15 @@ def test_ma_dispersion_is_closed() -> None:
     也就会看到关闭原因（2026 段 +0.30%、负日 49.2%、成交额门槛必须压到 0.3 亿）。
     """
     assert not hasattr(main_module, "MaDispersionStrategy")
+
+
+def test_private_placement_is_closed() -> None:
+    """定增公告自 2026-10-23 起关闭：不注册进策略清单。
+
+    不是删除 —— `strategy/private_placement.py` 与它的测试都还在，
+    恢复时取消 `main.build_strategies()` 里那两行注释即可（并把本类加回
+    `_STRATEGY_ATTRS`，否则该路策略会用真实实现去联网）。
+    关闭原因：它是唯一依赖 akshare 全量公告接口的策略（每次联网拉全市场增发），
+    信号来自公告事件而非量价，和其余策略不是一类；实测近几个月基本 0 只。
+    """
+    assert not hasattr(main_module, "PrivatePlacementStrategy")

@@ -37,7 +37,6 @@ from sequoia_x.strategy.bottom_doji import BottomDojiStrategy
 from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
 from sequoia_x.strategy.limit_up_shakeout import LimitUpShakeoutStrategy
 from sequoia_x.strategy.ma_volume import MaVolumeStrategy
-from sequoia_x.strategy.private_placement import PrivatePlacementStrategy
 from sequoia_x.strategy.pullback_shrink import PullbackShrinkStrategy
 from sequoia_x.strategy.rps_breakout import RpsBreakoutStrategy
 from sequoia_x.strategy.turtle_trade import TurtleTradeStrategy
@@ -101,7 +100,15 @@ def build_strategies(engine: DataEngine, settings: Settings) -> list[BaseStrateg
         LimitUpShakeoutStrategy(engine=engine, settings=settings),
         UptrendLimitDownStrategy(engine=engine, settings=settings),
         RpsBreakoutStrategy(engine=engine, settings=settings),
-        PrivatePlacementStrategy(engine=engine, settings=settings),
+        # ── 已关闭（2026-10-23 用户要求）──
+        # 定增公告：实现与测试都保留在 `strategy/private_placement.py`，只是不再注册。
+        # 恢复时把下面两行取消注释即可：
+        #     from sequoia_x.strategy.private_placement import PrivatePlacementStrategy
+        #     PrivatePlacementStrategy(engine=engine, settings=settings),
+        # 关闭原因：它是唯一依赖 akshare 全量公告接口的策略（每次都联网拉全市场增发），
+        # 而选出的票来自公告事件、与量价完全无关，和其余策略不是一类信号；
+        # 实测也几乎不出票（2026-10 多次运行均 0 只，公告有效期窗口很短）。
+        #
         # 逆势低吸：判据是「跌破 MA20 超 4 个 ATR」+ 缩量区间（0.4~0.8），不用布林/RSI。
         # 与精筛的「收盘价 >= MA120」天然互斥（实测 97.6% 的信号都在 MA120 之下），
         # 故它不读注入池，内部改用 apply_without_ma()（豁免均线维度）自行取全市场候选。
