@@ -294,12 +294,11 @@ def test_build_detail_computes_features(db):
     assert detail.amount is not None and detail.amount > 0
     # 区间最高价高于收盘价，故 near_high 略小于 1
     assert 0.97 < detail.near_high < 1.0
+    # 2026-10-23 起只计量价三维，并按 100 归一（原始 20 分 → 33.3 分）
     assert detail.dims == {
-        "策略共振": 20.0,
-        "量能配合": 15.0,
-        "趋势强度": 20.0,
-        "估值": 20.0,
-        "筹码": 17.0,
+        "策略共振": 33.3,
+        "量能配合": 25.0,
+        "趋势强度": 33.3,
     }
 
 
@@ -396,8 +395,20 @@ def test_score_pool_sorted_by_adjusted_desc(db):
     assert details[-1].symbol == "CCC"
 
 
-def test_score_pool_wires_metrics_holdings_tags(db):
+def test_score_pool_wires_tags_and_ignores_valuation_chip(db):
+    """`tags` 影响评分；`metrics` / `holdings` 仍被接收，但**不再计分**。
+
+    2026-10-23 起「估值」「筹码」两维被移除（PE 已由精筛过滤、筹码是季度滞后数据），
+    所以这里既验证 tags 仍然生效，也验证只给 metrics/holdings 时分数纹丝不动 ——
+    防止哪天有人悄悄把这两维加回去。
+    """
     plain = scorer.score_pool(["AAA"], db_path=db)[0]
+    metrics_only = scorer.score_pool(
+        ["AAA"],
+        db_path=db,
+        metrics={"AAA": StockMetric(symbol="AAA", pe_ttm=25.0)},
+        holdings={"AAA": 80.0},
+    )[0]
     enriched = scorer.score_pool(
         ["AAA"],
         db_path=db,
@@ -405,12 +416,11 @@ def test_score_pool_wires_metrics_holdings_tags(db):
         holdings={"AAA": 80.0},
         tags={"AAA": "TR"},
     )[0]
-    assert plain.dims["估值"] == 13.0  # 无 PE -> 中性分
-    assert enriched.dims["估值"] == 20.0
-    assert plain.dims["筹码"] == 10.0
-    assert enriched.dims["筹码"] == 20.0
-    assert plain.dims["策略共振"] == 10.0
-    assert enriched.dims["策略共振"] == 20.0
+
+    assert "估值" not in enriched.dims and "筹码" not in enriched.dims
+    assert metrics_only.score == plain.score  # 两维不再加分
+    assert plain.dims["策略共振"] == 16.7  # 10 × 100/60
+    assert enriched.dims["策略共振"] == 33.3  # 20 × 100/60
     assert enriched.adjusted > plain.adjusted
 
 

@@ -10,12 +10,18 @@
       但绝对价格不可直接展示；真实成交均价 = `turnover / volume`。
     - `volume` 是真实成交股数，`turnover` 是真实成交额（元）。
 
-评分构成（基础分满分 100，五维各 20）：
+评分构成（基础分满分 100，**只度量价三项**，每项 20 分 × 100/60 归一）：
     1. 策略共振  命中的策略越多越高；海龟 / RPS 属突破类信号，权重更高
     2. 量能配合  当日上涨且放量最佳，下跌放量最差
     3. 趋势强度  均线多头排列数 + 距区间高点位置
-    4. 估值      PE(TTM) 越低越高
-    5. 筹码      前十大流通股东合计占流通股比例越高越高
+
+    🔴 **「估值」（PE）与「筹码」（前十大流通股东占比）自 2026-10-23 起不再计分**，
+    实现保留在 `score_valuation` / `score_chip`（要恢复只需把两行加回 `raw_dims`）。
+    移除理由：两者都不是量价信号 —— PE 在精筛里已被 `MIN_PE=0` 过滤过，
+    筹码是季度滞后数据；留在分数里只会无条件把「低 PE 的银行煤炭」和
+    「股东高度集中的票」往前顶，与「今天这批票哪几只更值得看」无关。
+    三维原始合计 60 分，按 100 归一，所以对外「满分 100」的口径不变，
+    位置惩罚 3/6/10 的相对分量也与改动前一致。
 
 风险调整：
     `adjusted = 基础分 - 位置惩罚`，惩罚两件事：距 MA20 过度偏离（追高，10/6/3 分）、
@@ -65,6 +71,12 @@ ENHANCE_LOOKBACK = 750
 # 少于该行数直接跳过：算不出 MA60 与区间位置，硬算会给出误导性分数。
 # 130 = MA120 窗口(120) + 计算偏离所需的缓冲。
 MIN_ROWS = 130
+
+# 计分维度共 3 项（策略共振 / 量能配合 / 趋势强度），每项原始满分 20。
+# 「估值」「筹码」自 2026-10-23 起**不计分**（实现保留在 `score_valuation` /
+# `score_chip`，方便随时恢复），因此原始合计是 60，需要按 100 归一。
+_DIM_MAX = 20.0
+_SCALE = 100.0 / (3 * _DIM_MAX)
 
 # SQLite 单条语句的参数个数上限保护（与 DataEngine 的做法保持一致）。
 _SQL_PARAM_CHUNK = 900
@@ -186,6 +198,11 @@ def score_trend(bull: int, near_high: float | None) -> float:
 def score_valuation(pe: float | None) -> float:
     """估值：PE(TTM) 越低越高。
 
+    🔴 **已停用（2026-10-23）**：不再计入评分，`build_detail` 的 `raw_dims` 里没有它。
+    保留实现是为了随时恢复 —— 但恢复前请先想清楚：PE 在精筛里已经用 `MIN_PE=0`
+    过滤过一轮，再按档位加分等于把「低估值偏好」重复计价一次，
+    会把银行/煤炭这类票无条件顶到前排（与当日量价无关）。
+
     **负 PE（亏损股）单独判低分** —— 早期版本直接用 `pe < 40` 判断，
     负市盈率会被判成满分 20，是个隐蔽的反向 bug。当前精筛配置用
     `MIN_PE=0` 排除了亏损股，所以实践中不触发，但这里必须堵上。
@@ -208,7 +225,12 @@ def score_valuation(pe: float | None) -> float:
 
 
 def score_chip(hold: float | None) -> float:
-    """筹码：前十大流通股东合计占流通股比例越高越高。"""
+    """筹码：前十大流通股东合计占流通股比例越高越高。
+
+    🔴 **已停用（2026-10-23）**：不再计入评分。它是季报数据（`holder_concentration`
+    缓存的是 2026-06-30），滞后最长一个季度，且高持股比例本身不代表会涨 ——
+    用它给分只会让「机构抱团票」在排序上占便宜的假象。
+    """
     if hold is None or not math.isfinite(hold):
         return 10.0
     if hold >= 75:
@@ -339,13 +361,18 @@ def build_detail(
     near_high = (closes[-1] / peak) if peak else None
     dev_ma20 = ((closes[-1] / m20 - 1) * 100) if m20 else None
 
-    dims = {
+    # 计分维度：**只有量价三项**。2026-10-23 用户要求移除「估值」「筹码」两维的加分 ——
+    # 它们都不是量价信号：PE 在精筛里已经过滤过（MIN_PE=0）、筹码是季度滞后数据，
+    # 留在分数里只会把「低 PE 的银行煤炭」和「股东高度集中的票」无条件往前顶，
+    # 与「今天这批票哪几只更值得看」无关。
+    # 三维合计 60 分，**按 100 归一**（`_SCALE`）：对外「满分 100」的口径不变，
+    # 位置惩罚 3/6/10 的相对分量也与改动前一致，历史报告的分数仍可大致比较。
+    raw_dims = {
         "策略共振": score_resonance(tags),
         "量能配合": score_volume(chg1, vol_ratio),
         "趋势强度": score_trend(bull, near_high),
-        "估值": score_valuation(metric.pe_ttm if metric else None),
-        "筹码": score_chip(holding),
     }
+    dims = {name: round(value * _SCALE, 1) for name, value in raw_dims.items()}
     total = sum(dims.values())
     vol20 = _annual_vol(closes)
     penalty = position_penalty(dev_ma20, vol20)
