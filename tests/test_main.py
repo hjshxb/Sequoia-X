@@ -144,7 +144,9 @@ _STRATEGY_ATTRS = (
     "AtrShrinkReversalStrategy",
     "BottomDojiStrategy",
     "PullbackShrinkStrategy",
-    "MaDispersionStrategy",
+    # `MaDispersionStrategy` 2026-10-23 起关闭，不再注册（见 `test_ma_dispersion_is_closed`）。
+    # ⚠️ 恢复时**必须**把它加回这里，否则 `main()` 里那一路策略会被换成真实实现，
+    # 测试会去连库/联网。
 )
 
 
@@ -378,3 +380,16 @@ def test_main_survives_board_concept_failure(monkeypatch, tmp_path) -> None:
     assert pushes and reports, "板块取数失败不应阻断推送与报告"
     assert pushes[0]["board_summary"] is None
     assert reports[0]["board_summary"] is None
+
+
+def test_ma_dispersion_is_closed() -> None:
+    """均线收敛发散自 2026-10-23 起关闭：不注册进策略清单。
+
+    不是删除 —— `strategy/ma_dispersion.py` 与 `tests/test_ma_dispersion.py` 都还在，
+    恢复时取消 `main.build_strategies()` 里那两行注释即可。
+
+    断言用 `hasattr` 而不是跑 `build_strategies()`：关掉之后连 import 都移走了，
+    「模块里没有这个类」是最不容易误判的判据。有人重新注册时必须同时改这条用例，
+    也就会看到关闭原因（2026 段 +0.30%、负日 49.2%、成交额门槛必须压到 0.3 亿）。
+    """
+    assert not hasattr(main_module, "MaDispersionStrategy")
