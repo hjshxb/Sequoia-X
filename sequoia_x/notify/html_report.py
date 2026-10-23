@@ -903,10 +903,12 @@ class HtmlReportGenerator:
             name = html.escape(item.name) if item and item.name else "—"
             dist_high = (1 - detail.near_high) * 100 if detail.near_high else None
 
-            # 悬停提示：把分数拆开，说明它为什么高 / 为什么被扣分
+            # 悬停提示：把分数拆开，说明它为什么高 / 为什么加不到分
             tips = [f"{key} {value:.0f}" for key, value in detail.dims.items()]
-            if detail.penalty:
-                tips.append(f"惩罚 -{detail.penalty:.0f}")
+            if detail.position_adj:
+                tips.append(f"位置加分 +{detail.position_adj:.0f}（距MA20 {detail.dev_ma20:+.1f}%）"
+                            if detail.dev_ma20 is not None
+                            else f"位置加分 +{detail.position_adj:.0f}")
             if detail.prob_up is not None:
                 # 胜率必须带上分母才可解读：「100%」在 1/1 和 4/5 时含义完全不同。
                 # 没有窗口数（旧数据）时不要写成「67%（67%）」这种重复。
@@ -1022,8 +1024,8 @@ class HtmlReportGenerator:
             tips = ""
             if score:
                 parts = [f"{key} {value:.0f}" for key, value in score.dims.items()]
-                if score.penalty:
-                    parts.append(f"惩罚 -{score.penalty:.0f}")
+                if score.position_adj:
+                    parts.append(f"位置加分 +{score.position_adj:.0f}")
                 tips = f' title="{html.escape("、".join(parts))}"'
             cells += f'<td class="num score"{tips}>{text}</td>'
 

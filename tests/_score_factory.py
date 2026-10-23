@@ -24,7 +24,7 @@ def make_score(
     adjusted: float = 70.0,
     *,
     tags: str = "",
-    penalty: float = 0.0,
+    position_adj: float = 0.0,
     prob_up: float | None = None,
     prob_samples: int | None = None,
     prob_confidence: float | None = None,
@@ -36,9 +36,9 @@ def make_score(
 
     Args:
         symbol: 股票代码。
-        adjusted: 风险调整后得分（= total - penalty）。
+        adjusted: 对外展示的分数（= 三维合计 + 位置加分，封顶 100）。
         tags: 命中的策略字母标记。
-        penalty: 位置惩罚分（>0 时报告的悬停提示里应出现「惩罚」）。
+        position_adj: 位置加分（>0 时报告的悬停提示里应出现「位置加分」）。
         prob_up: 形态匹配胜率（%，0~100 口径）。
         prob_samples: **相似窗口数**，即 `prob_up` 的分母（`k/n` 里的 n，
             上限 5）。缺省 `None` 表示不还原，展示层退回百分比写法。
@@ -65,8 +65,8 @@ def make_score(
         "new_high60": False,
         "new_high120": False,
         "dims": dict(DEFAULT_DIMS),
-        "total": adjusted + penalty,
-        "penalty": penalty,
+        "total": adjusted - position_adj,
+        "position_adj": position_adj,
         "adjusted": adjusted,
         "prob_up": prob_up,
         "prob_samples": prob_samples,

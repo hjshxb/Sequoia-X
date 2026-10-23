@@ -35,8 +35,8 @@ from dotenv import load_dotenv  # noqa: E402
 from sequoia_x.analysis.scorer import (  # noqa: E402
     SHAPE_DEEP_PULLBACK,
     SHAPE_NEAR_HIGH,
+    SHAPE_NO_BONUS,
     SHAPE_OVEREXTENDED,
-    SHAPE_PENALISED,
     SHAPE_VOLUME_RALLY,
     score_pool,
     summarize,
@@ -196,7 +196,7 @@ def main() -> int:
         rec = pool.get(d.symbol, {})
         print(
             f"{i:<3}{d.symbol:<8}{rec.get('name', ''):<10}{d.score:<5}{d.tags or '-':<6}"
-            f"{d.total:<6.0f}{d.penalty:<5.0f}"
+            f"{d.total:<6.0f}{d.position_adj:<5.0f}"
             f"{(d.chg1 if d.chg1 is not None else float('nan')):>6.2f}   "
             f"{(d.chg20 if d.chg20 is not None else float('nan')):>6.2f}   "
             f"{(d.chg60 if d.chg60 is not None else float('nan')):>6.2f}   "
@@ -229,8 +229,8 @@ def main() -> int:
         [f"{name_of[d.symbol]}({d.dev_ma20:.1f}%)" for d in groups[SHAPE_OVEREXTENDED]],
     )
     print(
-        f"{SHAPE_PENALISED}(位置/波动):",
-        [f"{name_of[d.symbol]}(-{d.penalty:.0f})" for d in groups[SHAPE_PENALISED]],
+        f"{SHAPE_NO_BONUS}(离均线远):",
+        [f"{name_of[d.symbol]}({d.dev_ma20:+.0f}%)" for d in groups[SHAPE_NO_BONUS]],
     )
     return 0
 

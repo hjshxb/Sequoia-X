@@ -21,13 +21,15 @@
     筹码是季度滞后数据；留在分数里只会无条件把「低 PE 的银行煤炭」和
     「股东高度集中的票」往前顶，与「今天这批票哪几只更值得看」无关。
     三维原始合计 60 分，按 100 归一，所以对外「满分 100」的口径不变，
-    位置惩罚 3/6/10 的相对分量也与改动前一致。
+    位置加分 8/6/4/2 的相对分量与「满分 100」口径仍自洽。
 
-风险调整：
-    `adjusted = 基础分 - 位置惩罚`，惩罚两件事：距 MA20 过度偏离（追高，10/6/3 分）、
-    年化波动率过高（6/3 分）。动机是「越接近新高」不能无条件加分 ——
-    静态字段版曾把「距 MA20 +55%、波动 103%」的股票排到第 2 名，
-    扣分后掉到第 14 名，趋势末端的极端偏离必须惩罚。
+位置加分（不再扣分）：
+    `adjusted = min(100, 基础分 + 位置加分)`，加分项只看**偏离程度**（绝对值）：
+    距 MA20 ≤3% 加 8、≤6% 加 6、≤10% 加 4、≤15% 加 2、再远 0。
+    动机：追高的代价从「扣分」变成「拿不到加分」，语义更干净，也不会出现
+    「先被 ma20_filter 硬剔除、再扣一次」的重复惩罚。
+    🔴 原先的两条扣分（距 MA20 >20/30/40 扣 3/6/10、年化波动 >80/100 扣 3/6）
+    已于 2026-10-23 按用户要求移除。
 
 可选增强（外部 stock-researcher 工具的纯离线函数，喂本地库价格序列）：
     形态匹配胜率 / 最大回撤。该工具不属于本项目依赖，因此做成**可选层**：
@@ -121,7 +123,9 @@ class ScoreDetail:
     # ── 评分 ──
     dims: dict[str, float] = field(default_factory=dict)
     total: float = 0.0
-    penalty: float = 0.0
+    # 位置调整项：0~8，**正数=加分**（离 MA20 越近越多）。
+    # 2026-10-23 前这里是 `penalty`（扣分），改名是为了让符号不再反着读。
+    position_adj: float = 0.0
     adjusted: float = 0.0
     # ── 增强层（可选）──
     prob_up: float | None = None  # 形态匹配胜率 %
@@ -244,22 +248,37 @@ def score_chip(hold: float | None) -> float:
     return 5.0
 
 
-def position_penalty(dev_ma20: float | None, vol20: float | None) -> float:
-    """位置惩罚：追高（距 MA20 过度偏离）与高波动各扣一次。"""
-    penalty = 0.0
-    if dev_ma20 is not None:
-        if dev_ma20 > 40:
-            penalty += 10.0
-        elif dev_ma20 > 30:
-            penalty += 6.0
-        elif dev_ma20 > 20:
-            penalty += 3.0
-    if vol20 is not None:
-        if vol20 > 100:
-            penalty += 6.0
-        elif vol20 > 80:
-            penalty += 3.0
-    return penalty
+def position_bonus(dev_ma20: float | None) -> float:
+    """位置加分：**离 MA20 越近，加得越多**（反追高）。
+
+    用户 2026-10-23 的口径：「根据偏离程度加分，偏离越低加的分越多」。
+    这里按**偏离程度**（绝对值）算，不是按带符号的偏离 —— 两者差别很大：
+    若按带符号单调加分，一只跌破 MA20 20% 的票会拿到满分 +8，
+    反倒把下跌股顶到上涨股前面。按程度算，它和「高出 20%」一样得 0 分：
+    **离均线越远越不加分**，两头都算。
+
+    它取代了原先的两条扣分（距 MA20 过度偏离、年化波动过高）：
+    追高的代价从「扣分」变成「拿不到加分」，语义更干净，
+    也不再出现「先被 ma20_filter 硬剔除、再扣一次」的重复惩罚。
+
+    ⚠️ 这是**偏好**而不是预测，别拿回测去给档位找「最优切点」：
+    偏离与收益的关系本身不稳定（低波/非低波两档的转负点差一倍以上），
+    拟合出的拐点只会过拟合到最近两年。这里就是一条朴素、可解释的单调线。
+
+    参数缺失（新股/停牌）时返回 0：不奖不罚。
+    """
+    if dev_ma20 is None:
+        return 0.0
+    gap = abs(dev_ma20)
+    if gap <= 3:
+        return 8.0
+    if gap <= 6:
+        return 6.0
+    if gap <= 10:
+        return 4.0
+    if gap <= 15:
+        return 2.0
+    return 0.0  # 15% 以上：不给加分（20%/30% 以上还会被 ma20_filter 直接剔掉）
 
 
 # ── 本地库读取 ──
@@ -366,7 +385,7 @@ def build_detail(
     # 留在分数里只会把「低 PE 的银行煤炭」和「股东高度集中的票」无条件往前顶，
     # 与「今天这批票哪几只更值得看」无关。
     # 三维合计 60 分，**按 100 归一**（`_SCALE`）：对外「满分 100」的口径不变，
-    # 位置惩罚 3/6/10 的相对分量也与改动前一致，历史报告的分数仍可大致比较。
+    # 加分档位（8/6/4/2）也是相对 100 分设计的，不需要随归一化再缩放。
     raw_dims = {
         "策略共振": score_resonance(tags),
         "量能配合": score_volume(chg1, vol_ratio),
@@ -375,7 +394,10 @@ def build_detail(
     dims = {name: round(value * _SCALE, 1) for name, value in raw_dims.items()}
     total = sum(dims.values())
     vol20 = _annual_vol(closes)
-    penalty = position_penalty(dev_ma20, vol20)
+    # 位置是**加分项**（离 MA20 越近加得越多），不再是扣分。
+    # 加分后封顶 100：三维已经满分时再加没有意义，也避免出现 >100 的分数。
+    position_adj = position_bonus(dev_ma20)
+    adjusted = min(100.0, total + position_adj)
 
     return ScoreDetail(
         symbol=symbol,
@@ -395,8 +417,8 @@ def build_detail(
         new_high120=len(closes) >= 120 and closes[-1] >= max(closes[-120:]),
         dims=dims,
         total=total,
-        penalty=penalty,
-        adjusted=total - penalty,
+        position_adj=position_adj,
+        adjusted=adjusted,
     )
 
 
@@ -597,7 +619,7 @@ SHAPE_NEAR_HIGH = "接近新高"
 SHAPE_DEEP_PULLBACK = "深度回撤"
 SHAPE_VOLUME_RALLY = "放量上涨"
 SHAPE_OVEREXTENDED = "重度追高"
-SHAPE_PENALISED = "被扣分"
+SHAPE_NO_BONUS = "无位置加分"
 
 _NEAR_HIGH_MIN = 0.95
 _PULLBACK_MAX = 0.90
@@ -631,7 +653,9 @@ def summarize(details: Iterable[ScoreDetail]) -> dict[str, list[ScoreDetail]]:
         SHAPE_OVEREXTENDED: [
             d for d in items if d.dev_ma20 is not None and d.dev_ma20 > _OVEREXTENDED_MIN
         ],
-        SHAPE_PENALISED: [d for d in items if d.penalty > 0],
+        # 2026-10-23 起位置是加分项，所以这一组从「被扣分」改成「拿不到位置加分」
+        # （距 MA20 >15%，或数据缺失）。语义仍是「离均线太远的那一头」。
+        SHAPE_NO_BONUS: [d for d in items if d.position_adj == 0],
     }
 
 

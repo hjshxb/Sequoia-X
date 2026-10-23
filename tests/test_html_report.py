@@ -732,13 +732,13 @@ def test_ranking_card_keeps_given_order(gen):
 
 def test_ranking_card_explains_score_on_hover(gen):
     """分数必须是可解释的：悬停能看到五维分项、扣分、胜率与回撤。"""
-    scores = [make_score("600000", 72.5, penalty=6.0, prob_up=66.7, max_drawdown=18.4)]
+    scores = [make_score("600000", 72.5, position_adj=6.0, prob_up=66.7, max_drawdown=18.4)]
     text = gen.generate({"TurtleTradeStrategy": ["600000"]}, scores=scores).read_text(
         encoding="utf-8"
     )
 
     assert "策略共振 20" in text
-    assert "惩罚 -6" in text
+    assert "位置加分 +6" in text
     assert "形态胜率 67%" in text
     assert "最大回撤 18.4%" in text
     # 表格单元格本身也要显示增强层的两个数字
@@ -885,7 +885,6 @@ def test_report_filter_line_carries_the_exception_note(gen):
 
 def test_strategy_labels_match_strategy_constants():
     """标签里写死的门槛数字必须与策略常量一致 —— 否则改常量不改标签就会撒谎。"""
-    from sequoia_x.strategy.atr_shrink_reversal import AtrShrinkReversalStrategy
     from sequoia_x.strategy.bottom_doji import BottomDojiStrategy
 
     doji = STRATEGY_LABELS["BottomDojiStrategy"]

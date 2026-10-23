@@ -24,8 +24,8 @@ from sequoia_x.analysis import scorer
 from sequoia_x.analysis.scorer import (
     SHAPE_DEEP_PULLBACK,
     SHAPE_NEAR_HIGH,
+    SHAPE_NO_BONUS,
     SHAPE_OVEREXTENDED,
-    SHAPE_PENALISED,
     SHAPE_VOLUME_RALLY,
     summarize,
 )
@@ -208,24 +208,30 @@ def test_score_trend_combines_ma_stack_and_position():
 
 
 @pytest.mark.parametrize(
-    ("dev_ma20", "vol20", "expected"),
+    ("dev_ma20", "expected"),
     [
-        (0.0, 0.0, 0.0),
-        (20.0, 0.0, 0.0),  # 阈值为「严格大于」，等值不罚
-        (20.1, 0.0, 3.0),
-        (30.0, 0.0, 3.0),
-        (30.1, 0.0, 6.0),
-        (40.0, 0.0, 6.0),
-        (40.1, 0.0, 10.0),
-        (0.0, 80.0, 0.0),
-        (0.0, 80.1, 3.0),
-        (0.0, 100.1, 6.0),
-        (40.1, 100.1, 16.0),  # 追高 + 高波动叠加
-        (None, None, 0.0),  # 无数据不惩罚
+        # 按**偏离程度**（绝对值）递减：两头离得远都不加分
+        (0.0, 8.0),
+        (0.1, 8.0),
+        (3.0, 8.0),
+        (-3.0, 8.0),
+        (3.1, 6.0),
+        (-3.1, 6.0),
+        (6.0, 6.0),
+        (6.1, 4.0),
+        (10.0, 4.0),
+        (-10.0, 4.0),
+        (10.1, 2.0),
+        (15.0, 2.0),
+        (15.1, 0.0),
+        (40.0, 0.0),
+        (-40.0, 0.0),  # 深度跌破也不给分：离得远就是离得远
+        (None, 0.0),  # 无数据不奖不罚
     ],
 )
-def test_position_penalty(dev_ma20, vol20, expected):
-    assert scorer.position_penalty(dev_ma20, vol20) == expected
+def test_position_bonus(dev_ma20, expected):
+    """位置加分只吃偏离程度，不再看波动率（波动惩罚已移除）。"""
+    assert scorer.position_bonus(dev_ma20) == expected
 
 
 # ── 特征计算 ──
@@ -310,17 +316,17 @@ def test_build_detail_marks_new_highs(db):
     assert detail.near_high is not None and detail.near_high < 1.0  # 高点取 high 不是 close
 
 
-def test_build_detail_no_penalty_for_healthy_uptrend(db):
-    """稳健上行（距 MA20 个位数百分比）不该被扣分。"""
+def test_build_detail_bonus_for_healthy_uptrend(db):
+    """稳健上行（距 MA20 个位数百分比）应拿到位置加分，而不是被扣分。"""
     rows = scorer.read_price_series(db, ["AAA"])["AAA"]
     detail = scorer.build_detail("AAA", rows)
-    assert detail.dev_ma20 is not None and detail.dev_ma20 < 20
-    assert detail.penalty == 0.0
-    assert detail.adjusted == detail.total
+    assert detail.dev_ma20 is not None and detail.dev_ma20 < 15
+    assert detail.position_adj > 0
+    assert detail.adjusted == min(100.0, detail.total + detail.position_adj)
 
 
-def test_build_detail_applies_position_penalty(tmp_path):
-    """末日跳涨 60% ⇒ 既追高（距 MA20 > 40%）又高波动，两笔惩罚都要落上。"""
+def test_build_detail_no_bonus_when_overextended(tmp_path):
+    """末日跳涨 60% ⇒ 距 MA20 远超 15%，位置加分归零（不再扣分，只是拿不到）。"""
     rows = make_rows("SPK", 200, daily=0.0)
     last = rows[-1]
     shot = last[5] * 1.6
@@ -330,8 +336,8 @@ def test_build_detail_applies_position_penalty(tmp_path):
     detail = scorer.score_pool(["SPK"], db_path=path)[0]
     assert detail.dev_ma20 is not None and detail.dev_ma20 > 40
     assert detail.vol20 is not None and detail.vol20 > 100
-    assert detail.penalty == 16.0  # 追高 10 + 高波动 6
-    assert detail.adjusted == detail.total - 16.0
+    assert detail.position_adj == 0.0  # 不再是「扣 16 分」，而是加不到分
+    assert detail.adjusted == detail.total
 
 
 def test_score_property_rounds_to_one_decimal():
@@ -390,9 +396,12 @@ def test_score_pool_sorted_by_adjusted_desc(db):
     assert len(details) == 3
     adjusted = [d.adjusted for d in details]
     assert adjusted == sorted(adjusted, reverse=True)
-    # 上行趋势的 AAA 应优于下跌的 CCC
-    assert details[0].symbol == "AAA"
+    # 下行趋势的 CCC 垫底（三维分本来就低，位置加分也拿不到多少）
     assert details[-1].symbol == "CCC"
+    # 2026-10-23 起位置是**加分项**（离 MA20 越近加得越多），
+    # 所以涨得更温和、更贴均线的 BBB（dev +1.9%）反超 AAA（+5.8%）。
+    # 这不是 bug，是「偏离越低加分越多」的直接后果。
+    assert [d.symbol for d in details] == ["BBB", "AAA", "CCC"]
 
 
 def test_score_pool_wires_tags_and_ignores_valuation_chip(db):
@@ -657,7 +666,7 @@ def test_score_pool_survives_broken_enhancer(db, monkeypatch):
 
     monkeypatch.setattr(scorer, "load_quant_skill", boom)
     details = scorer.score_pool(["AAA", "BBB"], db_path=db, enhance_top=1, skill_path="/x")
-    assert [d.symbol for d in details] == ["AAA", "BBB"]
+    assert [d.symbol for d in details] == ["BBB", "AAA"]
     assert all(d.adjusted > 0 for d in details)
     assert all(d.prob_up is None for d in details)
 
@@ -689,16 +698,16 @@ def test_annual_vol_is_positive_for_noisy_series():
 
 def test_summarize_groups_by_shape():
     details = [
-        make_score("A", near_high=0.99, chg1=2.0, vol_ratio=1.5),
-        make_score("B", near_high=0.50),
-        make_score("C", dev_ma20=45.0, near_high=0.85, penalty=10.0),
+        make_score("A", near_high=0.99, chg1=2.0, vol_ratio=1.5, position_adj=8.0),
+        make_score("B", near_high=0.50, position_adj=4.0),
+        make_score("C", dev_ma20=45.0, near_high=0.85, position_adj=0.0),
     ]
     groups = summarize(details)
     assert [d.symbol for d in groups[SHAPE_NEAR_HIGH]] == ["A"]
     assert [d.symbol for d in groups[SHAPE_DEEP_PULLBACK]] == ["B", "C"]
     assert [d.symbol for d in groups[SHAPE_VOLUME_RALLY]] == ["A"]
     assert [d.symbol for d in groups[SHAPE_OVEREXTENDED]] == ["C"]
-    assert [d.symbol for d in groups[SHAPE_PENALISED]] == ["C"]
+    assert [d.symbol for d in groups[SHAPE_NO_BONUS]] == ["C"]
 
 
 def test_summarize_skips_missing_data_instead_of_guessing():
@@ -800,7 +809,7 @@ def test_score_from_settings_against_real_db(db):
     got = scorer.score_from_settings(
         ["AAA", "BBB"], settings=_settings(db_path=db, score_enhance=False)
     )
-    assert [d.symbol for d in got] == ["AAA", "BBB"]
+    assert [d.symbol for d in got] == ["BBB", "AAA"]
     assert all(d.adjusted > 0 for d in got)
 
 
