@@ -327,8 +327,8 @@ def test_describe_marks_dimensions_that_did_not_take_effect(tmp_path) -> None:
     f = UniverseFilter(settings=_settings(tmp_path, min_market_cap=100))
 
     assert "本次未生效" not in f.describe()
-    f.skipped_dimensions = ("市值/PE/PB",)
-    assert "本次未生效：市值/PE/PB" in f.describe()
+    f.skipped_dimensions = ("市值",)
+    assert "本次未生效：市值" in f.describe()
     assert "本次未生效" in f.describe(brief=True)
 
 
@@ -341,4 +341,4 @@ def test_apply_records_skipped_valuation_dimension(tmp_path, monkeypatch) -> Non
     kept = f.apply(["603051"])
 
     assert kept == ["603051"], "数据源整体故障时不能把票全杀光"
-    assert f.skipped_dimensions == ("市值/PE/PB",)
+    assert f.skipped_dimensions == ("市值",)

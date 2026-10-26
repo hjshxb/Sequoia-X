@@ -126,6 +126,7 @@ class _Context:
     """
 
     valuation: bool
+    market_cap: bool
     liquidity: bool
     technical: bool
     today_drop: bool
@@ -174,19 +175,16 @@ class UniverseFilter:
         return split_keywords(self.settings.exclude_industries)
 
     @property
-    def _valuation_enabled(self) -> bool:
+    def _market_cap_enabled(self) -> bool:
+        """市值是否要过滤。**独立于 PE/PB** —— 它是硬门槛，见 `_passes` 的注释。"""
         s = self.settings
-        return any(
-            v is not None
-            for v in (
-                s.min_market_cap,
-                s.max_market_cap,
-                s.min_pe,
-                s.max_pe,
-                s.min_pb,
-                s.max_pb,
-            )
-        )
+        return s.min_market_cap is not None or s.max_market_cap is not None
+
+    @property
+    def _valuation_enabled(self) -> bool:
+        """PE / PB 是否要过滤（2026-10-26 起**不再包含市值**）。"""
+        s = self.settings
+        return any(v is not None for v in (s.min_pe, s.max_pe, s.min_pb, s.max_pb))
 
     @property
     def _liquidity_enabled(self) -> bool:
@@ -219,7 +217,8 @@ class UniverseFilter:
     def enabled(self) -> bool:
         """是否启用了任一维度的过滤。"""
         return (
-            self._valuation_enabled
+            self._market_cap_enabled
+            or self._valuation_enabled
             or self._liquidity_enabled
             or self._technical_enabled
             or self._today_drop_enabled
@@ -639,6 +638,7 @@ class UniverseFilter:
         return self._apply(
             symbols,
             valuation=self._valuation_enabled,
+            market_cap=self._market_cap_enabled,
             liquidity=self._liquidity_enabled,
             technical=self._technical_enabled,
             today_drop=self._today_drop_enabled,
@@ -688,6 +688,7 @@ class UniverseFilter:
         stage1 = self._apply(
             all_symbols,
             valuation=False,
+            market_cap=False,
             liquidity=liquidity_on,
             technical=False,
             today_drop=today_drop_on,
@@ -707,6 +708,7 @@ class UniverseFilter:
         stage2 = self._apply(
             stage1,
             valuation=self._valuation_enabled,
+            market_cap=self._market_cap_enabled,
             liquidity=False,
             technical=self._technical_enabled,
             today_drop=False,
@@ -727,9 +729,16 @@ class UniverseFilter:
         若这类策略也沿用注入池，信号会被 MA120 一刀清空（实测 `dist_atr < -4` 的信号里
         97.6% 已在 MA120 下方）。
 
-        其余维度照常生效（成交额 / 今日跌幅 / 行业 / 筹码），且**刻意跳过估值与
-        换手率**：那两项要逐股请求 baostock，而这里的候选来自全市场，逐个拉取会把
-        每日任务拖成十分钟级。质量把关交给后续评分层。
+        其余维度照常生效（成交额 / 今日跌幅 / 行业 / 筹码），且**刻意跳过 PE/PB 与
+        换手率**：那两项要逐股请求 baostock，而这里只为「选票质量」服务，
+        不值得为它把每日任务拖成十分钟级。
+
+        🔴 **但市值照常过滤（2026-10-26 起）**：市值是用户指定的硬门槛
+        （>=100 亿），不是估值偏好。原先它和 PE/PB 共用 `valuation` 一个开关，
+        于是这两路策略**从来没查过市值** —— 一旦出票就会混进几十亿的小盘股。
+        成本可忽略：走到这一步的候选只剩 3~21 只，一次登录批量取完，
+        且结果会落进 `stock_valuation` 缓存，当天重跑零请求。
+        数据源失败时走 `load_latest` 兜底，仍判不出来才放行（不把数据问题变成选股结论）。
 
         Args:
             symbols: 待过滤的股票代码列表。
@@ -747,6 +756,7 @@ class UniverseFilter:
         return self._apply(
             symbols,
             valuation=False,
+            market_cap=self._market_cap_enabled,
             liquidity=floor is not None,
             technical=False,
             today_drop=self._today_drop_enabled,
@@ -768,6 +778,7 @@ class UniverseFilter:
         industry: bool,
         holder: bool = False,
         min_turnover: float | None = None,
+        market_cap: bool = False,
     ) -> list[str]:
         """按显式指定的维度集合过滤候选股票。
 
@@ -776,7 +787,7 @@ class UniverseFilter:
 
         Args:
             symbols: 待过滤的股票代码列表。
-            valuation: 是否启用估值维度（市值/PE/PB）。
+            valuation: 是否启用 **PE/PB** 维度（2026-10-26 起不含市值）。
             liquidity: 是否启用流动性维度（成交额）。
             technical: 是否启用技术面维度（换手率）。
             today_drop: 是否启用今日跌幅维度（本地库今收 vs 昨收）。
@@ -784,18 +795,30 @@ class UniverseFilter:
             industry: 是否启用行业维度（白名单/黑名单）。
             holder: 是否启用筹码维度（前十大流通股东合计占比）。
             min_turnover: 成交额下限覆盖值（亿元）；None 表示用 `settings.min_turnover`。
+            market_cap: 是否启用**市值**维度。它与 `valuation` 分开，是因为市值是
+                用户指定的硬门槛：`apply_without_ma` 会跳过 PE/PB 但**保留市值**。
 
         Returns:
             过滤后的代码列表。指定维度全为 False、或输入为空时原样返回。
         """
         if not symbols:
             return list(symbols)
-        if not (valuation or liquidity or technical or today_drop or ma or industry or holder):
+        if not (
+            valuation
+            or market_cap
+            or liquidity
+            or technical
+            or today_drop
+            or ma
+            or industry
+            or holder
+        ):
             return list(symbols)
 
         # 维度是否生效。注意：某一数据源「完全拉取失败」时必须把对应维度真正关掉，
         # 否则会退化成「全部因数据缺失被剔除」，把结果误杀成空。
         valuation_on = valuation
+        market_cap_on = market_cap
         technical_on = technical
         liquidity_on = liquidity
         today_drop_on = today_drop
@@ -803,13 +826,13 @@ class UniverseFilter:
         industry_on = industry
         holder_on = holder
 
-        # 1) 估值 / 换手率（baostock，一次登录批量拉取）
+        # 1) 市值 / 估值 / 换手率（baostock，一次登录批量拉取）
         metrics: dict[str, StockMetric] = {}
-        if valuation_on or technical_on:
+        if valuation_on or market_cap_on or technical_on:
             metrics = self.fetch_metrics(symbols)
             if not metrics:
                 logger.error("精筛：估值/技术面指标完全获取失败，跳过该维度")
-                valuation_on = technical_on = False
+                valuation_on = market_cap_on = technical_on = False
 
         # 2) 成交额（本地库，无网络开销）
         turnovers: dict[str, float] = {}
@@ -853,6 +876,7 @@ class UniverseFilter:
 
         ctx = _Context(
             valuation=valuation_on,
+            market_cap=market_cap_on,
             liquidity=liquidity_on,
             technical=technical_on,
             today_drop=today_drop_on,
@@ -873,19 +897,28 @@ class UniverseFilter:
         # 记录「配了但没生效」的维度：这必须能播报出去。
         # 事故形态（2026-10-26）：baostock 登录失败 ⇒ 估值维度被跳过 ⇒
         # 市值 >=100亿 静默失效，小市值票进榜，而报告页首照样写着这条门槛。
-        self.skipped_dimensions = tuple(
+        # ⚠️ 「实际是否生效」一律**从 ctx 读**，不读上面那些局部变量 ——
+        # 否则 ctx 被改坏时这里仍会认为「生效了」，播报与实际再次脱节。
+        # 而且**跨调用累积**：一轮运行里只要有一次没生效，页首就不能宣称它成立
+        # （精筛预筛、策略后置过滤、免均线入口会各调一次 `_apply`）。
+        skipped = tuple(
             name
             for name, wanted, actual in (
-                ("市值/PE/PB", valuation, valuation_on),
-                ("换手率", technical, technical_on),
-                ("成交额", liquidity, liquidity_on),
-                ("今日跌幅", today_drop, today_drop_on),
-                ("均线", ma, ma_on),
-                ("行业", industry, industry_on),
-                ("前十大流通股东", holder, holder_on),
+                ("市值", market_cap, ctx.market_cap),
+                ("PE/PB", valuation, ctx.valuation),
+                ("换手率", technical, ctx.technical),
+                ("成交额", liquidity, ctx.liquidity),
+                ("今日跌幅", today_drop, ctx.today_drop),
+                ("均线", ma, ctx.ma),
+                ("行业", industry, ctx.industry),
+                ("前十大流通股东", holder, ctx.holder),
             )
             if wanted and not actual
         )
+        if skipped:
+            self.skipped_dimensions = tuple(
+                dict.fromkeys((*self.skipped_dimensions, *skipped))
+            )
         if self.skipped_dimensions:
             logger.error(
                 "精筛：以下维度因数据源故障**本次未生效**："
@@ -906,24 +939,31 @@ class UniverseFilter:
         """判断单只股票是否同时满足所有已生效的维度。"""
         s = self.settings
 
-        # ── 估值：市值 / PE / PB ──
+        # ── 市值（硬门槛，独立于 PE/PB）──
+        # 2026-10-26 拆出来的：市值原先和 PE/PB 共用 `valuation` 一个开关，
+        # 于是「免均线」策略（`apply_without_ma`）跳过估值时连市值也一起跳过了，
+        # 而用户要的是「市值 >=100亿」这条不留口子。
         metric = ctx.metrics.get(symbol)
+        if ctx.market_cap:
+            if metric is None:
+                ctx.drop("估值数据缺失")
+                return False
+            if metric.circ_market_cap is None:
+                ctx.drop("市值缺失")
+                return False
+            cap_yi = metric.circ_market_cap / YI
+            if s.min_market_cap is not None and cap_yi < s.min_market_cap:
+                ctx.drop("市值偏小")
+                return False
+            if s.max_market_cap is not None and cap_yi > s.max_market_cap:
+                ctx.drop("市值偏大")
+                return False
+
+        # ── 估值：PE / PB ──
         if ctx.valuation:
             if metric is None:
                 ctx.drop("估值数据缺失")
                 return False
-
-            if s.min_market_cap is not None or s.max_market_cap is not None:
-                if metric.circ_market_cap is None:
-                    ctx.drop("市值缺失")
-                    return False
-                cap_yi = metric.circ_market_cap / YI
-                if s.min_market_cap is not None and cap_yi < s.min_market_cap:
-                    ctx.drop("市值偏小")
-                    return False
-                if s.max_market_cap is not None and cap_yi > s.max_market_cap:
-                    ctx.drop("市值偏大")
-                    return False
 
             if s.min_pe is not None or s.max_pe is not None:
                 if metric.pe_ttm is None:

@@ -1323,3 +1323,55 @@ def test_describe_mentions_ma_deviation_and_window():
     text = f.describe()
     assert "MA60" in text
     assert "3%" in text
+
+
+# ── 免均线入口也要查市值（2026-10-26）──
+
+
+def test_apply_without_ma_still_filters_market_cap(monkeypatch):
+    """`apply_without_ma` 豁免的是均线，**不是市值**。
+
+    事故背景：市值原先与 PE/PB 共用 `valuation` 一个开关，而这个入口
+    `valuation=False`，于是 ATR 超跌 / 底部十字星 这两路**从来没查过市值**，
+    一旦出票就会混进几十亿的小盘股（鹿山新材 38 亿就是这么可能进榜的）。
+    """
+    monkeypatch.setattr(
+        UniverseFilter,
+        "_fetch_from_baostock",
+        stub_metrics(
+            {
+                "000001": metric("000001", cap_yi=38.2),  # 小盘
+                "000002": metric("000002", cap_yi=300.0),  # 达标
+            }
+        ),
+    )
+    f = UniverseFilter(settings=make_settings(min_market_cap=100))
+
+    assert f.apply_without_ma(["000001", "000002"]) == ["000002"]
+    assert f.skipped_dimensions == ()
+
+
+def test_apply_without_ma_ignores_pe_and_pb(monkeypatch):
+    """市值是硬门槛，PE/PB 是估值偏好 —— 免均线路径只保留前者。
+
+    这两路策略选的本来就是超跌股，其中不乏亏损（PE 为负）。
+    若顺手把 PE 也套上，会把它们的信号清空；用户要的只是「市值 >=100亿」。
+    """
+    monkeypatch.setattr(
+        UniverseFilter,
+        "_fetch_from_baostock",
+        stub_metrics({"000001": metric("000001", cap_yi=300.0, pe=-5.0, pb=0.3)}),
+    )
+    f = UniverseFilter(settings=make_settings(min_market_cap=100, min_pe=0, min_pb=1.0))
+
+    assert f.apply_without_ma(["000001"]) == ["000001"]
+
+
+def test_apply_without_ma_keeps_stock_when_cap_unavailable(monkeypatch):
+    """数据源整体故障时不删票（不把数据问题变成选股结论），但要记进 skipped。"""
+    monkeypatch.setattr(UniverseFilter, "_fetch_from_baostock", lambda self, symbols: {})
+    f = UniverseFilter(settings=make_settings(min_market_cap=100))
+
+    assert f.apply_without_ma(["000001"]) == ["000001"]
+    assert f.skipped_dimensions == ("市值",)
+    assert "本次未生效：市值" in f.describe()
