@@ -86,6 +86,51 @@ def load(db_path: str, on_date: str, symbols: Sequence[str]) -> dict[str, dict[s
     }
 
 
+def load_latest(
+    db_path: str, symbols: Sequence[str], since: str
+) -> dict[str, tuple[str, dict[str, float | None]]]:
+    """读每只票**最近一次**缓存的估值（不限当天），返回 {symbol: (date, values)}。
+
+    用途只有一个：**兜底**。2026-10-26 那次 baostock 登录失败、174/174 全取不到，
+    估值维度被整体跳过 —— 市值 / PE / 换手率三条门槛同时失效，池子 174→174，
+    小市值票（鹿山新材 38 亿）直接进了榜单，而报告页首仍写着「流通市值 >=100亿」。
+
+    这里用「最近 N 天内的一条」来判市值/PE：
+      · 市值 = 价格 × 流通股本，几天内变动有限，用来判「是否 >=100亿」够用；
+      · PE 只用于 `MIN_PE=0` 这类粗过滤，旧值也可接受。
+    ⚠️ 但它**不能**替代当天的换手率（换手率是当日量能，跨日复用会算错）。
+
+    Args:
+        since: 最早可接受的日期（含），一般传「今天 - N 天」。
+    """
+    if not symbols:
+        return {}
+    try:
+        with sqlite3.connect(db_path, timeout=_TIMEOUT) as conn:
+            conn.execute(_CREATE_TABLE_SQL)
+            placeholders = ",".join("?" * len(symbols))
+            rows = conn.execute(
+                f"SELECT symbol, date, pe_ttm, pb, turn, circ_market_cap FROM {TABLE} "
+                f"WHERE date >= ? AND symbol IN ({placeholders}) "
+                f"ORDER BY symbol, date DESC",
+                (since, *symbols),
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"估值缓存：读取最近记录失败：{exc}")
+        return {}
+
+    out: dict[str, tuple[str, dict[str, float | None]]] = {}
+    for row in rows:  # 已按 date DESC，每只票第一条就是最近的
+        symbol = str(row[0])
+        if symbol in out:
+            continue
+        out[symbol] = (
+            str(row[1]),
+            {"pe_ttm": row[2], "pb": row[3], "turn": row[4], "circ_market_cap": row[5]},
+        )
+    return out
+
+
 def save(db_path: str, on_date: str, rows: Mapping[str, Mapping[str, float | None]]) -> int:
     """写入某一天的估值，返回写入条数。失败只记 WARNING（下轮重取）。"""
     if not rows:

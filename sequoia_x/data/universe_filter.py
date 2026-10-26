@@ -39,6 +39,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
@@ -53,6 +54,10 @@ YI = 1e8  # 1 亿元
 
 # 回看窗口天数：覆盖周末与连续假期，取窗口内最后一个有数据的交易日
 _LOOKBACK_DAYS = 15
+
+# 估值兜底可接受的缓存最大年龄（天）。市值/PE 变化慢，一周内用它判门槛够用；
+# 再老就可能跨过除权、定增、暴涨暴跌，反而误导。见 `valuation_cache.load_latest`。
+_STALE_MAX_DAYS = 7
 
 # 估值批量取数的缺失率超过这个比例就告警：正常年份个别退市/停牌票缺失在个位数，
 # 超过 20% 只可能是数据源抖动（实测某次 82/200 = 41%，池子被砍掉一半）。
@@ -153,6 +158,10 @@ class UniverseFilter:
         """
         self.settings = settings
         self.engine = engine
+        # 上一次 apply 里「配了但没生效」的维度（数据源整体故障被跳过）。
+        # 由 `describe()` 播报出来 —— 否则报告页首会写着「流通市值 >=100亿」，
+        # 而实际那天根本没校验（2026-10-26 的事故形态）。
+        self.skipped_dimensions: tuple[str, ...] = ()
 
     # ── 配置状态 ──
 
@@ -276,7 +285,13 @@ class UniverseFilter:
             holder_range = rng(s.min_top10_free_holding, s.max_top10_free_holding, "%")
             parts.append(f"前十大流通股东 {holder_range}")
 
-        return "精筛：" + "，".join(parts)
+        desc = "精筛：" + "，".join(parts)
+        if self.skipped_dimensions:
+            # 必须在页首／卡片上如实标注：这些条件「配了但这次没生效」。
+            # 不标注的后果就是 2026-10-26 那次 —— 页面写着「流通市值 >=100亿」，
+            # 而 59 只里有 24 只其实不到 100 亿（鹿山新材 38 亿）。
+            desc += f"（⚠️ 本次未生效：{'、'.join(self.skipped_dimensions)}）"
+        return desc
 
     # ── 数据获取 ──
 
@@ -348,6 +363,34 @@ class UniverseFilter:
             )
 
         missing = len(todo) - len(fetched)
+
+        # 兜底：网络没拿到的票，用「最近 N 天」的缓存顶上。
+        # 为什么需要：估值维度一旦整批失败会被**整体跳过**，那意味着市值门槛
+        # 静默失效（2026-10-26 鹿山新材 38 亿进榜的直接原因）。
+        # 市值 = 价格 × 流通股本，几天内变动有限，用来判「是否 >=100亿」够用；
+        # 换手率是当日量能、严格说不该跨日复用，所以只告警不改判据。
+        if missing:
+            still_missing = [s for s in todo if s not in fetched]
+            since = (date.today() - timedelta(days=_STALE_MAX_DAYS)).isoformat()
+            stale = valuation_cache.load_latest(self._db_path(), still_missing, since)
+            for symbol, (cached_date, values) in stale.items():
+                metric = StockMetric(
+                    symbol=symbol,
+                    circ_market_cap=values["circ_market_cap"],
+                    pe_ttm=values["pe_ttm"],
+                    pb=values["pb"],
+                    turn=values["turn"],
+                )
+                result[symbol] = metric
+                _METRIC_CACHE[symbol] = metric
+            if stale:
+                oldest = min(item[0] for item in stale.values())
+                missing -= len(stale)
+                logger.warning(
+                    f"精筛：{len(stale)} 只估值取数失败，改用最近缓存（最旧 {oldest}）"
+                    f"判市值/PE/换手率 —— 这是降级，别当成当日真实值"
+                )
+
         if todo and missing / len(todo) > _MISSING_WARN_RATIO:
             # 缺失率高只可能是数据源抖动，而不是「这些票真的没估值」。
             # 这里只告警、不改剔除策略：精筛仍是 fail-closed（宁可少选），
@@ -382,7 +425,25 @@ class UniverseFilter:
         return str(latest or date.today().isoformat())
 
     def _fetch_from_baostock(self, symbols: list[str]) -> dict[str, StockMetric]:
-        """通过 baostock 批量拉取指标。整批共用一个登录会话。"""
+        """通过 baostock 批量拉取指标。整批共用一个登录会话。
+
+        🔴 **登录失败会重试一次**：baostock 是裸 TCP（`public-api.baostock.com:10030`，
+        不走系统代理），登录偶发 `网络接收错误`。2026-10-26 19:37 就是这种情况，
+        一次性失败导致**估值维度被整体跳过** ⇒ 市值 >=100亿 这条门槛静默失效，
+        小市值票（鹿山新材 38 亿）进了榜单。同样的偶发失败在 10-23 也出现过
+        （81/200 失败）。等 2 秒重登录的代价远小于「一天的门槛没生效」。
+        """
+        for attempt in (1, 2):
+            metrics = self._fetch_once(symbols)
+            if metrics:
+                return metrics
+            if attempt == 1:
+                logger.warning(f"精筛：baostock 整批取数失败（{len(symbols)} 只），2 秒后重试一次")
+                time.sleep(2)
+        return {}
+
+    def _fetch_once(self, symbols: list[str]) -> dict[str, StockMetric]:
+        """单次登录 + 批量拉取。失败的票跳过（由调用方决定降级方式）。"""
         import baostock as bs
 
         today = date.today()
@@ -808,6 +869,29 @@ class UniverseFilter:
                 self.settings.min_turnover if min_turnover is None else min_turnover
             ),
         )
+
+        # 记录「配了但没生效」的维度：这必须能播报出去。
+        # 事故形态（2026-10-26）：baostock 登录失败 ⇒ 估值维度被跳过 ⇒
+        # 市值 >=100亿 静默失效，小市值票进榜，而报告页首照样写着这条门槛。
+        self.skipped_dimensions = tuple(
+            name
+            for name, wanted, actual in (
+                ("市值/PE/PB", valuation, valuation_on),
+                ("换手率", technical, technical_on),
+                ("成交额", liquidity, liquidity_on),
+                ("今日跌幅", today_drop, today_drop_on),
+                ("均线", ma, ma_on),
+                ("行业", industry, industry_on),
+                ("前十大流通股东", holder, holder_on),
+            )
+            if wanted and not actual
+        )
+        if self.skipped_dimensions:
+            logger.error(
+                "精筛：以下维度因数据源故障**本次未生效**："
+                + "、".join(self.skipped_dimensions)
+                + "（结果会比配置宽，播报必须标注）"
+            )
 
         kept: list[str] = []
         for symbol in symbols:

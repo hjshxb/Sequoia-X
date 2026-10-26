@@ -8,6 +8,7 @@
 """
 
 import sqlite3
+from datetime import date, timedelta
 
 import pytest
 
@@ -32,6 +33,37 @@ def _settings(tmp_path, **kwargs) -> Settings:
 def _clear_process_cache(monkeypatch):
     """进程内缓存会掩盖「库缓存是否命中」，每个用例都从空开始。"""
     monkeypatch.setattr(universe_filter, "_METRIC_CACHE", {})
+
+
+# `_env_file=None` 只关 .env 文件，管不住 `os.environ` —— 而 `main.py` 在导入时
+# 调了 `load_dotenv()`，所以只要 `test_main` 先跑过，本机 .env 的阈值就被灌进环境变量，
+# 后面这些用例的 UniverseFilter 会凭空多出「成交额/换手率/均线/行业」等维度
+# （表现为「单跑绿、全量红」，2026-10-23 已踩过一次）。用例要自己把它们清掉。
+_FILTER_ENV_VARS = (
+    "MIN_MARKET_CAP",
+    "MAX_MARKET_CAP",
+    "MIN_PE",
+    "MAX_PE",
+    "MIN_PB",
+    "MAX_PB",
+    "MIN_TURNOVER",
+    "MIN_TURN",
+    "MAX_TURN",
+    "MIN_TODAY_DROP",
+    "MAX_TODAY_DROP",
+    "MIN_MA_DEVIATION",
+    "INCLUDE_INDUSTRIES",
+    "EXCLUDE_INDUSTRIES",
+    "MIN_TOP10_FREE_HOLDING",
+    "MAX_TOP10_FREE_HOLDING",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_filter_env(monkeypatch):
+    """清掉可能被其他测试污染的精筛阈值，保证断言只反映本用例配置的维度。"""
+    for name in _FILTER_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
 
 
 class _Engine:
@@ -187,3 +219,126 @@ def test_table_is_created_on_demand(tmp_path) -> None:
     with sqlite3.connect(db) as conn:
         names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert valuation_cache.TABLE in names
+
+
+# ── 网络整批失败时的兜底与「如实播报」 ──
+
+
+def test_stale_cache_fills_gap_when_network_fails(tmp_path, monkeypatch, caplog) -> None:
+    """网络全失败时，用最近 7 天内的缓存顶上 —— 否则市值门槛会静默失效。
+
+    这是 2026-10-26 的事故形态：baostock 登录失败 174/174 ⇒ 估值维度被整体跳过
+    ⇒ 市值 >=100亿 不生效 ⇒ 鹿山新材（38 亿）进榜，而页首仍写着那条门槛。
+    """
+    db = str(tmp_path / "v.db")
+    DataEngine(_settings(tmp_path))
+    previous = (date.today() - timedelta(days=2)).isoformat()
+    valuation_cache.save(
+        db,
+        previous,
+        {"603051": {"pe_ttm": 30.0, "pb": 2.0, "turn": 3.0, "circ_market_cap": 3.82e9}},
+    )
+    monkeypatch.setattr(UniverseFilter, "_fetch_from_baostock", lambda self, symbols: {})
+
+    with caplog.at_level("WARNING"):
+        got = UniverseFilter(settings=_settings(tmp_path), engine=_Engine(db)).fetch_metrics(
+            ["603051"]
+        )
+
+    assert "603051" in got, "网络失败时必须用缓存兜底"
+    assert got["603051"].circ_market_cap == 3.82e9
+    assert "改用最近缓存" in caplog.text
+
+
+def test_stale_cache_older_than_window_is_ignored(tmp_path, monkeypatch) -> None:
+    """超过 7 天的缓存不能用：可能跨过除权/定增，判市值反而误导。"""
+    db = str(tmp_path / "v.db")
+    DataEngine(_settings(tmp_path))
+    old = (date.today() - timedelta(days=30)).isoformat()
+    valuation_cache.save(
+        db, old, {"603051": {"pe_ttm": 30.0, "pb": 2.0, "turn": 3.0, "circ_market_cap": 3.82e9}}
+    )
+    monkeypatch.setattr(UniverseFilter, "_fetch_from_baostock", lambda self, symbols: {})
+
+    got = UniverseFilter(settings=_settings(tmp_path), engine=_Engine(db)).fetch_metrics(["603051"])
+
+    assert got == {}
+
+
+class _FakeRs:
+    """假的 baostock 结果集：只喂一行数据。"""
+
+    error_code = "0"
+
+    def __init__(self, row: list[str]) -> None:
+        self._row = row
+        self._done = False
+
+    def next(self) -> bool:
+        if self._done:
+            return False
+        self._done = True
+        return True
+
+    def get_row_data(self) -> list[str]:
+        return self._row
+
+
+def _fake_baostock(fail_login_times: int):
+    """构造一个「前 N 次登录失败、之后成功」的假 baostock 模块。"""
+    import types
+
+    state = {"login": 0}
+
+    class _Lib:
+        @staticmethod
+        def login():
+            state["login"] += 1
+            code = "10001001" if state["login"] <= fail_login_times else "0"
+            return types.SimpleNamespace(error_code=code, error_msg="网络接收错误")
+
+        @staticmethod
+        def logout():
+            return types.SimpleNamespace(error_code="0")
+
+        @staticmethod
+        def query_history_k_data_plus(*_args, **_kwargs):
+            return _FakeRs(["2026-10-26", "10.0", "1000000", "2.0", "15.0", "1.5"])
+
+    return _Lib, state
+
+
+def test_baostock_login_is_retried_once(tmp_path, monkeypatch) -> None:
+    """登录偶发「网络接收错误」必须重试一次 —— 一次失败会让整天门槛失效。"""
+    import sys
+
+    fake, state = _fake_baostock(fail_login_times=1)
+    monkeypatch.setitem(sys.modules, "baostock", fake)
+    monkeypatch.setattr(universe_filter.time, "sleep", lambda _s: None)
+
+    got = UniverseFilter(settings=_settings(tmp_path))._fetch_from_baostock(["600000"])
+
+    assert state["login"] == 2, "第一次登录失败后应再试一次"
+    assert "600000" in got
+
+
+def test_describe_marks_dimensions_that_did_not_take_effect(tmp_path) -> None:
+    """维度没生效必须写在描述里，否则报告页首就是在撒谎。"""
+    f = UniverseFilter(settings=_settings(tmp_path, min_market_cap=100))
+
+    assert "本次未生效" not in f.describe()
+    f.skipped_dimensions = ("市值/PE/PB",)
+    assert "本次未生效：市值/PE/PB" in f.describe()
+    assert "本次未生效" in f.describe(brief=True)
+
+
+def test_apply_records_skipped_valuation_dimension(tmp_path, monkeypatch) -> None:
+    """估值整批失败 ⇒ 该维度被跳过（不剔除），但必须被记进 skipped_dimensions。"""
+    db = str(tmp_path / "v.db")
+    monkeypatch.setattr(UniverseFilter, "_fetch_from_baostock", lambda self, symbols: {})
+    f = UniverseFilter(settings=_settings(tmp_path, min_market_cap=100), engine=_Engine(db))
+
+    kept = f.apply(["603051"])
+
+    assert kept == ["603051"], "数据源整体故障时不能把票全杀光"
+    assert f.skipped_dimensions == ("市值/PE/PB",)
