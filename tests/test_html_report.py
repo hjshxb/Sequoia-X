@@ -893,3 +893,112 @@ def test_strategy_labels_match_strategy_constants():
     assert f"{BottomDojiStrategy.min_turnover_yi:g}亿" in doji
     # 两个都豁免均线维度：标签必须写明，否则页首的「收盘价>=MA120」会被当成人人适用
     assert "免均线" in doji and "免均线" in atr
+
+
+# ── 个股题材列 / 今日最强板块（2026-10-30）──
+
+
+def _fake_boards():
+    from sequoia_x.data.board_concept import StockBoards
+
+    # 600000 挂 3 个概念：按「当日命中数」排序后应先显示 人形机器人
+    return {
+        "600000": StockBoards(
+            symbol="600000",
+            concepts=("新材料", "人形机器人", "机器人概念"),
+            industry="银行",
+        ),
+        "000001": StockBoards(symbol="000001", concepts=(), industry="银行"),
+    }
+
+
+def _fake_ranks():
+    from sequoia_x.analysis.board_rank import BoardRank
+
+    return {
+        "concept": (
+            BoardRank("concept", "人形机器人", 3.24, 21, 38, "600000", 10.0),
+            BoardRank("concept", "固态电池", 2.10, 12, 20, "000001", 8.0),
+        ),
+        "industry": (BoardRank("industry", "机械设备", 1.05, 30, 60, "600000", 6.0),),
+    }
+
+
+def test_ranking_has_theme_column_with_hot_concepts(gen):
+    """排行表要能一眼看出「这只是什么题材」，而不只是「它是主板」。
+
+    同一只票往往挂十几个概念，列里只放两个、按**当日这批票的命中数**排序：
+    今天机器人扎堆 ⇒ 先显示人形机器人，而不是接口返回顺序的第一个（新材料）。
+    """
+    text = gen.generate(
+        {"TurtleTradeStrategy": ["600000"]},
+        scores=[make_score("600000", 80.0)],
+        board_summary=BoardSummary(
+            total=2,
+            covered=1,
+            concepts=(("人形机器人", 1), ("机器人概念", 1), ("新材料", 1)),
+            industries=(("银行", 2),),
+        ),
+        boards=_fake_boards(),
+    ).read_text(encoding="utf-8")
+
+    assert "<th>题材</th>" in text
+    cell = text.split('class="theme', 1)[1].split("</td>", 1)[0]
+    assert "新材料" in cell  # 完整概念（三个）在 title 里
+    visible = cell.split(">", 1)[1]
+    # 三个概念当日命中数都是 1 ⇒ 保持接口顺序，取前两个
+    assert visible.startswith("新材料、人形机器人"), visible
+
+
+def test_theme_column_prefers_hot_concepts(gen):
+    """当日命中数与接口顺序冲突时，广告位归「当日主线」。"""
+    text = gen.generate(
+        {"TurtleTradeStrategy": ["600000"]},
+        scores=[make_score("600000", 80.0)],
+        board_summary=BoardSummary(
+            total=2,
+            covered=1,
+            # 新材料 0 只（不在 summary 里）⇒ 排最后；人形机器人 5 只 ⇒ 排最前
+            concepts=(("人形机器人", 5), ("机器人概念", 2)),
+            industries=(),
+        ),
+        boards=_fake_boards(),
+    ).read_text(encoding="utf-8")
+
+    visible = text.split('class="theme', 1)[1].split(">", 1)[1].split("</td>", 1)[0]
+    assert visible.startswith("人形机器人"), visible
+
+
+def test_theme_column_falls_back_to_dash(gen):
+    """没有概念数据时显示「—」，不能空着（空单元格会被读成渲染坏了）。"""
+    text = gen.generate(
+        {"TurtleTradeStrategy": ["000001"]},
+        scores=[make_score("000001", 70.0)],
+        boards=_fake_boards(),
+    ).read_text(encoding="utf-8")
+
+    assert 'class="theme dim"' in text
+    assert "—" in text
+
+
+def test_board_ranks_panel_renders(gen):
+    """「今日最强 概念 / 行业」面板：涨幅、上涨家数、领涨股三样都要在。"""
+    text = gen.generate(
+        {"TurtleTradeStrategy": ["600000"]},
+        board_ranks=_fake_ranks(),
+    ).read_text(encoding="utf-8")
+
+    assert '<section class="panel ranks"' in text
+    assert "今日最强 概念 / 行业" in text
+    assert "人形机器人" in text
+    assert "+3.24%" in text
+    assert "↑21/38" in text  # 普涨还是独苗，一眼可见
+    assert "领涨" in text
+    assert '<span class="rank-kind">申万行业</span>' in text
+
+
+def test_board_ranks_panel_is_omitted_when_empty(gen):
+    """取数失败 / 关闭时整块不出现，不留空壳。"""
+    text = gen.generate({"TurtleTradeStrategy": ["600000"]}).read_text(encoding="utf-8")
+
+    assert '<section class="panel ranks"' not in text

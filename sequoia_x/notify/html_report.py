@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
+from sequoia_x.analysis.board_rank import KINDS as BOARD_RANK_KINDS
+from sequoia_x.analysis.board_rank import MIN_MEMBERS, BoardRank
 from sequoia_x.analysis.scorer import (
     WINRATE_WEIGHT,
     ScoreDetail,
@@ -33,7 +35,7 @@ from sequoia_x.analysis.scorer import (
 from sequoia_x.core.config import Settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data import stock_meta as stock_meta_module
-from sequoia_x.data.board_concept import BoardSummary
+from sequoia_x.data.board_concept import BoardSummary, StockBoards
 from sequoia_x.data.stock_meta import BOARD_ORDER, StockMeta, board_of, board_rank
 from sequoia_x.data.universe_filter import StockMetric
 
@@ -354,6 +356,11 @@ class HtmlReportGenerator:
             settings: 提供 report_dir 等配置。
         """
         self.settings = settings
+        # 个股题材 / 板块涨幅榜：`generate` 会覆盖；先给默认值，
+        # 这样单独调 `_render_ranking` 也不会因为缺属性而炸。
+        self._boards: Mapping[str, StockBoards] = {}
+        self._board_ranks: Mapping[str, Sequence[BoardRank]] = {}
+        self._concept_counts: dict[str, int] = {}
 
     # ── 路径 ──
 
@@ -374,6 +381,8 @@ class HtmlReportGenerator:
         scores: Sequence[ScoreDetail] | None = None,
         data_status: str = "",
         board_summary: BoardSummary | None = None,
+        boards: Mapping[str, StockBoards] | None = None,
+        board_ranks: Mapping[str, Sequence[BoardRank]] | None = None,
     ) -> Path:
         """生成 HTML 报告并写入磁盘。
 
@@ -397,6 +406,10 @@ class HtmlReportGenerator:
                 `data.board_concept.summarize` 生成）。传入后页首多一张
                 汇总卡 —— 策略表回答「哪几只」，它回答「这批票扎堆在什么方向」。
                 取数失败/未启用时传 None，整块不渲染（不影响其余内容）。
+            boards: 可选的 {代码: StockBoards}（全市场概念映射）。传入后排行表
+                多一列「题材」，显示该股命中的**今日热门概念**（悬停看全部）。
+            board_ranks: 可选的 `{kind: (BoardRank, ...)}`（`analysis.board_rank`
+                算出的当日最强概念 / 行业）。传入后页首多一张「今日最强」面板。
 
         Returns:
             实际写入的报告文件路径。
@@ -424,6 +437,8 @@ class HtmlReportGenerator:
             score_list,
             data_status,
             board_summary,
+            boards,
+            board_ranks,
         )
 
         path = Path(output_path) if output_path else self.default_path()
@@ -443,7 +458,15 @@ class HtmlReportGenerator:
         scores: Sequence[ScoreDetail] = (),
         data_status: str = "",
         board_summary: BoardSummary | None = None,
+        boards: Mapping[str, StockBoards] | None = None,
+        board_ranks: Mapping[str, Sequence[BoardRank]] | None = None,
     ) -> str:
+        # 个股题材要用「今日热门概念」的顺序挑前两个，故先把板块数据挂到实例上，
+        # 让 `_render_ranking` 不必再加一层参数（它已经被行内调用两处）。
+        self._boards = boards or {}
+        self._board_ranks = board_ranks or {}
+        # {概念: 当日这批票里的命中数}：题材列按它排序，先显示当前主线
+        self._concept_counts = dict(board_summary.concepts) if board_summary else {}
         today = date.today().strftime("%Y-%m-%d")
         total = sum(len(v) for v in results.values())
         hit_strategies = sum(1 for v in results.values() if v)
@@ -535,6 +558,7 @@ class HtmlReportGenerator:
         )
         ranking_html = self._render_ranking(scores, meta)
         boards_html = self._render_boards(board_summary)
+        ranks_html = self._render_board_ranks(self._board_ranks, meta)
 
         return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -662,6 +686,38 @@ class HtmlReportGenerator:
   td.board {{ color: var(--muted); white-space: nowrap; }}
   td.num {{ text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }}
   td.industry {{ color: var(--muted); }}
+  /* 题材列：个股所属的「今日热门概念」。比「板块（主板/创业板）」细一层，
+     一行就能看出「这只是机器人链的」，而不是只知道它是主板。 */
+  td.theme {{ color: var(--text); font-size: 12.5px; }}
+  td.theme.dim {{ color: var(--muted); }}
+  /* 今日最强板块榜 */
+  .rank-rows {{ display: flex; flex-direction: column; gap: 6px; }}
+  .rank-row {{
+    display: grid;
+    grid-template-columns: 52px minmax(96px, 1.2fr) 72px 96px minmax(120px, 1fr);
+    align-items: baseline;
+    gap: 10px;
+    padding: 5px 0;
+    border-bottom: 1px dashed var(--border);
+    font-size: 13px;
+  }}
+  .rank-row:last-child {{ border-bottom: none; }}
+  .rank-kind {{
+    color: var(--muted);
+    font-size: 11px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    text-align: center;
+    padding: 0 4px;
+  }}
+  .rank-name {{ font-weight: 600; }}
+  .rank-breadth {{ color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }}
+  .rank-breadth i {{ font-style: normal; margin-left: 5px; opacity: .75; }}
+  .rank-leader {{ color: var(--muted); font-size: 12px; }}
+  .rank-row .num {{ text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }}
+  /* A 股习惯：涨红跌绿 */
+  .chg-up {{ color: #d64541; }}
+  .chg-down {{ color: #2f9e6e; }}
   .boards {{ margin-left: auto; color: var(--muted); font-size: 12px; }}
   .empty {{ color: var(--muted); font-size: 13px; margin: 4px 0 16px; }}
   .card.ranking {{ border-color: #efd2d2; }}
@@ -734,6 +790,7 @@ class HtmlReportGenerator:
   <main id="report">
 {empty_hint}
 {ranking_html}
+{ranks_html}
 {boards_html}
 {chr(10).join(sections)}
   </main>
@@ -797,6 +854,89 @@ class HtmlReportGenerator:
 </body>
 </html>
 """
+
+    def _render_board_ranks(
+        self,
+        ranks: Mapping[str, Sequence[BoardRank]],
+        meta: Mapping[str, StockMeta] | None = None,
+    ) -> str:
+        """渲染「今日最强 概念 / 行业」面板。
+
+        回答的是「今天钱往哪儿去了」：榜单里的票再好，如果它们所在方向整体在跌，
+        那是个股机会；反之方向性行情里跟第二梯队往往比追第一名划算。
+
+        口径写在 `analysis.board_rank`：**成分股等权平均**当日涨跌幅、
+        成分数 >= 8 才上榜。这里额外把「上涨家数 / 成分数」摆出来 ——
+        平均 +3% 但只有 3/20 上涨，是领涨股拉的，不是板块效应，两者含义完全不同。
+
+        无数据（取数失败 / 开关关闭）时返回空串，调用方不用判空。
+        """
+        if not ranks or not any(ranks.values()):
+            return ""
+
+        meta = meta or {}
+        rows: list[str] = []
+        for kind, label in BOARD_RANK_KINDS:
+            items = list(ranks.get(kind, ()))
+            if not items:
+                continue
+            for item in items:
+                stock = meta.get(item.leader)
+                leader_name = (
+                    stock.name if stock and stock.name else item.leader
+                )
+                # 严格按 A 股习惯：涨红跌绿
+                cls = "chg-up" if item.avg_chg >= 0 else "chg-down"
+                rows.append(
+                    f'        <div class="rank-row" data-kind="{kind}">'
+                    f'<span class="rank-kind">{html.escape(label)}</span>'
+                    f'<span class="rank-name">{html.escape(item.name)}</span>'
+                    f'<span class="num {cls}">{item.avg_chg:+.2f}%</span>'
+                    f'<span class="rank-breadth">↑{item.up}/{item.members}'
+                    f"<i>{item.up_ratio:.0f}%</i></span>"
+                    f'<span class="rank-leader">领涨 '
+                    f"{html.escape(leader_name)} {item.leader_chg:+.1f}%</span>"
+                    "</div>"
+                )
+
+        return f"""<section class="panel ranks">
+      <div class="card-head">
+        <h2>今日最强 概念 / 行业</h2>
+        <span class="boards">按成分股等权平均涨幅·成分数≥{MIN_MEMBERS}·↑为上涨家数</span>
+      </div>
+      <div class="rank-rows">
+{chr(10).join(rows)}
+      </div>
+    </section>"""
+
+    def _themes_of(self, symbol: str, limit: int = 2) -> tuple[str, str]:
+        """返回 `(可见题材文本, 悬停提示)`，供排行表的「题材」列使用。
+
+        为什么按 `self._concept_counts` 排序：一只票往往挂十几个概念
+        （福莱新材就有 人形机器人 / 机器人概念 / 消费电子 / 新材料…），
+        列里只能放两三个。按「**当日这批票里命中多少只**」排，
+        显示的自然就是当天的主线（今天机器人扎堆 ⇒ 先显示人形机器人），
+        比按接口返回顺序或字母序有信息量得多。
+
+        Args:
+            symbol: 股票代码。
+            limit: 可见概念个数。
+
+        Returns:
+            (可见文本, title 提示)。没有概念数据时返回 `("—", "")`。
+        """
+        stock = self._boards.get(symbol)
+        if stock is None or not stock.concepts:
+            return "—", (f"行业：{stock.industry}" if stock and stock.industry else "")
+
+        concepts = list(stock.concepts)
+        hot = sorted(
+            concepts,
+            key=lambda name: (-self._concept_counts.get(name, 0), concepts.index(name)),
+        )
+        tip_parts = [f"行业：{stock.industry}"] if stock.industry else []
+        tip_parts.append("概念：" + "、".join(concepts))
+        return "、".join(hot[:limit]), "；".join(tip_parts)
 
     @staticmethod
     def _render_boards(summary: BoardSummary | None) -> str:
@@ -892,7 +1032,8 @@ class HtmlReportGenerator:
             return ""
 
         head = (
-            "<th>#</th><th>代码</th><th>名称</th><th>板块</th><th>评分</th><th>综合</th>"
+            "<th>#</th><th>代码</th><th>名称</th><th>题材</th><th>板块</th>"
+            "<th>评分</th><th>综合</th>"
             "<th>标记</th>"
             "<th>当日</th><th>20日</th><th>量比</th><th>距高</th><th>MA20偏离</th>"
             "<th>波动</th><th>胜率</th><th>窗口</th><th>置信</th><th>回撤</th>"
@@ -901,6 +1042,8 @@ class HtmlReportGenerator:
         for i, detail in enumerate(scores, 1):
             item = meta.get(detail.symbol)
             name = html.escape(item.name) if item and item.name else "—"
+            theme, theme_tip = self._themes_of(detail.symbol)
+            theme_attr = f' title="{html.escape(theme_tip)}"' if theme_tip else ""
             dist_high = (1 - detail.near_high) * 100 if detail.near_high else None
 
             # 悬停提示：把分数拆开，说明它为什么高 / 为什么加不到分
@@ -943,6 +1086,8 @@ class HtmlReportGenerator:
                 f'<td class="code"><a href="https://xueqiu.com/S/{to_xueqiu_code(detail.symbol)}"'
                 f' target="_blank" rel="noopener">{detail.symbol}</a></td>'
                 f'<td class="name">{name}</td>'
+                f'<td class="theme{"" if theme != "—" else " dim"}"{theme_attr}>'
+                f"{html.escape(theme)}</td>"
                 f'<td class="board">{html.escape(board_of(detail.symbol))}</td>'
                 f'<td class="num score" title="{html.escape("、".join(tips))}">'
                 f"{detail.score:.1f}</td>"

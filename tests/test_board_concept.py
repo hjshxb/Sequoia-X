@@ -152,7 +152,7 @@ def test_load_uses_fresh_cache_without_network(tmp_path, monkeypatch) -> None:
     def boom(*_a, **_kw):
         raise AssertionError("命中缓存时不应联网")
 
-    monkeypatch.setattr(bc, "_request", boom)
+    monkeypatch.setattr(bc, "_request_many", boom)
     boards = bc.load_board_concepts(["300750"], cache_dir=str(tmp_path))
 
     assert boards["300750"].concepts == ("固态电池",)
@@ -162,16 +162,16 @@ def test_load_uses_fresh_cache_without_network(tmp_path, monkeypatch) -> None:
 def test_load_refreshes_when_ttl_is_zero(tmp_path, monkeypatch) -> None:
     """`ttl_days=0` 表示不信任缓存、每次都刷新。"""
     _write_cache(tmp_path, {"300750": _fresh_entry(concepts=("旧概念",))})
-    calls: list[str] = []
+    calls: list[list[str]] = []
 
-    def fake_request(symbol: str) -> list[dict]:
-        calls.append(symbol)
-        return _CATL_ROWS
+    def fake_many(symbols):
+        calls.append(list(symbols))
+        return {s: _CATL_ROWS for s in symbols}
 
-    monkeypatch.setattr(bc, "_request", fake_request)
+    monkeypatch.setattr(bc, "_request_many", fake_many)
     boards = bc.load_board_concepts(["300750"], cache_dir=str(tmp_path), ttl_days=0)
 
-    assert calls == ["300750"]
+    assert calls == [["300750"]]
     assert boards["300750"].concepts == ("储能概念", "固态电池")
     # 写回：磁盘上的旧值已被刷新后的结果覆盖
     payload = json.loads((tmp_path / "board_concept.json").read_text(encoding="utf-8"))
@@ -181,18 +181,31 @@ def test_load_refreshes_when_ttl_is_zero(tmp_path, monkeypatch) -> None:
 def test_load_ignores_nonexistent_symbols_and_reports_partial_failure(
     tmp_path, monkeypatch
 ) -> None:
-    """单只失败不影响其余：成功的照常返回，失败的只是缺数据（不抛异常）。"""
+    """接口没返回某只（次新 / 已退市）时，其余照常返回，失败的只是缺数据。"""
 
-    def fake_request(symbol: str) -> list[dict]:
-        if symbol == "600000":
-            raise RuntimeError("连接被重置")
-        return _CATL_ROWS
+    def fake_many(symbols):
+        return {s: _CATL_ROWS for s in symbols if s != "600000"}
 
-    monkeypatch.setattr(bc, "_request", fake_request)
+    monkeypatch.setattr(bc, "_request_many", fake_many)
     boards = bc.load_board_concepts(["300750", "600000"], cache_dir=str(tmp_path))
 
     assert set(boards) == {"300750"}
     assert "600000" not in boards
+
+
+def test_load_chunks_large_requests(tmp_path, monkeypatch) -> None:
+    """全市场名单要按批切开（`_BATCH_SIZE` 只/请求），不能塞进一个 URL。"""
+    sizes: list[int] = []
+
+    def fake_many(symbols):
+        sizes.append(len(symbols))
+        return {s: _CATL_ROWS for s in symbols}
+
+    monkeypatch.setattr(bc, "_request_many", fake_many)
+    symbols = [f"{i:06d}" for i in range(1, 251)]  # 250 只
+    bc.load_board_concepts(symbols, cache_dir=str(tmp_path), workers=1)
+
+    assert sorted(sizes, reverse=True) == [bc._BATCH_SIZE, bc._BATCH_SIZE, 50]
 
 
 def test_load_degrades_to_stale_cache_when_refresh_fails(tmp_path, monkeypatch) -> None:
@@ -201,10 +214,10 @@ def test_load_degrades_to_stale_cache_when_refresh_fails(tmp_path, monkeypatch) 
     stale["fetched_at"] = "2000-01-01 00:00:00"
     _write_cache(tmp_path, {"300750": stale})
 
-    def boom(_symbol: str) -> list[dict]:
+    def boom(_symbols):
         raise RuntimeError("网络不可用")
 
-    monkeypatch.setattr(bc, "_request", boom)
+    monkeypatch.setattr(bc, "_request_many", boom)
     boards = bc.load_board_concepts(["300750"], cache_dir=str(tmp_path))
 
     assert boards["300750"].concepts == ("老概念",)
@@ -216,14 +229,58 @@ def test_load_empty_symbols_makes_no_request(tmp_path, monkeypatch) -> None:
     def boom(*_a, **_kw):
         raise AssertionError("空名单不应联网")
 
-    monkeypatch.setattr(bc, "_request", boom)
+    monkeypatch.setattr(bc, "_request_many", boom)
     assert bc.load_board_concepts([], cache_dir=str(tmp_path)) == {}
 
 
 def test_corrupt_cache_file_degrades_to_network(tmp_path, monkeypatch) -> None:
     """缓存文件损坏时当作「无缓存」重拉，而不是抛异常中断报告。"""
     (tmp_path / "board_concept.json").write_text("{ 坏掉的 json", encoding="utf-8")
-    monkeypatch.setattr(bc, "_request", lambda _s: _CATL_ROWS)
+    monkeypatch.setattr(
+        bc, "_request_many", lambda symbols: {s: _CATL_ROWS for s in symbols}
+    )
 
     boards = bc.load_board_concepts(["300750"], cache_dir=str(tmp_path))
     assert boards["300750"].industry == "电力设备"
+
+
+def test_request_many_follows_pagination(monkeypatch) -> None:
+    """服务端会把结果截断成多页时必须取全 —— 实测 200 只就会返回 `pages=2`。
+
+    这个坑很隐蔽：只看第一页也不会报错，只是**悄悄少了一批票**，
+    表现成「某些股票永远没有概念」，而缓存还会把这批「缺失」记住。
+    """
+    calls: list[int] = []
+
+    class _Resp:
+        def __init__(self, payload: dict) -> None:
+            self._payload = payload
+
+        def json(self) -> dict:
+            return self._payload
+
+    def fake_get(_url, params=None, timeout=None):  # noqa: ANN001
+        page = int(params["pageNumber"])
+        calls.append(page)
+        code = "000001" if page == 1 else "000002"
+        return _Resp(
+            {
+                "result": {
+                    "data": [
+                        {
+                            "SECURITY_CODE": code,
+                            "BOARD_NAME": f"概念{page}",
+                            "IS_PRECISE": "1",
+                            "BOARD_TYPE": None,
+                        }
+                    ],
+                    "pages": 2,
+                }
+            }
+        )
+
+    monkeypatch.setattr(bc.requests, "get", fake_get)
+    got = bc._request_many(["000001", "000002"])
+
+    assert calls == [1, 2], "必须按 pages 翻完"
+    assert set(got) == {"000001", "000002"}

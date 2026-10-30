@@ -26,6 +26,7 @@ socket.setdefaulttimeout(10.0)
 from dotenv import load_dotenv  # noqa: E402
 
 from main import build_strategies  # noqa: E402
+from sequoia_x.analysis import board_rank  # noqa: E402
 from sequoia_x.analysis.ma20_filter import Ma20DeviationFilter  # noqa: E402
 from sequoia_x.analysis.scorer import (  # noqa: E402  # noqa: E402
     ScoreDetail,
@@ -125,20 +126,42 @@ def main() -> None:
         except Exception as exc:
             logger.error(f"量化评分失败，本次报告与推送不含评分：{exc}")
 
-    # 5. 板块 / 概念分布（与 main.py 同构；失败降级为 None，不阻断推送）
+    # 5. 板块 / 概念分布 + 今日最强板块（与 main.py 同构；失败降级为 None，不阻断推送）
     board_summary = None
+    board_ranks: dict = {}
+    boards: dict = {}
     if settings.concept_enabled and displayed:
         try:
+            # 与生产同构：涨幅榜要全市场映射，个股题材列也用同一份数据
+            want = list(displayed)
+            if settings.board_rank_top > 0:
+                try:
+                    want = list(dict.fromkeys([*displayed, *engine.get_local_symbols()]))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"[测试模式] 取全市场代码失败，只统计榜单票：{exc}")
             boards = board_concept.load_board_concepts(
-                displayed,
+                want,
                 cache_dir=settings.concept_cache_dir,
-                ttl_days=settings.concept_ttl_days,
+                ttl_days=max(settings.concept_ttl_days, settings.concept_full_ttl_days),
             )
             board_summary = board_concept.summarize(boards, displayed)
             logger.info(
                 f"[测试模式] 板块/概念：{board_summary.covered}/{board_summary.total} 只，"
-                f"{len(board_summary.concepts)} 个概念"
+                f"{len(board_summary.concepts)} 个概念，映射共 {len(boards)} 只"
             )
+            if settings.board_rank_top > 0:
+                change_date, changes = board_rank.load_daily_changes(settings.db_path)
+                if changes:
+                    board_ranks = board_rank.rank_all(
+                        boards,
+                        changes,
+                        top=settings.board_rank_top,
+                        min_members=settings.board_rank_min_members,
+                    )
+                    head = "、".join(
+                        f"{r.name} {r.avg_chg:+.2f}%" for r in board_ranks.get("concept", ())
+                    )
+                    logger.info(f"[测试模式] 板块涨幅榜（{change_date}）：{head or '无'}")
         except Exception as exc:
             logger.warning(f"[测试模式] 板块/概念取数失败，降级为空继续推送：{exc}")
 
@@ -177,6 +200,8 @@ def main() -> None:
         scores=ranking,
         data_status=data_status,
         board_summary=board_summary,
+        boards=boards,
+        board_ranks=board_ranks,
     )
     logger.info(f"HTML 报告：{path.resolve()}")
     logger.info(f"数据状态：{data_status}")

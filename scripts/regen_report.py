@@ -25,6 +25,7 @@ load_dotenv()
 
 from pathlib import Path
 
+from sequoia_x.analysis import board_rank
 from sequoia_x.analysis.ma20_filter import Ma20DeviationFilter
 from sequoia_x.analysis.scorer import ScoreDetail, composite_score, score_from_settings
 from sequoia_x.core.config import Settings
@@ -135,18 +136,40 @@ if ranking:
 # 注意必须**在生成报告之前**取，否则重算出来的报告会比生产少一节 ——
 # 这个脚本的全部价值就在于「非交易日也能拿到与生产同构的报告」。
 board_summary = None
+board_ranks: dict = {}
+boards: dict = {}
 if settings.concept_enabled and union:
     try:
+        want = list(union)
+        if settings.board_rank_top > 0:
+            try:
+                want = list(dict.fromkeys([*union, *engine.get_local_symbols()]))
+            except Exception as exc:  # noqa: BLE001
+                print(f"取全市场代码失败，板块榜只统计候选票：{exc}")
         boards = board_concept.load_board_concepts(
-            union,
+            want,
             cache_dir=settings.concept_cache_dir,
-            ttl_days=settings.concept_ttl_days,
+            ttl_days=max(settings.concept_ttl_days, settings.concept_full_ttl_days),
         )
         board_summary = board_concept.summarize(boards, union)
         print(
             f"板块/概念：{board_summary.covered}/{board_summary.total} 只，"
-            f"{len(board_summary.concepts)} 个概念"
+            f"{len(board_summary.concepts)} 个概念，映射共 {len(boards)} 只"
         )
+        if settings.board_rank_top > 0:
+            # ⚠️ 必须传 DATE：不传就会拿**今天**的行情给历史报告排榜，看着正常其实全错
+            change_date, changes = board_rank.load_daily_changes(settings.db_path, DATE)
+            if changes:
+                board_ranks = board_rank.rank_all(
+                    boards,
+                    changes,
+                    top=settings.board_rank_top,
+                    min_members=settings.board_rank_min_members,
+                )
+                head = "、".join(
+                    f"{r.name} {r.avg_chg:+.2f}%" for r in board_ranks.get("concept", ())
+                )
+                print(f"板块涨幅榜（{change_date}）：{head or '无'}")
     except Exception as exc:
         print(f"板块/概念取数失败（本次报告不含该小节）：{exc}")
 
@@ -162,6 +185,8 @@ path = HtmlReportGenerator(settings).generate(
     # 否则一份重算出来的旧报告看起来就像「今天跑了盘」。
     data_status=f"{DATE} · 候选快照重算（未联网增量同步）",
     board_summary=board_summary,
+    boards=boards,
+    board_ranks=board_ranks,
 )
 print()
 print(f"候选快照：{SRC}")

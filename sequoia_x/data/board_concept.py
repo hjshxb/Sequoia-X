@@ -6,9 +6,13 @@
 行情，而不是零散个股机会。行业与地域同理。
 
 数据源：东财 `datacenter-web` 的 `RPT_F10_CORETHEME_BOARDTYPE`（F10「所属板块」
-用同一张表），**逐股一次请求**、实测约 0.3s/只。刻意**不用** `push2.eastmoney.com`
-的板块接口：push2 有较激进的限流（短时间内十余次请求即被整体拒连，恢复期内
-连 `p1z=20` 的正常请求也返回 `RemoteDisconnected`），不适合放进每日定时任务；
+用同一张表）。**批量查**（`SECURITY_CODE in (...)`，100 只/请求）：实测 120 只
+0.5s 拿回约 2500 行，全市场 5211 只约 53 次请求 / 30 秒 —— 于是「全市场概念映射」
+成为可能（板块涨幅榜、个股题材精细化都靠它）。早期版本是逐股 0.3s/只，
+只够查当日选出的几十只，已于 2026-10-30 换成批量。
+刻意**不用** `push2.eastmoney.com` 的板块接口：push2 有较激进的限流
+（短时间内十余次请求即被整体拒连，恢复期内连 `p1z=20` 的正常请求也返回
+`RemoteDisconnected`），不适合放进每日定时任务；
 `datacenter-web` 是与「筹码集中度」同一个已在生产跑稳的主机。
 
 三类的判定口径（看 `BOARD_TYPE` / `IS_PRECISE` 两个字段）：
@@ -49,6 +53,10 @@ _API_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 _REPORT_NAME = "RPT_F10_CORETHEME_BOARDTYPE"
 _COLUMNS = "SECUCODE,SECURITY_CODE,BOARD_CODE,BOARD_NAME,IS_PRECISE,BOARD_TYPE"
 _PAGE_SIZE = 120  # 单只股票实测最多 ~40 行，留足余量
+# 批量查询：一次请求塞多少只。实测 120 只约 0.5s 拿回 2500 行；
+# 200 只时会被 pageSize 顶到翻页（pages=2），所以批大小与页容量要一起看。
+_BATCH_SIZE = 100
+_BATCH_PAGE_SIZE = 3000
 _TIMEOUT = 15.0
 _RETRIES = 3
 _MAX_WORKERS = 8
@@ -201,31 +209,73 @@ def parse_rows(symbol: str, rows: Iterable[Mapping[str, Any]]) -> StockBoards:
 # ── 网络 ──
 
 
-def _request(symbol: str) -> list[dict]:
-    """拉取单只股票的所属板块，带重试。
+def _get_json(params: Mapping[str, Any]) -> dict:
+    """发一次请求并返回 JSON，带重试。
 
     Raises:
-        Exception: 重试耗尽后抛出（由调用方汇总成「这一只失败」）。
+        Exception: 重试耗尽后抛出（由调用方汇总成「这一批失败」）。
     """
-    params = {
-        "reportName": _REPORT_NAME,
-        "columns": _COLUMNS,
-        "filter": f'(SECURITY_CODE="{symbol}")',
-        "pageNumber": 1,
-        "pageSize": _PAGE_SIZE,
-        "source": "HSF10",
-        "client": "PC",
-    }
     last_exc: Exception | None = None
     for attempt in range(_RETRIES):
         try:
-            resp = requests.get(_API_URL, params=params, timeout=_TIMEOUT)
-            payload = resp.json()
-            return list(((payload.get("result") or {}).get("data")) or [])
+            resp = requests.get(_API_URL, params=dict(params), timeout=_TIMEOUT)
+            return resp.json()
         except Exception as exc:  # 网络抖动 / JSON 解析失败
             last_exc = exc
             time.sleep(0.4 * (attempt + 1))
     raise last_exc if last_exc else RuntimeError("未知请求错误")
+
+
+def _request_many(symbols: Sequence[str]) -> dict[str, list[dict]]:
+    """批量拉取一批股票的所属板块，返回 `{代码: 原始行}`。
+
+    东财 `datacenter-web` 支持 `SECURITY_CODE in (...)`，实测 **120 只 0.5s、
+    一次拿回约 2500 行** —— 比逐股（0.3s/只）快两个数量级。这是「全市场概念映射」
+    能放进每日任务的前提：5211 只约 **53 次请求 / 30 秒**，而不是 26 分钟。
+
+    ⚠️ 服务端会截断 `pageSize`：200 只 × 约 20 行 = 4000 行 > 3000 时会返回
+    `pages=2`（实测），所以必须按 `pages` 把剩余页取回来，不能只看第一页。
+
+    单批失败会让调用方把这一批的票都算作「失败」，由上层决定降级方式。
+
+    Raises:
+        Exception: 重试耗尽后抛出。
+    """
+    codes = [c for c in dict.fromkeys(symbols) if c]
+    if not codes:
+        return {}
+
+    flt = "(SECURITY_CODE in (" + ",".join(f'"{c}"' for c in codes) + "))"
+    out: dict[str, list[dict]] = {}
+    page = 1
+    while True:
+        payload = _get_json(
+            {
+                "reportName": _REPORT_NAME,
+                "columns": _COLUMNS,
+                "filter": flt,
+                "pageNumber": page,
+                "pageSize": _BATCH_PAGE_SIZE,
+                "source": "HSF10",
+                "client": "PC",
+            }
+        )
+        result = payload.get("result") or {}
+        rows = list(result.get("data") or [])
+        for row in rows:
+            code = str(row.get("SECURITY_CODE") or "")
+            if code:
+                out.setdefault(code, []).append(row)
+        pages = int(result.get("pages") or 1)
+        if page >= pages or not rows:
+            break
+        page += 1
+    return out
+
+
+def _request(symbol: str) -> list[dict]:
+    """拉取单只股票的所属板块（`_request_many` 的单票包装，保留给逐只场景/测试）。"""
+    return _request_many([symbol]).get(symbol, [])
 
 
 # ── 磁盘缓存 ──
@@ -311,11 +361,11 @@ def load_board_concepts(
 ) -> dict[str, StockBoards]:
     """按需拉取一批股票的「所属板块 / 概念」，命中缓存则不联网。
 
-    只对「需要的股票」请求：`symbols` 一般是当日选出的**去重名单**（几十只），
-    不是全市场 —— 这是这套逐股接口能放进每日任务的前提。
+    `symbols` 可以只有几十只（当日去重名单），也可以给全市场（板块涨幅榜需要）。
+    批量接口之下两者成本差得很小：全市场约 53 次请求 / 30 秒，实测可接受。
 
     失败处理刻意分两级，且都不抛异常：
-        - 单只失败：记 WARNING、该只缺数据（聚合时计入 `total - covered`）；
+        - 某一批失败：记 WARNING、该批的票缺数据（聚合时计入 `total - covered`）；
         - 有旧缓存但已过期、刷新又失败：**降级用旧值**（与 `stock_meta` 一致，
           概念变化慢，旧值远好过没有）。
 
@@ -359,16 +409,23 @@ def load_board_concepts(
 
     failed = 0
     fetched: dict[str, StockBoards] = {}
+    chunks = [todo[i : i + _BATCH_SIZE] for i in range(0, len(todo), _BATCH_SIZE)]
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        futures = {pool.submit(_request, symbol): symbol for symbol in todo}
+        futures = {pool.submit(_request_many, chunk): chunk for chunk in chunks}
         for future in as_completed(futures):
-            symbol = futures[future]
+            chunk = futures[future]
             try:
-                fetched[symbol] = parse_rows(symbol, future.result())
+                raw = future.result()
             except Exception as exc:  # noqa: BLE001
-                failed += 1
-                if failed == 1:  # 只报第一只，避免刷屏
-                    logger.warning(f"板块/概念：{symbol} 拉取失败 {exc}")
+                failed += len(chunk)
+                logger.warning(f"板块/概念：一批 {len(chunk)} 只拉取失败 {exc}")
+                continue
+            for symbol in chunk:
+                rows = raw.get(symbol)
+                if rows is None:  # 接口没返回这只（次新 / 已退市 / 该批被截断）
+                    failed += 1
+                    continue
+                fetched[symbol] = parse_rows(symbol, rows)
 
     # 写回：新结果覆盖旧的，未刷新到的（含失败）保留原条目 —— 它们是下次的降级来源。
     merged = dict(cached)

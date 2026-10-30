@@ -22,6 +22,7 @@ import sys
 
 from dotenv import load_dotenv
 
+from sequoia_x.analysis import board_rank
 from sequoia_x.analysis.ma20_filter import Ma20DeviationFilter
 from sequoia_x.analysis.scorer import ScoreDetail, composite_score, score_from_settings
 from sequoia_x.core.config import MAX_SYNC_WORKERS, Settings, get_settings
@@ -320,25 +321,51 @@ def main() -> None:
             except Exception as exc:
                 logger.error(f"量化评分失败，本次报告与推送不含评分：{exc}")
 
-        # 6.6 板块 / 概念聚合：把「哪几只」补成「扎堆在什么方向」。
-        #     只查当日选出的几十只（东财逐股接口，约 0.3s/只、8 线程并发），
-        #     带磁盘缓存；**失败只降级**（少一节），绝不能因此丢掉当天的报告与推送。
+        # 6.6 板块 / 概念：把「哪几只」补成「扎堆在什么方向」，外加「今天哪个方向最强」。
+        #     概念映射走东财 F10 的**批量**接口（100 只/请求，全市场约 53 次请求 / 30 秒，
+        #     一周刷新一次即可）。**失败只降级**（少一节），绝不能因此丢掉当天的报告与推送。
         board_summary = None
+        board_ranks: dict = {}
+        boards: dict = {}
         if not settings.concept_enabled:
             logger.info("板块/概念分布已关闭（CONCEPT_ENABLED=false）")
         elif displayed:
             try:
+                # 板块涨幅榜要看全市场，个股题材列也要用同一份映射 —— 一次取全，
+                # 比「先取几十只、再补 5000 只」少一轮往返。
+                want = list(displayed)
+                if settings.board_rank_top > 0:
+                    try:
+                        want = list(dict.fromkeys([*displayed, *engine.get_local_symbols()]))
+                    except Exception as exc:  # noqa: BLE001 - 取不到全市场就退回只查榜单票
+                        logger.warning(f"板块涨幅榜：取全市场代码失败，只统计榜单票：{exc}")
                 boards = board_concept.load_board_concepts(
-                    displayed,
+                    want,
                     cache_dir=settings.concept_cache_dir,
-                    ttl_days=settings.concept_ttl_days,
+                    ttl_days=max(settings.concept_ttl_days, settings.concept_full_ttl_days),
                 )
                 board_summary = board_concept.summarize(boards, displayed)
                 logger.info(
                     f"板块/概念分布：{board_summary.covered}/{board_summary.total} 只"
                     f"，{len(board_summary.concepts)} 个概念"
                     f"（命中 >=2 只的 {sum(1 for _, c in board_summary.concepts if c >= 2)} 个）"
+                    f"，映射共 {len(boards)} 只"
                 )
+
+                # 6.6.1 今日最强概念 / 行业：等权平均涨幅，成分数 >= min_members
+                if settings.board_rank_top > 0:
+                    change_date, changes = board_rank.load_daily_changes(settings.db_path)
+                    if changes:
+                        board_ranks = board_rank.rank_all(
+                            boards,
+                            changes,
+                            top=settings.board_rank_top,
+                            min_members=settings.board_rank_min_members,
+                        )
+                        head = "、".join(
+                            f"{r.name} {r.avg_chg:+.2f}%" for r in board_ranks.get("concept", ())
+                        )
+                        logger.info(f"板块涨幅榜（{change_date}）：{head or '无'}")
             except Exception as exc:
                 logger.error(f"板块/概念取数失败，报告与卡片不含该小节：{exc}")
 
@@ -377,6 +404,8 @@ def main() -> None:
                     scores=ranking,
                     data_status=data_status,
                     board_summary=board_summary,
+                    boards=boards,
+                    board_ranks=board_ranks,
                 )
                 logger.info(f"HTML 报告已生成：{report_path.resolve()}")
             except Exception as exc:
