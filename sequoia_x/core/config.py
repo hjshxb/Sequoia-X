@@ -128,6 +128,9 @@ class Settings(BaseSettings):
     board_rank_top: int = 5
     # 成分股下限：低于这个数不参与排名，否则 3~5 只的小概念会霸榜。
     board_rank_min_members: int = 8
+    # 飞书拆两张卡（2026-10-30 用户选择）：第 1 张只放选股，第 2 张放
+    # 「板块 / 概念分布 + 今日最强方向」。False = 回到单张卡（板块小节留在选股卡里）。
+    board_card_separate: bool = True
 
     # ── 本地 HTML 报告 ──
     # 跑完策略后生成一份本地单文件 HTML 报告（按策略分块展示选股结果）

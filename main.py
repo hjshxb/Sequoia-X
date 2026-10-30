@@ -369,7 +369,13 @@ def main() -> None:
             except Exception as exc:
                 logger.error(f"板块/概念取数失败，报告与卡片不含该小节：{exc}")
 
-        # 7. 推送：各策略汇总成单张卡片（中文策略名 + 板块分组 + 高分榜）
+        # 7. 推送：**两张卡**（2026-10-30 用户选择）
+        #    第 1 张 = 选股（摘要 + 综合评分 Top20 + 各策略小节）
+        #    第 2 张 = 板块视角（分布 + 今日最强概念/行业 Top5）
+        #    为什么拆：选股卡本来就长，再塞板块榜会被飞书折叠；两者读法也不同
+        #    （一个回答「买什么」，一个回答「今天钱往哪儿去」）。
+        #    `BOARD_CARD_SEPARATE=false` 可退回单张卡（板块小节留在选股卡里）。
+        separate = settings.board_card_separate
         if args.no_push:
             logger.info("已指定 --no-push，跳过飞书推送")
         elif not any(results.values()):
@@ -385,8 +391,19 @@ def main() -> None:
                     filter_desc=universe.describe(brief=True).removeprefix("精筛：") + ma20_suffix,
                     scores=ranking,
                     data_status=data_status,
-                    board_summary=board_summary,
+                    # 拆卡时板块小节搬到第 2 张，否则两张卡的题材信息会重复一遍
+                    board_summary=None if separate else board_summary,
                 )
+                if separate:
+                    sent = notifier.send_board_card(
+                        board_summary=board_summary,
+                        board_ranks=board_ranks,
+                        data_status=data_status,
+                        min_members=settings.board_rank_min_members,
+                    )
+                    logger.info(
+                        "板块视角卡：" + ("已推送" if sent else "无内容，未推送")
+                    )
             except Exception as exc:
                 logger.error(f"飞书推送异常，已忽略：{exc}")
 

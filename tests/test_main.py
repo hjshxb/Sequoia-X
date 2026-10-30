@@ -284,9 +284,12 @@ def test_main_forwards_data_status_to_card_and_report(monkeypatch, tmp_path) -> 
 # ── 板块 / 概念分布 ──
 
 
-def _run_offline_main(monkeypatch, tmp_path) -> tuple[list[dict], list[dict]]:
-    """跑一遍离线化的 main()，返回 (推送参数, 报告参数)。
+def _run_offline_main(
+    monkeypatch, tmp_path, **settings_overrides: object
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """跑一遍离线化的 main()，返回 (推送参数, 报告参数, 板块视角卡参数)。
 
+    `settings_overrides` 会叠加到测试用的 Settings 上（例如关掉拆卡）。
     复用与上面用例相同的替身：引擎不联网、精筛不联网、策略固定返回一只、
     输出层只记录参数。板块/概念的取数由调用方按需 patch。
     """
@@ -314,6 +317,7 @@ def _run_offline_main(monkeypatch, tmp_path) -> tuple[list[dict], list[dict]]:
 
     pushes: list[dict] = []
     reports: list[dict] = []
+    board_cards: list[dict] = []
 
     class _Notifier:
         def __init__(self, *args: object, **kwargs: object) -> None:
@@ -321,6 +325,10 @@ def _run_offline_main(monkeypatch, tmp_path) -> tuple[list[dict], list[dict]]:
 
         def send_report(self, results: object, **kwargs: object) -> None:
             pushes.append(kwargs)
+
+        def send_board_card(self, **kwargs: object) -> bool:
+            board_cards.append(kwargs)
+            return True
 
     class _Report:
         def __init__(self, *args: object, **kwargs: object) -> None:
@@ -338,6 +346,7 @@ def _run_offline_main(monkeypatch, tmp_path) -> tuple[list[dict], list[dict]]:
             _env_file=None,
             feishu_webhook_url="https://example.com/hook",
             db_path=str(tmp_path / "t.db"),
+            **settings_overrides,
         ),
     )
     monkeypatch.setattr(main_module, "DataEngine", _HealthyEngine)
@@ -348,11 +357,15 @@ def _run_offline_main(monkeypatch, tmp_path) -> tuple[list[dict], list[dict]]:
         monkeypatch.setattr(main_module, attr, _StubStrategy)
 
     main_module.main()
-    return pushes, reports
+    return pushes, reports, board_cards
 
 
 def test_main_forwards_board_summary_to_card_and_report(monkeypatch, tmp_path) -> None:
-    """板块/概念聚合要同时进卡片与报告 —— 只给报告，飞书上就看不到题材分布。"""
+    """板块信息要进「板块视角卡」与报告；选股卡那边不再重复放一遍。
+
+    2026-10-30 起飞书拆两张卡：第 1 张纯选股，第 2 张放分布 + 最强榜。
+    所以选股卡的 `board_summary` 必须是 None（否则两张卡各印一遍题材，重复）。
+    """
     from sequoia_x.data.board_concept import StockBoards
 
     seen: list[list[str]] = []
@@ -362,10 +375,29 @@ def test_main_forwards_board_summary_to_card_and_report(monkeypatch, tmp_path) -
         return {"600000": StockBoards("600000", ("创新药",), "医药生物", "上海板块")}
 
     monkeypatch.setattr(main_module.board_concept, "load_board_concepts", fake_load)
-    pushes, reports = _run_offline_main(monkeypatch, tmp_path)
+    pushes, reports, board_cards = _run_offline_main(monkeypatch, tmp_path)
 
-    assert seen == [["600000"]], "应只查当日选出的股票，不是全市场"
-    assert pushes[0]["board_summary"].concepts == (("创新药", 1),)
+    assert seen == [["600000"]], "取数失败于全市场时应退回只查当日选出的股票"
+    assert pushes[0]["board_summary"] is None, "拆卡后选股卡不再带板块小节"
+    assert board_cards and board_cards[0]["board_summary"].concepts == (("创新药", 1),)
+    assert reports[0]["board_summary"] is board_cards[0]["board_summary"]
+
+
+def test_main_can_keep_single_card(monkeypatch, tmp_path) -> None:
+    """`BOARD_CARD_SEPARATE=false` 时回到单张卡：板块小节留在选股卡里。"""
+    from sequoia_x.data.board_concept import StockBoards
+
+    monkeypatch.setattr(
+        main_module.board_concept,
+        "load_board_concepts",
+        lambda symbols, **_k: {"600000": StockBoards("600000", ("创新药",), "医药生物")},
+    )
+    pushes, reports, board_cards = _run_offline_main(
+        monkeypatch, tmp_path, board_card_separate=False
+    )
+
+    assert pushes[0]["board_summary"] is not None, "单卡模式下板块小节应留在选股卡"
+    assert board_cards == [], "单卡模式不应再发第二张卡"
     assert reports[0]["board_summary"] is pushes[0]["board_summary"]
 
 
@@ -376,11 +408,15 @@ def test_main_survives_board_concept_failure(monkeypatch, tmp_path) -> None:
         raise RuntimeError("东财连接被重置")
 
     monkeypatch.setattr(main_module.board_concept, "load_board_concepts", boom)
-    pushes, reports = _run_offline_main(monkeypatch, tmp_path)
+    pushes, reports, board_cards = _run_offline_main(monkeypatch, tmp_path)
 
     assert pushes and reports, "板块取数失败不应阻断推送与报告"
     assert pushes[0]["board_summary"] is None
     assert reports[0]["board_summary"] is None
+    # 拆卡模式下仍会尝试发第二张，但内容为空（summary=None / ranks={}），
+    # 真实 notifier 会跳过；这里只确认传参是空，不会拿旧数据凑一张卡
+    assert board_cards[0]["board_summary"] is None
+    assert not board_cards[0]["board_ranks"]
 
 
 def test_ma_dispersion_is_closed() -> None:

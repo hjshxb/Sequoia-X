@@ -622,3 +622,112 @@ def test_card_composite_handles_missing_name() -> None:
 # 相关用例（按可信度排序 / k over n / 缺可信度排最后 等）已由上面的
 # 综合榜用例覆盖；胜率的排序语义现在住在 `scorer.composite_score` 里，
 # 由 `tests/test_scorer.py` 覆盖。
+
+
+# ── 第二张卡：板块视角（2026-10-30）──
+
+
+def _ranks():
+    from sequoia_x.analysis.board_rank import BoardRank
+
+    return {
+        "concept": (
+            BoardRank("concept", "空间站概念", 0.42, 12, 24, "600000", 11.8),
+            BoardRank("concept", "鸡肉概念", 0.13, 8, 20, "300750", 12.6),
+        ),
+        "industry": (BoardRank("industry", "银行", 1.98, 40, 42, "600000", 8.0),),
+    }
+
+
+def _card_text(payload: dict) -> str:
+    """把卡片 elements 里的 markdown 拼成一段文本，便于断言。"""
+    return "\n".join(
+        el["text"]["content"] for el in payload["card"]["elements"] if el.get("tag") == "div"
+    )
+
+
+def test_board_card_renders_ranks_with_breadth_and_leader():
+    """第二张卡：概念/行业各一节，涨幅 + 上涨家数 + 领涨股（带名称）都要有。
+
+    上涨家数是这节的重点 —— 平均 +2% 但只有 3/20 上涨，是领涨股拉的，
+    跟「板块普涨」是两码事。
+    """
+    notifier = FeishuNotifier(make_settings())
+
+    payload = notifier._build_board_card(board_ranks=_ranks(), min_members=8)
+    text = _card_text(payload)
+
+    assert payload["card"]["header"]["template"] == "orange"
+    assert "📊 板块视角" in payload["card"]["header"]["title"]["content"]
+    assert "🔥 概念 Top 2" in text
+    assert "🏭 申万行业 Top 1" in text
+    assert "**空间站概念** +0.42%" in text
+    assert "↑12/24（50%）" in text
+    assert "领涨 [600000 浦发银行]" in text  # 名称来自 stock_meta 桩
+    assert "成分数 ≥ 8" in text  # 口径必须印出来，否则「+0.42%」无从解读
+
+
+def test_board_card_carries_data_status():
+    """数据日期必须带上：标题是运行日，行情可能是更早的交易日。"""
+    notifier = FeishuNotifier(make_settings())
+
+    text = _card_text(
+        notifier._build_board_card(board_ranks=_ranks(), data_status="2026-10-29 · 更新 5208 只")
+    )
+
+    assert "**数据日期：** 2026-10-29 · 更新 5208 只" in text
+
+
+def test_board_card_includes_distribution_section():
+    """分布小节搬到了这张卡（选股卡那边传 None），所以这里必须出现。"""
+    notifier = FeishuNotifier(make_settings())
+
+    text = _card_text(notifier._build_board_card(board_summary=_FAKE_SUMMARY, board_ranks=_ranks()))
+
+    assert "🧩 板块 / 概念分布" in text
+    assert "病原体防治" in text
+
+
+def test_board_card_skips_empty_summary_but_keeps_ranks():
+    """分布为空时不留空壳，但榜单照常渲染。"""
+    notifier = FeishuNotifier(make_settings())
+
+    text = _card_text(
+        notifier._build_board_card(board_summary=BoardSummary(), board_ranks=_ranks())
+    )
+
+    assert "🧩 板块 / 概念分布" not in text
+    assert "🔥 概念 Top 2" in text
+
+
+def test_send_board_card_is_noop_without_content():
+    """两块都没内容时不发卡（避免往群里推一张空卡），并返回 False。"""
+    notifier = FeishuNotifier(make_settings())
+
+    with patch.object(FeishuNotifier, "_post") as post:
+        sent = notifier.send_board_card(board_summary=None, board_ranks={})
+
+    assert sent is False
+    post.assert_not_called()
+
+
+def test_send_board_card_posts_once():
+    notifier = FeishuNotifier(make_settings())
+
+    with patch.object(FeishuNotifier, "_post") as post:
+        sent = notifier.send_board_card(board_ranks=_ranks())
+
+    assert sent is True
+    post.assert_called_once()
+
+
+def test_board_card_flags_weak_day():
+    """当日整体偏弱时，小节标题要带说明 —— 「最强」不等于「在涨」。"""
+    from sequoia_x.analysis.board_rank import BoardRank
+
+    weak = {"concept": (BoardRank("concept", "水产概念", -0.03, 5, 17, "600000", 3.0),)}
+    notifier = FeishuNotifier(make_settings())
+
+    text = _card_text(notifier._build_board_card(board_ranks=weak))
+
+    assert "当日整体偏弱" in text

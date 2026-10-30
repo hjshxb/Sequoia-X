@@ -267,3 +267,15 @@ def test_plausible_limit_depends_on_board() -> None:
     assert board_rank.is_plausible_change("300750", 25.0) is False
     assert board_rank.is_plausible_change("830799", 29.0) is True
     assert board_rank.is_plausible_change("830799", 35.0) is False
+
+
+def test_weakness_note_only_when_top_is_negative() -> None:
+    """弱势日「最强概念」也可能是 −0.03%：标题里要说明，否则会被读成「市场在涨」。"""
+    from sequoia_x.analysis.board_rank import BoardRank
+
+    up = (BoardRank("concept", "A", 0.42, 5, 10, "600000", 3.0),)
+    down = (BoardRank("concept", "A", -0.03, 3, 10, "600000", 3.0),)
+
+    assert board_rank.weakness_note(up) == ""
+    assert "偏弱" in board_rank.weakness_note(down)
+    assert board_rank.weakness_note(()) == ""

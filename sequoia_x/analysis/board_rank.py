@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from sequoia_x.core.logger import get_logger
@@ -249,3 +249,15 @@ def rank_all(
         kind: rank_boards(boards, changes, kind=kind, top=top, min_members=min_members)
         for kind, _label in KINDS
     }
+
+
+def weakness_note(ranks: Sequence[BoardRank]) -> str:
+    """榜首涨幅也为负时，返回一句提示；否则空串。
+
+    为什么要写：弱势日「最强概念」可能是 −0.03% —— 榜单本身没错（它确实是当天
+    相对最好的），但读者只看标题「最强」会以为市场在涨。展示层把这句话接在标题后，
+    避免误读。报告与卡片共用同一句，免得两处措辞不一致。
+    """
+    if ranks and ranks[0].avg_chg <= 0:
+        return "（当日整体偏弱，榜首涨幅也为负）"
+    return ""

@@ -25,7 +25,7 @@ from datetime import date
 from pathlib import Path
 
 from sequoia_x.analysis.board_rank import KINDS as BOARD_RANK_KINDS
-from sequoia_x.analysis.board_rank import MIN_MEMBERS, BoardRank
+from sequoia_x.analysis.board_rank import MIN_MEMBERS, BoardRank, weakness_note
 from sequoia_x.analysis.scorer import (
     WINRATE_WEIGHT,
     ScoreDetail,
@@ -899,9 +899,11 @@ class HtmlReportGenerator:
                     "</div>"
                 )
 
+        # 弱势日「最强概念」也可能是负的：标题后补一句，免得被读成「市场在涨」
+        note = str(weakness_note(tuple(ranks.get("concept", ()))))
         return f"""<section class="panel ranks">
       <div class="card-head">
-        <h2>今日最强 概念 / 行业</h2>
+        <h2>今日最强 概念 / 行业{html.escape(note)}</h2>
         <span class="boards">按成分股等权平均涨幅·成分数≥{MIN_MEMBERS}·↑为上涨家数</span>
       </div>
       <div class="rank-rows">

@@ -13,11 +13,13 @@
 """
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date
 
 import requests
 
+from sequoia_x.analysis.board_rank import KINDS as BOARD_RANK_KINDS
+from sequoia_x.analysis.board_rank import BoardRank, weakness_note
 from sequoia_x.analysis.scorer import ScoreDetail, composite_score, rank_by_composite
 from sequoia_x.core.config import Settings
 from sequoia_x.core.logger import get_logger
@@ -189,6 +191,125 @@ class FeishuNotifier:
             lines.append(f"（{summary.total} 只中 {summary.covered} 只取到板块数据）")
         return "\n".join(lines)
 
+    @classmethod
+    def _rank_section(
+        cls,
+        title: str,
+        ranks: Sequence[BoardRank],
+        meta: dict[str, StockMeta],
+    ) -> str:
+        """渲染一个「最强板块」小节（概念 / 行业各一份）。
+
+        每行：`序号. 名称 平均涨幅 · 上涨家数/成分数(占比) · 领涨股 涨幅`。
+
+        为什么把「上涨家数」也印在卡上：平均 +2% 但只有 3/20 上涨，是领涨股拉的，
+        不是板块效应 —— 这条信息决定了「能不能跟第二梯队」，比涨幅本身更有用。
+        """
+        lines = [f"**{title}**"]
+        for i, item in enumerate(ranks, 1):
+            line = (
+                f"{i}. **{item.name}** {item.avg_chg:+.2f}% · "
+                f"↑{item.up}/{item.members}（{item.up_ratio:.0f}%） · "
+                f"领涨 {cls._stock_text(item.leader, meta)} {item.leader_chg:+.1f}%"
+            )
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _build_board_card(
+        self,
+        board_summary: BoardSummary | None = None,
+        board_ranks: Mapping[str, Sequence[BoardRank]] | None = None,
+        data_status: str = "",
+        min_members: int = 0,
+    ) -> dict:
+        """渲染第二张卡：板块视角（分布 + 今日最强方向）。
+
+        **为什么拆成两张**（用户 2026-10-30 选择）：选股卡本来就长（摘要 + Top20 +
+        各策略小节），再塞板块榜会被飞书折叠；而且这两类信息的读法不同 ——
+        选股卡是「买什么」，这张是「今天钱往哪儿去」。
+
+        Args:
+            board_summary: 这批票的板块 / 概念分布（可空）。
+            board_ranks: `{kind: (BoardRank, ...)}`，由 `analysis.board_rank` 算出。
+            data_status: 数据日期那一行（与选股卡同源）。
+            min_members: 只用于把那句口径说明印准确。
+
+        Returns:
+            飞书 `msg_type=interactive` 的请求体；两块都没内容时**不**调用本函数
+            （调用方先判空，避免推一张空卡）。
+        """
+        meta = stock_meta_module.load_stock_meta()
+        today = date.today().strftime("%Y-%m-%d")
+
+        summary_lines = [f"**日期：** {today}"]
+        if data_status:
+            summary_lines.append(f"**数据日期：** {data_status}")
+        summary_lines.append(
+            f"**口径：** 成分股等权平均涨幅 · 成分数 ≥ {min_members or '—'} · ↑为上涨家数"
+        )
+
+        elements: list[dict] = [
+            {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(summary_lines)}}
+        ]
+
+        def add_markdown(content: str) -> None:
+            elements.append({"tag": "hr"})
+            elements.append({"tag": "div", "text": {"tag": "lark_md", "content": content}})
+
+        if board_summary is not None:
+            section = self._board_section(board_summary)
+            if section:
+                add_markdown(section)
+
+        for kind, label in BOARD_RANK_KINDS:
+            items = list((board_ranks or {}).get(kind, ()))
+            if items:
+                icon = "🔥" if kind == "concept" else "🏭"
+                note = weakness_note(items)
+                add_markdown(
+                    self._rank_section(f"{icon} {label} Top {len(items)}{note}", items, meta)
+                )
+
+        return {
+            "msg_type": "interactive",
+            "card": {
+                "header": {
+                    "title": {"tag": "plain_text", "content": f"📊 板块视角 | {today}"},
+                    "template": "orange",
+                },
+                "elements": elements,
+            },
+        }
+
+    def send_board_card(
+        self,
+        board_summary: BoardSummary | None = None,
+        board_ranks: Mapping[str, Sequence[BoardRank]] | None = None,
+        data_status: str = "",
+        min_members: int = 0,
+        webhook_key: str = "default",
+    ) -> bool:
+        """推送第二张卡（板块视角）。没有内容时**不发**，返回 False。
+
+        Raises:
+            不抛出异常（`_post` 内部吞掉网络错误）。
+        """
+        has_summary = board_summary is not None and not board_summary.is_empty
+        has_ranks = bool(board_ranks) and any(board_ranks.values())
+        if not (has_summary or has_ranks):
+            logger.info("板块视角卡：没有内容可推，跳过")
+            return False
+
+        payload = self._build_board_card(
+            board_summary=board_summary if has_summary else None,
+            board_ranks=board_ranks,
+            data_status=data_status,
+            min_members=min_members,
+        )
+        url = self.settings.get_webhook_url(webhook_key)
+        self._post(url, payload, webhook_key, 0)
+        return True
+
     def _build_report_card(
         self,
         results: dict[str, list[str]],
@@ -306,8 +427,11 @@ class FeishuNotifier:
                 logger.error(
                     f"飞书推送失败 [{webhook_key}] HTTP状态={resp.status_code} 飞书响应={resp.text}"
                 )
-            else:
+            elif count > 0:
                 logger.info(f"飞书推送成功 [{webhook_key}]，共 {count} 只股票")
+            else:
+                # 板块视角卡没有股票数，别打出「共 0 只股票」这种吓人的话
+                logger.info(f"飞书推送成功 [{webhook_key}]（板块视角卡）")
 
         except requests.RequestException as exc:
             logger.error(f"飞书推送请求异常 [{webhook_key}]：{exc}")

@@ -180,14 +180,25 @@ def main() -> None:
         logger.info("--no-push：跳过飞书推送（仅生成本地报告）")
     else:
         try:
-            FeishuNotifier(settings).send_report(
+            notifier = FeishuNotifier(settings)
+            # 与 main.py 同构：拆两张卡（选股卡 + 板块视角卡）
+            separate = settings.board_card_separate
+            notifier.send_report(
                 results,
                 filter_desc=universe.describe(brief=True).removeprefix("精筛：") + ma20_suffix,
                 scores=ranking,
                 data_status=data_status,
-                board_summary=board_summary,
+                board_summary=None if separate else board_summary,
             )
             logger.info("飞书汇总卡片推送完成")
+            if separate:
+                sent = notifier.send_board_card(
+                    board_summary=board_summary,
+                    board_ranks=board_ranks,
+                    data_status=data_status,
+                    min_members=settings.board_rank_min_members,
+                )
+                logger.info("板块视角卡：" + ("已推送" if sent else "无内容，未推送"))
         except Exception as exc:
             logger.error(f"飞书推送异常：{exc}")
 
