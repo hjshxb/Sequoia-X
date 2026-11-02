@@ -265,6 +265,9 @@ def test_plausible_limit_depends_on_board() -> None:
     assert board_rank.is_plausible_change("600000", 27.0) is False  # 主板不可能 +27%
     assert board_rank.is_plausible_change("300750", 19.5) is True
     assert board_rank.is_plausible_change("300750", 25.0) is False
+    # 302 是创业板新号段（库里 302132 就是）：15% 不能当脏数据剔掉
+    assert board_rank.is_plausible_change("302132", 15.0) is True
+    assert board_rank.is_plausible_change("302132", 25.0) is False
     assert board_rank.is_plausible_change("830799", 29.0) is True
     assert board_rank.is_plausible_change("830799", 35.0) is False
 
