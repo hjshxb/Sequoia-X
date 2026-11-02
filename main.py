@@ -31,7 +31,11 @@ from sequoia_x.data import board_concept, stock_meta
 from sequoia_x.data.engine import BaostockUnavailable, DataEngine, SyncIncomplete, SyncStats
 from sequoia_x.data.universe_filter import UniverseFilter
 from sequoia_x.notify.feishu import FeishuNotifier
-from sequoia_x.notify.html_report import HtmlReportGenerator, build_symbol_marks
+from sequoia_x.notify.html_report import (
+    HtmlReportGenerator,
+    build_symbol_marks,
+    ranking_candidates,
+)
 from sequoia_x.strategy.atr_shrink_reversal import AtrShrinkReversalStrategy
 from sequoia_x.strategy.base import BaseStrategy
 from sequoia_x.strategy.bottom_doji import BottomDojiStrategy
@@ -321,6 +325,22 @@ def main() -> None:
             except Exception as exc:
                 logger.error(f"量化评分失败，本次报告与推送不含评分：{exc}")
 
+        # 6.5.1 排行榜只收「可排行」的票：逆势三路（超跌 / 底部十字星 / 深回调）
+        #       不参与跨策略排名（2026-11-02 用户要求）。它们**照常打分** ——
+        #       策略小节里的「评分」列还在，只是不跟顺势票排在一起：
+        #       评分体系（趋势强度 + 距 MA20 位置加分）对「越跌破越该买」的票天然错配。
+        #       ⚠️ 过滤发生在 `score_top_n` 截断之后（截断在 scorer 内部按评分做），
+        #       所以若把 SCORE_TOP_N 设成大于 0，排行榜可能不足 N 只 —— 默认 0（不限）无此问题。
+        rankable = ranking_candidates(results)
+        ranking_table = [d for d in ranking if d.symbol in rankable]
+        if ranking_table and len(ranking_table) < len(ranking):
+            logger.info(
+                f"综合评分排行：{len(ranking)} 只中剔除 {len(ranking) - len(ranking_table)} 只"
+                "（超跌 / 底部十字星 / 深回调，不参与跨策略排名）"
+            )
+        elif ranking and not ranking_table:
+            logger.info("综合评分排行：本次候选全部来自逆势策略，排行榜不渲染")
+
         # 6.6 板块 / 概念：把「哪几只」补成「扎堆在什么方向」，外加「今天哪个方向最强」。
         #     概念映射走东财 F10 的**批量**接口（100 只/请求，全市场约 53 次请求 / 30 秒，
         #     一周刷新一次即可）。**失败只降级**（少一节），绝不能因此丢掉当天的报告与推送。
@@ -390,6 +410,8 @@ def main() -> None:
                     # 卡片可视长度（实测「前十大流通股东」曾被截掉）。
                     filter_desc=universe.describe(brief=True).removeprefix("精筛：") + ma20_suffix,
                     scores=ranking,
+                    # 综合评分 Top 只收可排行的票（逆势三路不参与排名）
+                    ranking=ranking_table,
                     data_status=data_status,
                     # 拆卡时板块小节搬到第 2 张，否则两张卡的题材信息会重复一遍
                     board_summary=None if separate else board_summary,
@@ -419,6 +441,7 @@ def main() -> None:
                     metrics=metrics,
                     holdings=holdings,
                     scores=ranking,
+                    ranking=ranking_table,
                     data_status=data_status,
                     board_summary=board_summary,
                     boards=boards,

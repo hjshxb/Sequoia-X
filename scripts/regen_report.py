@@ -32,7 +32,11 @@ from sequoia_x.core.config import Settings
 from sequoia_x.data import board_concept, stock_meta
 from sequoia_x.data.engine import DataEngine
 from sequoia_x.data.universe_filter import UniverseFilter
-from sequoia_x.notify.html_report import HtmlReportGenerator, build_symbol_marks
+from sequoia_x.notify.html_report import (
+    HtmlReportGenerator,
+    build_symbol_marks,
+    ranking_candidates,
+)
 
 
 def _find_candidates() -> Path:
@@ -125,6 +129,9 @@ if union and settings.score_enabled:
         )
     except Exception as exc:
         print(f"量化评分失败（本次报告不含评分）：{exc}")
+
+# 与 main.py 同构：逆势三路（超跌 / 十字星 / 深回调）不参与跨策略排名
+ranking_table = [d for d in ranking if d.symbol in ranking_candidates(results)]
 if ranking:
     # 榜首按**综合分**（评分 + 胜率）排，不一定是评分最高那只 —— 两个数都打出来
     print(
@@ -181,6 +188,7 @@ path = HtmlReportGenerator(settings).generate(
     # 与 main.py 保持一致：仅在配置了筹码维度时展示该列，复用已加载的快照
     holdings=holdings,
     scores=ranking,
+    ranking=ranking_table,
     # 报告页首的日期是**运行日**，而这里的数据来自历史候选快照，必须写明，
     # 否则一份重算出来的旧报告看起来就像「今天跑了盘」。
     data_status=f"{DATE} · 候选快照重算（未联网增量同步）",

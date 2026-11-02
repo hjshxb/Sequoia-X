@@ -442,3 +442,26 @@ def test_private_placement_is_closed() -> None:
     信号来自公告事件而非量价，和其余策略不是一类；实测近几个月基本 0 只。
     """
     assert not hasattr(main_module, "PrivatePlacementStrategy")
+
+
+def test_main_passes_counter_trend_filtered_ranking(monkeypatch, tmp_path) -> None:
+    """main 必须把「剔掉逆势三路」后的列表传给卡片与报告（2026-11-02 用户要求）。
+
+    离线桩里没有行情库、算不出真评分，所以把 `score_from_settings` 与
+    `ranking_candidates` 都换成确定的桩：评分给两只，可排行的只留一只。
+    断言：card/report 收到的 `ranking` 是过滤后的那一只，而 `scores` 仍是全量
+    （策略小节的「评分」列要靠它）。
+    """
+    from tests._score_factory import make_score
+
+    monkeypatch.setattr(
+        main_module,
+        "score_from_settings",
+        lambda *_a, **_k: [make_score("600000", 80.0), make_score("300750", 95.0)],
+    )
+    monkeypatch.setattr(main_module, "ranking_candidates", lambda _results: {"600000"})
+    pushes, reports, _board_cards = _run_offline_main(monkeypatch, tmp_path)
+
+    assert [d.symbol for d in pushes[0]["ranking"]] == ["600000"]
+    assert [d.symbol for d in reports[0]["ranking"]] == ["600000"]
+    assert len(pushes[0]["scores"]) == 2, "评分列仍是全量，只是排行剔了逆势票"

@@ -317,6 +317,7 @@ class FeishuNotifier:
         scores: Sequence[ScoreDetail] = (),
         data_status: str = "",
         board_summary: BoardSummary | None = None,
+        ranking: Sequence[ScoreDetail] | None = None,
     ) -> dict:
         """把 {策略类名: 代码列表} 渲染成一张飞书交互卡片。
 
@@ -365,8 +366,11 @@ class FeishuNotifier:
             elements.append({"tag": "hr"})
             elements.append({"tag": "div", "text": {"tag": "lark_md", "content": content}})
 
-        if score_list:
-            add_markdown(self._composite_section(score_list, meta))
+        # 综合榜只放「可排行」的票：逆势三路（超跌 / 十字星 / 深回调）不参与排名。
+        # 传 None 时退回用全部 scores（兼容旧调用）。
+        rank_list = list(score_list if ranking is None else ranking)
+        if rank_list:
+            add_markdown(self._composite_section(rank_list, meta))
 
         # 板块/概念分布排在综合评分榜之后、策略小节之前：
         # 先看「最该看谁」（个股），再看「整体扎堆在什么方向」（题材）。
@@ -444,6 +448,7 @@ class FeishuNotifier:
         scores: Sequence[ScoreDetail] = (),
         data_status: str = "",
         board_summary: BoardSummary | None = None,
+        ranking: Sequence[ScoreDetail] | None = None,
     ) -> None:
         """把所有策略的选股结果汇总成一张卡片推送出去。
 
@@ -454,6 +459,8 @@ class FeishuNotifier:
             scores: 可选的量化评分（应按得分降序），用于生成高分榜与节内排序。
             data_status: 一行数据状态（数据日期 + 更新完整性），空串则不显示。
             board_summary: 可选的「板块 / 概念分布」聚合，None 则卡片少一节。
+            ranking: 可选，**进「综合评分 Top」的那批明细**；None = 用 `scores`。
+                main 会传剔掉逆势三路（超跌 / 十字星 / 深回调）后的子集。
 
         Raises:
             不抛出异常，HTTP 失败时记录 ERROR 日志。
@@ -465,5 +472,6 @@ class FeishuNotifier:
             scores=scores,
             data_status=data_status,
             board_summary=board_summary,
+            ranking=ranking,
         )
         self._post(url, payload, webhook_key, sum(len(v) for v in results.values()))

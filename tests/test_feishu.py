@@ -731,3 +731,38 @@ def test_board_card_flags_weak_day():
     text = _card_text(notifier._build_board_card(board_ranks=weak))
 
     assert "当日整体偏弱" in text
+
+
+# ── 逆势三路不进综合评分榜（2026-11-02）──
+
+
+def test_composite_section_skips_counter_trend_symbols():
+    """超跌 / 底部十字星 / 深回调的票不进「🎯 综合评分 Top」，但仍留在策略小节。"""
+    from sequoia_x.notify.html_report import ranking_candidates
+
+    results = {"TurtleTradeStrategy": ["600000"], "BottomDojiStrategy": ["300750"]}
+    scores = [make_score("600000", 80.0), make_score("300750", 95.0)]
+
+    notifier = FeishuNotifier(make_settings())
+    payload = notifier._build_report_card(
+        results,
+        scores=scores,
+        ranking=[d for d in scores if d.symbol in ranking_candidates(results)],
+    )
+    text = _card_text(payload)
+
+    composite = text.split("🎯 综合评分 Top", 1)[1].split("**海龟突破**", 1)[0]
+    assert "600000" in composite
+    assert "300750" not in composite, "底部十字星选出的票不该出现在综合榜里"
+    # 策略小节照常列出（只是不参与排名）
+    assert "**底部十字星" in text and "300750 宁德时代" in text
+
+
+def test_composite_section_unchanged_when_ranking_not_given():
+    """不传 ranking 时退回用全部 scores —— 老调用方行为不变。"""
+    scores = [make_score("600000", 80.0), make_score("300750", 95.0)]
+    notifier = FeishuNotifier(make_settings())
+
+    text = _card_text(notifier._build_report_card({"TurtleTradeStrategy": ["600000"]}, scores=scores))
+
+    assert "300750" in text.split("🎯 综合评分 Top", 1)[1]

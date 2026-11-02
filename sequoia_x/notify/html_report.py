@@ -71,6 +71,42 @@ STRATEGY_LABELS: dict[str, str] = {
     "PullbackShrinkStrategy": "深回调缩量",
 }
 
+# 不进「综合评分排行」的策略（2026-11-02 用户要求）。
+# 这三路都是**逆势低吸**：ATR 超跌、底部十字星、深回调缩量。
+# 为什么不跟顺势票一起排：评分体系（趋势强度 + 距 MA20 位置加分）是按「站上均线、
+# 走势强」设计的，对「跌破 MA20 越深越该加分」的票天然错配 —— 混在一起排，
+# 既冤枉它们，也会把真正的强势票挤出榜单，读者看到的顺序没有意义。
+# 它们**照常打分**（策略小节里的「评分」列还在），只是不参与跨策略排名。
+RANKING_EXCLUDED_STRATEGIES: frozenset[str] = frozenset(
+    {
+        "AtrShrinkReversalStrategy",  # 超跌
+        "BottomDojiStrategy",  # 底部十字星
+        "PullbackShrinkStrategy",  # 深度回调
+    }
+)
+
+
+def ranking_candidates(results: Mapping[str, Sequence[str]]) -> set[str]:
+    """能进「综合评分排行」的代码集合：来自**非逆势**策略的票。
+
+    判据是「有没有被任一顺势策略选中」，而不是「有没有被逆势策略选中」——
+    同一只票常常同时命中多个策略（比如既在 RPS 突破里、又在深回调里），
+    这种票该进榜：它不只是「超跌票」。
+
+    Args:
+        results: `{策略类名: 代码列表}`。
+
+    Returns:
+        可进排行的代码集合；全部来自被排除的策略时返回空集
+        （调用方据此不渲染排行榜，而不是渲染一张全是逆势票的榜）。
+    """
+    return {
+        symbol
+        for name, symbols in results.items()
+        if name not in RANKING_EXCLUDED_STRATEGIES
+        for symbol in symbols
+    }
+
 # 兼容旧引用（原名带下划线，仅供历史代码/测试使用）
 _STRATEGY_LABELS = STRATEGY_LABELS
 
@@ -383,6 +419,7 @@ class HtmlReportGenerator:
         board_summary: BoardSummary | None = None,
         boards: Mapping[str, StockBoards] | None = None,
         board_ranks: Mapping[str, Sequence[BoardRank]] | None = None,
+        ranking: Sequence[ScoreDetail] | None = None,
     ) -> Path:
         """生成 HTML 报告并写入磁盘。
 
@@ -410,6 +447,10 @@ class HtmlReportGenerator:
                 多一列「题材」，显示该股命中的**今日热门概念**（悬停看全部）。
             board_ranks: 可选的 `{kind: (BoardRank, ...)}`（`analysis.board_rank`
                 算出的当日最强概念 / 行业）。传入后页首多一张「今日最强」面板。
+            ranking: 可选，**进「综合评分排行」的那批明细**。默认 None 表示
+                「就是 scores」；main 会传一份剔掉逆势策略（超跌 / 十字星 /
+                深回调）之后的子集 —— 详见 `RANKING_EXCLUDED_STRATEGIES`。
+                注意它只影响排行榜，`scores` 仍决定各策略小节的「评分」列。
 
         Returns:
             实际写入的报告文件路径。
@@ -439,6 +480,7 @@ class HtmlReportGenerator:
             board_summary,
             boards,
             board_ranks,
+            ranking,
         )
 
         path = Path(output_path) if output_path else self.default_path()
@@ -460,6 +502,7 @@ class HtmlReportGenerator:
         board_summary: BoardSummary | None = None,
         boards: Mapping[str, StockBoards] | None = None,
         board_ranks: Mapping[str, Sequence[BoardRank]] | None = None,
+        rank_list: Sequence[ScoreDetail] | None = None,
     ) -> str:
         # 个股题材要用「今日热门概念」的顺序挑前两个，故先把板块数据挂到实例上，
         # 让 `_render_ranking` 不必再加一层参数（它已经被行内调用两处）。
@@ -556,7 +599,9 @@ class HtmlReportGenerator:
             if data_status
             else ""
         )
-        ranking_html = self._render_ranking(scores, meta)
+        ranking_html = self._render_ranking(
+            rank_list if rank_list is not None else scores, meta
+        )
         boards_html = self._render_boards(board_summary)
         ranks_html = self._render_board_ranks(self._board_ranks, meta)
 

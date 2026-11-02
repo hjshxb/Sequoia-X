@@ -39,7 +39,11 @@ from sequoia_x.data import board_concept, stock_meta  # noqa: E402
 from sequoia_x.data.engine import DataEngine  # noqa: E402
 from sequoia_x.data.universe_filter import UniverseFilter  # noqa: E402
 from sequoia_x.notify.feishu import FeishuNotifier  # noqa: E402
-from sequoia_x.notify.html_report import HtmlReportGenerator, build_symbol_marks  # noqa: E402
+from sequoia_x.notify.html_report import (  # noqa: E402
+    HtmlReportGenerator,
+    build_symbol_marks,
+    ranking_candidates,
+)
 
 
 def main() -> None:
@@ -126,6 +130,9 @@ def main() -> None:
         except Exception as exc:
             logger.error(f"量化评分失败，本次报告与推送不含评分：{exc}")
 
+    # 与 main.py 同构：逆势三路（超跌 / 十字星 / 深回调）不参与跨策略排名
+    ranking_table = [d for d in ranking if d.symbol in ranking_candidates(results)]
+
     # 5. 板块 / 概念分布 + 今日最强板块（与 main.py 同构；失败降级为 None，不阻断推送）
     board_summary = None
     board_ranks: dict = {}
@@ -187,6 +194,7 @@ def main() -> None:
                 results,
                 filter_desc=universe.describe(brief=True).removeprefix("精筛：") + ma20_suffix,
                 scores=ranking,
+                ranking=ranking_table,
                 data_status=data_status,
                 board_summary=None if separate else board_summary,
             )
@@ -209,6 +217,7 @@ def main() -> None:
         metrics=metrics,
         holdings=holdings,
         scores=ranking,
+        ranking=ranking_table,
         data_status=data_status,
         board_summary=board_summary,
         boards=boards,

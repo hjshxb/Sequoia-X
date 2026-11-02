@@ -1002,3 +1002,70 @@ def test_board_ranks_panel_is_omitted_when_empty(gen):
     text = gen.generate({"TurtleTradeStrategy": ["600000"]}).read_text(encoding="utf-8")
 
     assert '<section class="panel ranks"' not in text
+
+
+# ── 逆势三路不进「综合评分排行」（2026-11-02）──
+
+
+def test_ranking_candidates_drops_counter_trend_strategies():
+    """超跌 / 底部十字星 / 深回调 的票不进排行；同时命中顺势策略的票仍可进。"""
+    from sequoia_x.notify.html_report import (
+        RANKING_EXCLUDED_STRATEGIES,
+        ranking_candidates,
+    )
+
+    assert RANKING_EXCLUDED_STRATEGIES == {
+        "AtrShrinkReversalStrategy",
+        "BottomDojiStrategy",
+        "PullbackShrinkStrategy",
+    }
+    results = {
+        "TurtleTradeStrategy": ["600000"],
+        "BottomDojiStrategy": ["300750", "600000"],  # 600000 同时命中海龟
+        "AtrShrinkReversalStrategy": ["000001"],
+    }
+
+    assert ranking_candidates(results) == {"600000"}
+
+
+def test_ranking_candidates_empty_when_all_counter_trend():
+    """全部来自逆势策略时返回空集 —— 调用方据此不渲染排行榜。"""
+    from sequoia_x.notify.html_report import ranking_candidates
+
+    assert ranking_candidates({"BottomDojiStrategy": ["300750"]}) == set()
+
+
+def test_ranking_card_excludes_counter_trend_but_strategy_keeps_score(gen):
+    """排行榜剔掉十字星那只；十字星小节里的「评分」列照常保留。"""
+    from sequoia_x.notify.html_report import ranking_candidates
+
+    results = {"TurtleTradeStrategy": ["600000"], "BottomDojiStrategy": ["300750"]}
+    scores = [make_score("300750", 95.0), make_score("600000", 80.0)]
+    text = gen.generate(
+        results,
+        scores=scores,
+        ranking=[d for d in scores if d.symbol in ranking_candidates(results)],
+    ).read_text(encoding="utf-8")
+
+    ranking_card = text.split("<h2>综合评分排行</h2>", 1)[1].split("</section>", 1)[0]
+    assert "600000" in ranking_card
+    assert "300750" not in ranking_card, "底部十字星选出的票不该进排行榜"
+
+    doji = text.split("<h2>底部十字星", 1)[1].split("</section>", 1)[0]
+    assert 'class="num score"' in doji, "策略小节仍要显示评分（只是不参与排名）"
+
+
+def test_ranking_card_absent_when_everything_is_counter_trend(gen):
+    """全部逆势时排行榜整块不渲染，而不是给一张全是低吸票的榜。"""
+    from sequoia_x.notify.html_report import ranking_candidates
+
+    results = {"BottomDojiStrategy": ["300750"]}
+    scores = [make_score("300750", 95.0)]
+    text = gen.generate(
+        results,
+        scores=scores,
+        ranking=[d for d in scores if d.symbol in ranking_candidates(results)],
+    ).read_text(encoding="utf-8")
+
+    assert "<h2>综合评分排行</h2>" not in text
+    assert "<h2>底部十字星" in text  # 策略小节照常
