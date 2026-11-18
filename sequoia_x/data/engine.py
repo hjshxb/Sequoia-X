@@ -116,56 +116,156 @@ class SyncStats:
         return self.missing / denominator if denominator else 0.0
 
 
+# ── 断线重连（2026-11-18）──
+# 背景：11-06 起 baostock 几乎每个交易日都会在批次中途把会话 reset 一次
+# （日志里是一次 `[Errno 104] Connection reset by peer`），此后客户端一直复用那把
+# 死连接，**后面的每一只都变成 `[Errno 32] Broken pipe`**。老实现只在批次开头
+# login 一次、循环里对错误只 `failed += 1; continue`，于是尾巴整段报废：
+# 实测 11-06 丢 2066 只（39.6%）、11-12 丢 2802 只、11-16 丢 1380 只、11-18 丢 956 只，
+# 全部超过 5% 的完整性上限 ⇒ 四天都没有报告（只能靠人晚上再跑一遍）。
+#
+# 两个阈值共同决定「重连」的激进度：
+#   连续失败多少只 ⇒ 判定「会话已死，不是个股问题」。取 20：单只查不到（退市/停牌）
+#   不会连成串，而一次 reset 之后必然是大段连续失败，20 只足够确认。
+#   一个批次最多重登几次 ⇒ 防「服务端真挂了」时无限重登把一次故障放大成请求风暴
+#   （10001011 黑名单就是这么来的）。
+_CONSECUTIVE_FAILS_TO_RECONNECT = 20
+_MAX_RELOGINS = 6
+
+_BS_COLUMNS = "date,open,high,low,close,volume,amount"
+
+
+def _try_login() -> str | None:
+    """登录 baostock。成功返回 None，失败返回 `"错误码 错误信息"`。
+
+    刻意不抛异常：中途重连失败要能「降级成这一批失败」交给上层闸门，
+    而不是把已经取到手的几千行数据一起丢掉。
+    """
+    import baostock as bs
+
+    lg = bs.login()
+    return None if lg.error_code == "0" else f"{lg.error_code} {lg.error_msg}"
+
+
+def _bs_fetch_pass(tasks: list) -> tuple[list, list]:
+    """一趟拉取：一次 login + 顺序查询，连续失败即重连。
+
+    Returns:
+        `(rows, failed_tasks)`。`failed_tasks` 回传的是**任务元组**（不是数量），
+        好让调用方换一个新会话只补这几只，而不是重跑整批。
+
+    Raises:
+        BaostockUnavailable: 开头登录就失败 —— 一只都不许查。
+            旧实现丢弃 `bs.login()` 的返回值、照样给整批股票各发一次注定失败的
+            请求，把一次故障放大成「全市场重试风暴」（历史事故的放大器）。
+    """
+    import baostock as bs
+
+    err = _try_login()
+    if err is not None:
+        raise BaostockUnavailable(
+            f"baostock 登录失败: {err}"
+            f"（{len(tasks)} 只待拉取，已放弃，未发出任何行情请求）"
+        )
+
+    results: list = []
+    failed: list = []
+    consecutive = 0
+    relogins = 0
+    try:
+        for idx, task in enumerate(tasks):
+            symbol, bs_code, start, end = task
+            rs = bs.query_history_k_data_plus(
+                bs_code,
+                _BS_COLUMNS,
+                start_date=start,
+                end_date=end,
+                frequency="d",
+                adjustflag="1",  # 后复权
+            )
+            if rs.error_code != "0":
+                failed.append(task)
+                consecutive += 1
+                if consecutive < _CONSECUTIVE_FAILS_TO_RECONNECT:
+                    continue
+                # 连成串的失败 ⇒ 会话已死。换一条连接继续，别把剩下的都判死。
+                if relogins >= _MAX_RELOGINS:
+                    rest = tasks[idx + 1 :]
+                    failed.extend(rest)
+                    logger.error(
+                        f"已重连 {relogins} 次仍未恢复，本批剩余 {len(rest)} 只放弃"
+                        f"（会话疑似被持续重置，交给完整性闸门判定）"
+                    )
+                    break
+                relogins += 1
+                logger.warning(
+                    f"连续 {consecutive} 只查询失败（疑似会话被重置），"
+                    f"第 {relogins}/{_MAX_RELOGINS} 次重连后从第 {idx + 2} 只继续"
+                )
+                with contextlib.suppress(Exception):
+                    bs.logout()
+                err = _try_login()
+                consecutive = 0
+                if err is not None:
+                    rest = tasks[idx + 1 :]
+                    failed.extend(rest)
+                    logger.error(f"重连失败（{err}），本批剩余 {len(rest)} 只放弃")
+                    break
+                continue
+            consecutive = 0
+            while rs.next():
+                results.append([symbol] + rs.get_row_data())
+    finally:
+        # 会话可能已经被 reset，logout 自身也会抛 —— 绝不能让它盖掉真正的结果。
+        with contextlib.suppress(Exception):
+            bs.logout()
+
+    return results, failed
+
+
 def _bs_fetch_batch(tasks: list) -> tuple[list, int]:
     """同步 worker：独立 login，批量拉取 baostock 数据。
 
     单进程模式下由 `sync_today_bulk` 直接调用（整份任务一次传入）；
     多进程模式下作为 `Pool.map` 的任务函数，每个分片各起一个进程。
 
+    两趟：第一趟带断线重连；若仍有零星的失败（典型是重连前那 20 只，
+    或 reset 恰好卡在最后几只），**换一个新会话只补这几只**再试一次。
+    这样一次会话重置的代价从「尾巴全废」降到「几乎为零」。
+
     Returns:
-        `(rows, failed)`：成功取到的行，以及查询直接报错的股票数。
+        `(rows, failed)`：成功取到的行，以及补拉后仍失败的股票数。
         把 `failed` 一并回传（而不是就地打个 warning 丢掉），是因为
         「本次数据完不完整」必须由**全市场**维度判断，而单个分片看不到全局。
 
     Raises:
         BaostockUnavailable: 登录失败，或本批查询**全部**失败。
-            登录失败必须立即抛出、一只都不许查 —— 旧实现丢弃了 `bs.login()`
-            的返回值，照样给整批股票各发一次注定失败的请求，把一次故障放大成
-            「全市场重试风暴」，最终换来 10001011 黑名单（历史事故的放大器）。
+            注意「全部失败」**不做补拉**：那说明数据源没就绪（或账号被拒），
+            再发一轮请求只会重演当年换 10001011 黑名单的请求风暴。
     """
-    import baostock as bs
+    results, failed_tasks = _bs_fetch_pass(tasks)
 
-    lg = bs.login()
-    if lg.error_code != "0":
-        raise BaostockUnavailable(
-            f"baostock 登录失败: {lg.error_code} {lg.error_msg}"
-            f"（{len(tasks)} 只待拉取，已放弃，未发出任何行情请求）"
+    # 只补「部分失败」：全失败是数据源/账号的问题，补拉等于把请求量翻倍。
+    if failed_tasks and len(failed_tasks) < len(tasks):
+        logger.warning(
+            f"本批 {len(tasks)} 只中有 {len(failed_tasks)} 只查询失败，"
+            "换新会话补拉一次..."
         )
+        try:
+            more, still_failed = _bs_fetch_pass(failed_tasks)
+        except BaostockUnavailable as exc:
+            # 补拉阶段连登录都失败：保留已取到的行，让完整性闸门去判够不够
+            logger.error(f"补拉阶段登录失败（{exc}），保留已取到的 {len(results)} 行")
+        else:
+            results.extend(more)
+            failed_tasks = still_failed
 
-    results = []
-    failed = 0
-    for symbol, bs_code, start, end in tasks:
-        rs = bs.query_history_k_data_plus(
-            bs_code,
-            "date,open,high,low,close,volume,amount",
-            start_date=start,
-            end_date=end,
-            frequency="d",
-            adjustflag="1",  # 后复权
-        )
-        if rs.error_code != "0":
-            failed += 1
-            continue
-        while rs.next():
-            results.append([symbol] + rs.get_row_data())
-    bs.logout()
-
-    # 个别股票查不到（退市 / 长期停牌 / 新代码）是正常的，跳过即可；
-    # 但「整批全部失败」只可能是数据源出了问题，不能伪装成「无新数据」。
-    if failed and failed == len(tasks):
+    if failed_tasks and len(failed_tasks) == len(tasks):
         raise BaostockUnavailable(
             f"baostock 本批 {len(tasks)} 只股票查询全部失败，判定为数据源故障"
         )
+
+    failed = len(failed_tasks)
     if failed:
         logger.warning(f"本批 {len(tasks)} 只中有 {failed} 只查询失败，已跳过")
 

@@ -976,3 +976,131 @@ def test_fetch_trade_dates_raises_when_query_fails(monkeypatch) -> None:
         engine, _ = make_engine_in(tmp_dir)
         with pytest.raises(engine_module.BaostockUnavailable):
             engine.fetch_trade_dates("2026-09-24", "2026-09-28")
+
+
+# ── 会话被 reset 后必须重连、并把失败的那几只补回来（2026-11-18）──
+#
+# 事故：11-06 起 baostock 每个交易日会在批次中途 reset 一次会话，老实现一直复用
+# 那把死连接 ⇒ 尾巴整段 `Broken pipe`（丢 238~2802 只不等）⇒ 超过 5% 完整性上限
+# ⇒ 四天没有报告。下面四个用例守的就是「一次 reset 不许再废掉整批」。
+
+
+class _SessionBaoStock:
+    """模拟「一条连接用久了会被服务端 reset」的 baostock 替身。
+
+    语义：`die_after` 控制一条连接最多还能成功查几只；一旦触发，本连接后续查询
+    全部失败（对应 `Broken pipe`），**只有重新 login 才会恢复**。
+    这正是线上观测到的行为：reset 之后客户端不重连，后面每一只都失败。
+    """
+
+    def __init__(self, die_after: int | None = None) -> None:
+        self.die_after = die_after
+        self.logins = 0
+        self.logout_called = 0
+        self.query_calls: list[str] = []
+        self._alive = 0
+        self._dead = False
+
+    def login(self) -> _FakeLogin:
+        self.logins += 1
+        self._alive = 0
+        self._dead = False
+        return _FakeLogin("0", "success")
+
+    def logout(self) -> None:
+        self.logout_called += 1
+
+    def query_history_k_data_plus(self, code: str, *_a: object, **_kw: object) -> _FakeResultSet:
+        self.query_calls.append(code)
+        if self._dead:
+            return _FakeResultSet([], "10002007", "网络接收错误")
+        self._alive += 1
+        if self.die_after is not None and self._alive > self.die_after:
+            self._dead = True
+            return _FakeResultSet([], "10002007", "网络接收错误")
+        return _FakeResultSet([["2026-11-18", "1", "1", "1", "1", "1000", "2000"]], "0", "")
+
+
+def _tasks(n: int) -> list:
+    return [(f"6000{i:02d}", f"sh.6000{i:02d}", "2026-11-18", "2026-11-18") for i in range(n)]
+
+
+def test_fetch_pass_reconnects_when_session_dies(monkeypatch) -> None:
+    """单趟内：连续失败 20 只就判定会话已死，重连后**从断点继续**。
+
+    这条只测「重连」本身，所以直接打 `_bs_fetch_pass` —— 走 `_bs_fetch_batch`
+    的话，第二趟补拉会把「没重连」的后果盖住（补拉能捞回尾巴），
+    于是这个变异就测不出来了（2026-11-18 变异检验亲测）。
+
+    场景：会话在第 60 只后死掉。重连后剩 20 只照常拿到 ⇒ 失败 20、成功 80。
+    不重连则是失败 40、成功 60。
+    """
+    fake = _SessionBaoStock(die_after=60)
+    monkeypatch.setitem(sys.modules, "baostock", fake)
+
+    rows, failed = engine_module._bs_fetch_pass(_tasks(100))
+
+    assert fake.logins == 2, "断连后必须重新登录"
+    assert len(failed) == engine_module._CONSECUTIVE_FAILS_TO_RECONNECT
+    assert len(rows) == 100 - engine_module._CONSECUTIVE_FAILS_TO_RECONNECT
+
+
+def test_fetch_batch_reconnects_after_session_reset(monkeypatch) -> None:
+    """端到端：一次会话重置的最后结果是**一只都不丢**（重连 + 补拉）。
+
+    线上表现是：一次 `Connection reset by peer` 之后紧接着几百条 `Broken pipe`。
+    老实现下这批要丢 40 只（18.5% 那次丢 964 只），现在必须为 0。
+    """
+    fake = _SessionBaoStock(die_after=60)
+    monkeypatch.setitem(sys.modules, "baostock", fake)
+
+    rows, failed = engine_module._bs_fetch_batch(_tasks(100))
+
+    assert failed == 0, "重连 + 补拉之后不该再有失败的票"
+    assert len(rows) == 100
+    assert fake.logins >= 2, "发生断连后必须重新登录"
+
+
+def test_fetch_batch_tail_reset_is_recovered_by_retry_pass(monkeypatch) -> None:
+    """reset 恰好卡在最后 10 只（不足 20 只、不触发重连）⇒ 补拉那 10 只。
+
+    这是 11-17 的形态：尾巴丢 238 只、占比 4.8%，靠运气过关。补拉后连运气都不需要。
+    """
+    fake = _SessionBaoStock(die_after=90)
+    monkeypatch.setitem(sys.modules, "baostock", fake)
+
+    rows, failed = engine_module._bs_fetch_batch(_tasks(100))
+
+    assert failed == 0
+    assert len(rows) == 100
+    assert fake.logins == 2, "只补拉一次：第二趟换新会话拿回那 10 只"
+    # 补拉只针对失败的那 10 只，不是重跑整批
+    assert len(fake.query_calls) == 110
+
+
+def test_fetch_batch_stops_reconnecting_after_cap(monkeypatch) -> None:
+    """服务端持续重置时，重连次数必须封顶，不能变成请求风暴（10001011 的老路）。
+
+    这里让每条连接**只够查 1 只**：不封顶时会一路「断 20 只 → 重连 → 再断 20 只」，
+    重登次数随批大小线性增长；封顶后两趟各最多 `1 + _MAX_RELOGINS` 次。
+    """
+    fake = _SessionBaoStock(die_after=1)
+    monkeypatch.setitem(sys.modules, "baostock", fake)
+
+    rows, failed = engine_module._bs_fetch_batch(_tasks(200))
+
+    assert failed > 0, "一直连不上就该如实报失败"
+    assert len(rows) > 0, "前面已经取到的行不能丢"
+    cap = (1 + engine_module._MAX_RELOGINS) * 2  # 两趟，各自封顶
+    assert fake.logins <= cap, f"重登次数应有上限，实测 {fake.logins}"
+
+
+def test_fetch_batch_does_not_retry_when_everything_fails(monkeypatch) -> None:
+    """整批全失败是数据源/账号问题，**不许**补拉 —— 那会把请求量翻倍。"""
+    fake = _FakeBaoStock(query_code="10002007", rows=[])
+    monkeypatch.setitem(sys.modules, "baostock", fake)
+
+    with pytest.raises(engine_module.BaostockUnavailable):
+        engine_module._bs_fetch_batch(_TASKS)
+
+    assert len(fake.query_calls) == len(_TASKS), "全失败时不应再发第二轮请求"
