@@ -47,10 +47,13 @@ from sequoia_x.strategy.rps_breakout import RpsBreakoutStrategy
 from sequoia_x.strategy.turtle_trade import TurtleTradeStrategy
 from sequoia_x.strategy.uptrend_limit_down import UptrendLimitDownStrategy
 
-# baostock 用的是裸 socket，这里统一把默认超时压到 10s，避免网络异常时长时间挂起。
+# baostock 用的是裸 socket，这里统一把默认超时收到 120s：既能避免网络异常时无限挂起，
+# 又留得出 baostock 登录的余量 —— 实测服务端繁忙时单次 login 要 48~63s，
+# 早先压到 10s 会让 login 在 11s 左右被掐断、报「10002007 网络接收错误」，
+# 看着像数据源挂了（2026-11-04 晚连挂 4 次），其实是本地超时太紧。
 # 必须早于任何 socket 建立 —— 放在 import 之后即可（导入阶段不会建连接）。
 # 注：这行刻意不夹在 import 中间，否则后面的 import 全会被判为 E402。
-socket.setdefaulttimeout(10.0)
+socket.setdefaulttimeout(120.0)
 
 
 def _format_data_status(stats: SyncStats, latest_date: str | None) -> str:
