@@ -1029,7 +1029,7 @@ def test_fetch_pass_reconnects_when_session_dies(monkeypatch) -> None:
     """单趟内：连续失败 20 只就判定会话已死，重连后**从断点继续**。
 
     这条只测「重连」本身，所以直接打 `_bs_fetch_pass` —— 走 `_bs_fetch_batch`
-    的话，第二趟补拉会把「没重连」的后果盖住（补拉能捞回尾巴），
+    的话，事后补拉会把「没重连」的后果盖住（补拉能捞回尾巴），
     于是这个变异就测不出来了（2026-11-18 变异检验亲测）。
 
     场景：会话在第 60 只后死掉。重连后剩 20 只照常拿到 ⇒ 失败 20、成功 80。
@@ -1038,11 +1038,12 @@ def test_fetch_pass_reconnects_when_session_dies(monkeypatch) -> None:
     fake = _SessionBaoStock(die_after=60)
     monkeypatch.setitem(sys.modules, "baostock", fake)
 
-    rows, failed = engine_module._bs_fetch_pass(_tasks(100))
+    rows, failed, left = engine_module._bs_fetch_pass(_tasks(100), engine_module._MAX_RELOGINS)
 
     assert fake.logins == 2, "断连后必须重新登录"
     assert len(failed) == engine_module._CONSECUTIVE_FAILS_TO_RECONNECT
     assert len(rows) == 100 - engine_module._CONSECUTIVE_FAILS_TO_RECONNECT
+    assert left == engine_module._MAX_RELOGINS - 1, "重连要扣掉全批共用的额度"
 
 
 def test_fetch_batch_reconnects_after_session_reset(monkeypatch) -> None:
@@ -1078,11 +1079,11 @@ def test_fetch_batch_tail_reset_is_recovered_by_retry_pass(monkeypatch) -> None:
     assert len(fake.query_calls) == 110
 
 
-def test_fetch_batch_stops_reconnecting_after_cap(monkeypatch) -> None:
-    """服务端持续重置时，重连次数必须封顶，不能变成请求风暴（10001011 的老路）。
+def test_fetch_batch_reconnects_are_capped_by_shared_budget(monkeypatch) -> None:
+    """重来次数是**全批共用**的 3 次，不是「主流程 3 次 + 补拉 3 次」。
 
     这里让每条连接**只够查 1 只**：不封顶时会一路「断 20 只 → 重连 → 再断 20 只」，
-    重登次数随批大小线性增长；封顶后两趟各最多 `1 + _MAX_RELOGINS` 次。
+    次数随批大小线性增长。封顶后总共只有 1 次起家 login + 3 次重来。
     """
     fake = _SessionBaoStock(die_after=1)
     monkeypatch.setitem(sys.modules, "baostock", fake)
@@ -1091,8 +1092,20 @@ def test_fetch_batch_stops_reconnecting_after_cap(monkeypatch) -> None:
 
     assert failed > 0, "一直连不上就该如实报失败"
     assert len(rows) > 0, "前面已经取到的行不能丢"
-    cap = (1 + engine_module._MAX_RELOGINS) * 2  # 两趟，各自封顶
-    assert fake.logins <= cap, f"重登次数应有上限，实测 {fake.logins}"
+    assert fake.logins == 1 + engine_module._MAX_RELOGINS, "起家 1 次 + 重来 3 次"
+
+
+def test_fetch_batch_retries_only_the_failed_symbols(monkeypatch) -> None:
+    """补拉不是「再跑一遍主流程」：只查失败的那几只，成功过的一只都不重发。"""
+    fake = _SessionBaoStock(die_after=90)
+    monkeypatch.setitem(sys.modules, "baostock", fake)
+
+    engine_module._bs_fetch_batch(_tasks(100))
+
+    ok = "sh.600000"  # 第 1 只，主流程里已成功
+    bad = "sh.600090"  # 第 91 只，落在失败的那段里
+    assert fake.query_calls.count(ok) == 1, "成功过的代码不该被补拉再查一次"
+    assert fake.query_calls.count(bad) == 2, "失败的代码才需要补一次"
 
 
 def test_fetch_batch_does_not_retry_when_everything_fails(monkeypatch) -> None:

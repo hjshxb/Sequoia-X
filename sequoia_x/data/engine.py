@@ -127,10 +127,12 @@ class SyncStats:
 # 两个阈值共同决定「重连」的激进度：
 #   连续失败多少只 ⇒ 判定「会话已死，不是个股问题」。取 20：单只查不到（退市/停牌）
 #   不会连成串，而一次 reset 之后必然是大段连续失败，20 只足够确认。
-#   一个批次最多重登几次 ⇒ 防「服务端真挂了」时无限重登把一次故障放大成请求风暴
-#   （10001011 黑名单就是这么来的）。
+#   整批最多「重来」几次 ⇒ **中途重连与事后补拉共用这一个预算**（不是各算一份）。
+#   取 3：足够覆盖「一天 reset 一次」的实际情形（实测只需 1 次），
+#   同时兜住「服务端真挂了」—— 最坏 4 次 login 就停手，不会把一次故障放大成
+#   请求风暴（10001011 黑名单就是这么来的）。
 _CONSECUTIVE_FAILS_TO_RECONNECT = 20
-_MAX_RELOGINS = 6
+_MAX_RELOGINS = 3
 
 _BS_COLUMNS = "date,open,high,low,close,volume,amount"
 
@@ -147,12 +149,17 @@ def _try_login() -> str | None:
     return None if lg.error_code == "0" else f"{lg.error_code} {lg.error_msg}"
 
 
-def _bs_fetch_pass(tasks: list) -> tuple[list, list]:
-    """一趟拉取：一次 login + 顺序查询，连续失败即重连。
+def _bs_fetch_pass(tasks: list, relogins_left: int) -> tuple[list, list, int]:
+    """一趟拉取：一次 login + 顺序查询，连续失败即就地重连。
+
+    Args:
+        tasks: 待拉的 `(symbol, bs_code, start, end)` 列表。
+        relogins_left: **全批共用的**重来预算剩余次数，本趟用掉多少要扣多少。
 
     Returns:
-        `(rows, failed_tasks)`。`failed_tasks` 回传的是**任务元组**（不是数量），
-        好让调用方换一个新会话只补这几只，而不是重跑整批。
+        `(rows, failed_tasks, relogins_left)`。`failed_tasks` 回传的是**任务元组**
+        （不是数量），好让上层只补这几只，而不是重跑整批；`relogins_left` 回传剩余
+        预算，补拉轮的额度因此不会和主流程各算一份。
 
     Raises:
         BaostockUnavailable: 开头登录就失败 —— 一只都不许查。
@@ -171,7 +178,6 @@ def _bs_fetch_pass(tasks: list) -> tuple[list, list]:
     results: list = []
     failed: list = []
     consecutive = 0
-    relogins = 0
     try:
         for idx, task in enumerate(tasks):
             symbol, bs_code, start, end = task
@@ -189,18 +195,18 @@ def _bs_fetch_pass(tasks: list) -> tuple[list, list]:
                 if consecutive < _CONSECUTIVE_FAILS_TO_RECONNECT:
                     continue
                 # 连成串的失败 ⇒ 会话已死。换一条连接继续，别把剩下的都判死。
-                if relogins >= _MAX_RELOGINS:
+                if relogins_left <= 0:
                     rest = tasks[idx + 1 :]
                     failed.extend(rest)
                     logger.error(
-                        f"已重连 {relogins} 次仍未恢复，本批剩余 {len(rest)} 只放弃"
+                        f"重来次数已用完，本批剩余 {len(rest)} 只放弃"
                         f"（会话疑似被持续重置，交给完整性闸门判定）"
                     )
                     break
-                relogins += 1
+                relogins_left -= 1
                 logger.warning(
                     f"连续 {consecutive} 只查询失败（疑似会话被重置），"
-                    f"第 {relogins}/{_MAX_RELOGINS} 次重连后从第 {idx + 2} 只继续"
+                    f"重连后从第 {idx + 2} 只继续（剩余重来额度 {relogins_left} 次）"
                 )
                 with contextlib.suppress(Exception):
                     bs.logout()
@@ -220,18 +226,23 @@ def _bs_fetch_pass(tasks: list) -> tuple[list, list]:
         with contextlib.suppress(Exception):
             bs.logout()
 
-    return results, failed
+    return results, failed, relogins_left
 
 
 def _bs_fetch_batch(tasks: list) -> tuple[list, int]:
-    """同步 worker：独立 login，批量拉取 baostock 数据。
+    """同步 worker：**主流程只跑一次**，跑完再对失败的票补拉。
 
     单进程模式下由 `sync_today_bulk` 直接调用（整份任务一次传入）；
     多进程模式下作为 `Pool.map` 的任务函数，每个分片各起一个进程。
 
-    两趟：第一趟带断线重连；若仍有零星的失败（典型是重连前那 20 只，
-    或 reset 恰好卡在最后几只），**换一个新会话只补这几只**再试一次。
-    这样一次会话重置的代价从「尾巴全废」降到「几乎为零」。
+    流程（补拉不是「再跑一遍主流程」，只查失败的那几只）：
+
+    1. **主流程**：一次 login + 顺序拉完；中途若连续失败（会话被 reset），
+       就地重连并从断点继续，**不回头重查已经拿到的**；
+    2. **补拉**：主流程结束后若还有失败票，只对这几只重新建立会话再拉，
+       每轮换一个新会话，最多 3 轮；
+    3. 中途重连与补拉**共用** `_MAX_RELOGINS` 这一个预算 ⇒ 最坏 4 次 login
+       （1 次起家 + 3 次重来），不会因为「两段各算一份」翻倍。
 
     Returns:
         `(rows, failed)`：成功取到的行，以及补拉后仍失败的股票数。
@@ -243,22 +254,25 @@ def _bs_fetch_batch(tasks: list) -> tuple[list, int]:
             注意「全部失败」**不做补拉**：那说明数据源没就绪（或账号被拒），
             再发一轮请求只会重演当年换 10001011 黑名单的请求风暴。
     """
-    results, failed_tasks = _bs_fetch_pass(tasks)
+    relogins_left = _MAX_RELOGINS
+    results, failed_tasks, relogins_left = _bs_fetch_pass(tasks, relogins_left)
 
-    # 只补「部分失败」：全失败是数据源/账号的问题，补拉等于把请求量翻倍。
-    if failed_tasks and len(failed_tasks) < len(tasks):
+    # 补拉：只针对失败的那几只。全失败是数据源/账号的问题，不补（请求量会翻倍）。
+    rounds = 0
+    while failed_tasks and len(failed_tasks) < len(tasks) and relogins_left > 0:
+        relogins_left -= 1  # 这一轮要重新建立一次会话，占 1 次额度
+        rounds += 1
         logger.warning(
-            f"本批 {len(tasks)} 只中有 {len(failed_tasks)} 只查询失败，"
-            "换新会话补拉一次..."
+            f"补拉第 {rounds} 轮：{len(failed_tasks)} 只查询失败，"
+            f"换新会话重试（剩余重来额度 {relogins_left} 次）"
         )
         try:
-            more, still_failed = _bs_fetch_pass(failed_tasks)
+            more, failed_tasks, relogins_left = _bs_fetch_pass(failed_tasks, relogins_left)
         except BaostockUnavailable as exc:
             # 补拉阶段连登录都失败：保留已取到的行，让完整性闸门去判够不够
             logger.error(f"补拉阶段登录失败（{exc}），保留已取到的 {len(results)} 行")
-        else:
-            results.extend(more)
-            failed_tasks = still_failed
+            break
+        results.extend(more)
 
     if failed_tasks and len(failed_tasks) == len(tasks):
         raise BaostockUnavailable(
@@ -268,6 +282,11 @@ def _bs_fetch_batch(tasks: list) -> tuple[list, int]:
     failed = len(failed_tasks)
     if failed:
         logger.warning(f"本批 {len(tasks)} 只中有 {failed} 只查询失败，已跳过")
+        if relogins_left <= 0:
+            logger.error(
+                f"重来次数已用完（{_MAX_RELOGINS} 次），仍有 {failed} 只没取到；"
+                "若未更新占比超过上限，完整性闸门会自动拦下本次结果"
+            )
 
     return results, failed
 
