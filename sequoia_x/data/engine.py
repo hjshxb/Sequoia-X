@@ -3,6 +3,7 @@
 import contextlib
 import io
 import sqlite3
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -134,6 +135,12 @@ class SyncStats:
 _CONSECUTIVE_FAILS_TO_RECONNECT = 20
 _MAX_RELOGINS = 3
 
+# 重登前的等待（秒）。**不能立即重登**：11-19 实测，会话被 reset 之后服务端有一个
+# 几十秒的「拒绝窗口」—— 21:15:02 我们立刻重登拿到 `10002007 网络接收错误` 就放弃了
+# 剩余 3300 只，而 20 秒后另一个进程（backfill）的登录就成功了。
+# 只差这一次等待，当天本可以正常跑完。
+_RELOGIN_BACKOFF_SECONDS = 30
+
 _BS_COLUMNS = "date,open,high,low,close,volume,amount"
 
 
@@ -206,16 +213,22 @@ def _bs_fetch_pass(tasks: list, relogins_left: int) -> tuple[list, list, int]:
                 relogins_left -= 1
                 logger.warning(
                     f"连续 {consecutive} 只查询失败（疑似会话被重置），"
-                    f"重连后从第 {idx + 2} 只继续（剩余重来额度 {relogins_left} 次）"
+                    f"等待 {_RELOGIN_BACKOFF_SECONDS} 秒后重连，"
+                    f"从第 {idx + 2} 只继续（剩余重来额度 {relogins_left} 次）"
                 )
                 with contextlib.suppress(Exception):
                     bs.logout()
+                # 服务端在 reset 之后会短暂拒绝新会话，立即重登等于白撞一次（11-19）。
+                time.sleep(_RELOGIN_BACKOFF_SECONDS)
                 err = _try_login()
                 consecutive = 0
                 if err is not None:
                     rest = tasks[idx + 1 :]
                     failed.extend(rest)
-                    logger.error(f"重连失败（{err}），本批剩余 {len(rest)} 只放弃")
+                    logger.error(
+                        f"重连失败（{err}），本批剩余 {len(rest)} 只记作失败，"
+                        "交给补拉轮继续尝试"
+                    )
                     break
                 continue
             consecutive = 0
@@ -238,11 +251,13 @@ def _bs_fetch_batch(tasks: list) -> tuple[list, int]:
     流程（补拉不是「再跑一遍主流程」，只查失败的那几只）：
 
     1. **主流程**：一次 login + 顺序拉完；中途若连续失败（会话被 reset），
-       就地重连并从断点继续，**不回头重查已经拿到的**；
+       等 `_RELOGIN_BACKOFF_SECONDS` 秒后重连、从断点继续，**不回头重查已经拿到的**；
     2. **补拉**：主流程结束后若还有失败票，只对这几只重新建立会话再拉，
        每轮换一个新会话，最多 3 轮；
     3. 中途重连与补拉**共用** `_MAX_RELOGINS` 这一个预算 ⇒ 最坏 4 次 login
-       （1 次起家 + 3 次重来），不会因为「两段各算一份」翻倍。
+       （1 次起家 + 3 次重来），不会因为「两段各算一份」翻倍；
+    4. **登录失败不立刻收手**：11-19 的服务端在 reset 后有几十秒的拒绝窗口，
+       所以失败后等一个退避间隔、用下一份额度再试，额度耗尽才放弃。
 
     Returns:
         `(rows, failed)`：成功取到的行，以及补拉后仍失败的股票数。
@@ -269,9 +284,20 @@ def _bs_fetch_batch(tasks: list) -> tuple[list, int]:
         try:
             more, failed_tasks, relogins_left = _bs_fetch_pass(failed_tasks, relogins_left)
         except BaostockUnavailable as exc:
-            # 补拉阶段连登录都失败：保留已取到的行，让完整性闸门去判够不够
-            logger.error(f"补拉阶段登录失败（{exc}），保留已取到的 {len(results)} 行")
-            break
+            # 登录失败**不等于**当天没戏：11-19 的重置窗口只有几十秒。
+            # 保留已取到的行，等一个退避间隔后用下一份额度再试（额度用完才收手）。
+            if relogins_left <= 0:
+                logger.error(
+                    f"补拉第 {rounds} 轮登录失败（{exc}），重来次数已用完，"
+                    f"保留已取到的 {len(results)} 行"
+                )
+                break
+            logger.warning(
+                f"补拉第 {rounds} 轮登录失败（{exc}），"
+                f"等待 {_RELOGIN_BACKOFF_SECONDS} 秒后重试（剩余额度 {relogins_left} 次）"
+            )
+            time.sleep(_RELOGIN_BACKOFF_SECONDS)
+            continue
         results.extend(more)
 
     if failed_tasks and len(failed_tasks) == len(tasks):

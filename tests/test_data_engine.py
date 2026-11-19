@@ -1025,7 +1025,19 @@ def _tasks(n: int) -> list:
     return [(f"6000{i:02d}", f"sh.6000{i:02d}", "2026-11-18", "2026-11-18") for i in range(n)]
 
 
-def test_fetch_pass_reconnects_when_session_dies(monkeypatch) -> None:
+@pytest.fixture(autouse=True)
+def fast_backoff(monkeypatch) -> list[float]:
+    """把引擎里的退避等待换成「只记录、不真等」。
+
+    不这么做，任何触发重连的用例都要真睡 30 秒；同时记录的时长正好用来
+    断言「重登前确实等过」。
+    """
+    sleeps: list[float] = []
+    monkeypatch.setattr(engine_module.time, "sleep", lambda seconds: sleeps.append(seconds))
+    return sleeps
+
+
+def test_fetch_pass_reconnects_when_session_dies(monkeypatch, fast_backoff) -> None:
     """单趟内：连续失败 20 只就判定会话已死，重连后**从断点继续**。
 
     这条只测「重连」本身，所以直接打 `_bs_fetch_pass` —— 走 `_bs_fetch_batch`
@@ -1033,7 +1045,7 @@ def test_fetch_pass_reconnects_when_session_dies(monkeypatch) -> None:
     于是这个变异就测不出来了（2026-11-18 变异检验亲测）。
 
     场景：会话在第 60 只后死掉。重连后剩 20 只照常拿到 ⇒ 失败 20、成功 80。
-    不重连则是失败 40、成功 60。
+    不重连则是失败 40、成功 60。重连前必须**先等一个退避间隔**（11-19 的教训）。
     """
     fake = _SessionBaoStock(die_after=60)
     monkeypatch.setitem(sys.modules, "baostock", fake)
@@ -1041,6 +1053,7 @@ def test_fetch_pass_reconnects_when_session_dies(monkeypatch) -> None:
     rows, failed, left = engine_module._bs_fetch_pass(_tasks(100), engine_module._MAX_RELOGINS)
 
     assert fake.logins == 2, "断连后必须重新登录"
+    assert fast_backoff == [engine_module._RELOGIN_BACKOFF_SECONDS], "重登前要先等待"
     assert len(failed) == engine_module._CONSECUTIVE_FAILS_TO_RECONNECT
     assert len(rows) == 100 - engine_module._CONSECUTIVE_FAILS_TO_RECONNECT
     assert left == engine_module._MAX_RELOGINS - 1, "重连要扣掉全批共用的额度"
@@ -1117,3 +1130,37 @@ def test_fetch_batch_does_not_retry_when_everything_fails(monkeypatch) -> None:
         engine_module._bs_fetch_batch(_TASKS)
 
     assert len(fake.query_calls) == len(_TASKS), "全失败时不应再发第二轮请求"
+
+
+class _RejectingLoginBaoStock(_SessionBaoStock):
+    """起家那次能登录成功，之后每次登录都被拒 —— 模拟 reset 后的「拒绝窗口」。"""
+
+    def __init__(self, die_after: int = 5) -> None:
+        super().__init__(die_after=die_after)
+        self.rejected = 0
+
+    def login(self) -> _FakeLogin:
+        if self.logins == 0:
+            return super().login()
+        self.logins += 1
+        self.rejected += 1
+        return _FakeLogin("10002007", "网络接收错误。")
+
+
+def test_login_failure_does_not_abandon_the_batch(monkeypatch, fast_backoff) -> None:
+    """11-19 的真实形态：会话断了，重登被服务端短暂拒绝。
+
+    当天 21:15:02 重登失败就放弃了剩余 3300 只（63.7% 缺数据 ⇒ 整天无报告），
+    而 20 秒后另一个进程的 login 是成功的 —— 差的就是一次退避等待。
+    现在必须把 3 次额度用满（每次先等 30 秒）才收手，且已取到的行不能丢。
+    """
+    fake = _RejectingLoginBaoStock(die_after=5)
+    monkeypatch.setitem(sys.modules, "baostock", fake)
+
+    rows, failed = engine_module._bs_fetch_batch(_tasks(100))
+
+    assert fake.logins == 1 + engine_module._MAX_RELOGINS, "起家 1 次 + 3 次额度都要试完"
+    assert fake.rejected == engine_module._MAX_RELOGINS, "三次重登全部被拒"
+    assert fast_backoff == [engine_module._RELOGIN_BACKOFF_SECONDS] * 2, "每次被拒后都要等待"
+    assert len(rows) == 5, "断连前已经取到的行必须保住"
+    assert failed == 95
